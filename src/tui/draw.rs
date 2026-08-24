@@ -140,9 +140,7 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
                 Paragraph::new(runtime_lines(snap, app, &rs, width)).scroll((app.scroll, 0)),
                 list,
             );
-            let pw = popup_rect(inner, 58, 50)
-                .width
-                .saturating_sub(2 + 4) as usize;
+            let pw = popup_rect(inner, 58, 50).width.saturating_sub(2 + 4) as usize;
             match app.mode {
                 Mode::Details => {
                     draw_popup(
@@ -397,14 +395,18 @@ fn origin(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) -> String {
     if let Some(p) = &item.project {
         return short_path(&p.root);
     }
-    if let Some(cwd) = item.process_ids.iter().find_map(|pid| {
-        by_pid.get(pid).and_then(|p| p.cwd.as_ref())
-    }) {
+    if let Some(cwd) = item
+        .process_ids
+        .iter()
+        .find_map(|pid| by_pid.get(pid).and_then(|p| p.cwd.as_ref()))
+    {
         return short_path(cwd);
     }
-    if let Some(tty) = item.process_ids.iter().find_map(|pid| {
-        by_pid.get(pid).and_then(|p| p.tty.as_deref())
-    }) {
+    if let Some(tty) = item
+        .process_ids
+        .iter()
+        .find_map(|pid| by_pid.get(pid).and_then(|p| p.tty.as_deref()))
+    {
         return tty.to_string();
     }
     if item.state == RuntimeState::Persistent {
