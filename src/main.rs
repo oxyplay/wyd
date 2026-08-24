@@ -1,7 +1,9 @@
 mod actions;
 mod classify;
+mod collect;
 mod config;
 mod model;
+mod output;
 mod platform;
 mod scanner;
 use std::collections::HashMap;
@@ -34,7 +36,18 @@ use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 /// See what your dev sessions left running.
 #[derive(Parser)]
 #[command(name = "wyd", version, about)]
-struct Cli {}
+struct Cli {
+    /// Print JSON and exit (no TUI)
+    #[arg(long)]
+    json: bool,
+    /// Print one item per line and exit (no TUI)
+    #[arg(long)]
+    plain: bool,
+    /// leftovers | mcp | agents | docker | project
+    filter: Option<String>,
+    /// Project name when filter is `project`
+    name: Option<String>,
+}
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_POLL: Duration = Duration::from_millis(100);
@@ -86,8 +99,40 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
 }
 
 fn main() -> io::Result<()> {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
+    if cli.json || cli.plain {
+        return run_cli(cli);
+    }
+    run_tui()
+}
 
+fn run_cli(cli: Cli) -> io::Result<()> {
+    if cli.json && cli.plain {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "use only one of --json or --plain",
+        ));
+    }
+    let filter = output::Filter::parse(cli.filter.as_deref())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if filter == output::Filter::Project && cli.name.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "filter `project` needs a name: wyd --json project myapp",
+        ));
+    }
+    let snap = collect::snapshot();
+    let project = cli.name.as_deref();
+    let text = if cli.json {
+        output::render_json(&snap, filter, project)
+    } else {
+        output::render_plain(&snap, filter, project)
+    };
+    println!("{text}");
+    Ok(())
+}
+
+fn run_tui() -> io::Result<()> {
     let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
     let (force_tx, force_rx) = mpsc::channel::<()>();
     thread::spawn({

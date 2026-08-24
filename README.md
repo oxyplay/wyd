@@ -2,7 +2,7 @@
 
 > A fast TUI for seeing what your development tools and AI agents left running.
 
-> **Status:** prototype. Classifies runtime, Docker, and leftovers (`⚠` + reasons). Kill/`x` need `y` (volumes: `D`).
+> **Status:** prototype. TUI plus `wyd --json` / `--plain` for scripts. Kill/`x` need `y` (volumes: `D`).
 
 **wyd** is a fast terminal UI for understanding, inspecting, and cleaning up your local development runtime.
 
@@ -623,11 +623,49 @@ Or, more casually:
 
 ---
 
-## Status
+## CLI
 
-Early prototype: live process snapshot and ancestry tree.
+Same snapshot as the TUI, no interactive session:
 
-The mockup in this README is the target UI, not what `cargo run` renders today.
+```bash
+wyd --json
+wyd --json leftovers
+wyd --json mcp
+wyd --json docker
+wyd --json project myapp
+wyd --plain leftovers
+```
+
+JSON shape (fields will not be renamed without a major version bump):
+
+```json
+{
+  "runtime": [
+    {
+      "type": "leftover",
+      "name": "chrome-devtools-mcp",
+      "pid": 94148,
+      "project": "queryknight",
+      "memory_bytes": 50331648,
+      "status": "leftover",
+      "ports": [9222],
+      "reasons": ["owning agent missing"],
+      "children": []
+    }
+  ],
+  "docker": [
+    {
+      "type": "dangling-image",
+      "name": "abcdef012345",
+      "status": "dangling",
+      "size_bytes": 1400000000
+    }
+  ]
+}
+```
+
+`type` on runtime items: `agent`, `mcp`, `browser`, `dev-server`, `language-server`, `database`, `dev-service`, `other`, `leftover`.  
+`status`: `active`, `persistent`, `leftover`. Empty `ports` / `reasons` / `children` / `project` are omitted.
 
 ## License
 
