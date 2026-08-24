@@ -1,20 +1,34 @@
 # wyd
 
-See what your dev tools and AI agents left running.
+**What the hell is still running?**
 
-A local TUI (macOS / Linux). No accounts, no network, no telemetry.
-Hides OS noise. Groups agents, MCP, browsers, servers, DBs, Docker.
-Tells you the project and whether it looks leftover.
+AI agents, MCP servers, headless Chromium, Vite, and last week's Docker leftovers pile up on a developer machine. `ps` and `docker ps` show every PID. wyd shows the *session*: who started it, which project, whether it's leftover, and whether you can kill it.
+
+Local TUI. macOS and Linux. No account, no network, no telemetry.
 
 ```bash
 cargo install wyd
 wyd
 ```
 
-macOS / Linux binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases).
+Binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases). From a clone: `cargo install --path .`
 
-From a clone: `cargo install --path .`
+![wyd TUI — agents, MCP, Vite, and project folders](docs/screenshot.webp)
 
+OS daemons stay hidden. Desktop Chrome stays hidden. Agent-spawned Chromium does not.
+
+## Why wyd
+
+| | `ps` / Activity Monitor | Docker Desktop | wyd |
+|---|---|---|---|
+| Every process | yes | containers only | only dev runtime |
+| Who started it | no | compose labels | agent → MCP → browser |
+| Which project | no | sometimes | cwd / git root |
+| Leftover? | no | you guess | scored, with a reason |
+| Safe kill | you hope | stop/rm | PID + start time, `y` to confirm |
+| Volumes | — | easy to nuke | unused ≠ garbage; `D` required |
+
+Built for people who run coding agents all day and then ask *what did that session leave behind?*
 
 ## Keys
 
@@ -22,7 +36,7 @@ From a clone: `cargo install --path .`
 |---|---|
 | `←` `→` | overview / list |
 | `↑` `↓` | move |
-| `enter` | details; on a project, pin that project |
+| `enter` | details popup; on a project, pin that project |
 | `space` | mark several |
 | `k` / `K` | terminate / force kill (`y` confirms) |
 | `x` | Docker clean (`y`; volumes need `D`) |
@@ -30,15 +44,14 @@ From a clone: `cargo install --path .`
 | `/` | filter |
 | `r` | refresh |
 | `?` | help |
-| `esc` | clear filter, then project, then quit |
+| `esc` | close popup, then clear filter / project, then quit |
 | `q` | quit |
 
-Kill only signals the item’s own PIDs (re-checked by PID + start time).
-An unused Docker volume is never treated as garbage.
+Kill only signals the item’s own PIDs (re-checked by PID + start time). An unused Docker volume is never treated as garbage.
 
 ## Scripts
 
-Same snapshot as the TUI:
+Same snapshot as the TUI — useful after an agent finishes a task:
 
 ```bash
 wyd --json leftovers
@@ -89,5 +102,3 @@ display = "myagent"
 ## License
 
 Apache-2.0. Copyright 2026 Maksym Nevinchanyy.
-
-Longer product notes: [SPEC.md](SPEC.md).
