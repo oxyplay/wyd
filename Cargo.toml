@@ -1,12 +1,16 @@
 [package]
 name = "wyd"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast TUI for seeing what your development tools and AI agents left running."
 license = "Apache-2.0"
 authors = ["Maksym Nevinchanyy"]
 readme = "README.md"
+repository = "https://github.com/oxyplay/wyd"
+homepage = "https://github.com/oxyplay/wyd"
+keywords = ["tui", "process", "docker", "devtools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }

@@ -7,11 +7,14 @@ Hides OS noise. Groups agents, MCP, browsers, servers, DBs, Docker.
 Tells you the project and whether it looks leftover.
 
 ```bash
-git clone https://github.com/oxyplay/wyd
-cd wyd
-cargo install --path .
+cargo install wyd
 wyd
 ```
+
+macOS / Linux binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases).
+
+From a clone: `cargo install --path .`
+
 
 ## Keys
 
