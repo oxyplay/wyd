@@ -1,8 +1,8 @@
+mod actions;
 mod classify;
 mod model;
 mod platform;
 mod scanner;
-
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, mpsc};
@@ -25,6 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use actions::process::{self, Identity, Signal};
 use classify::{ProjectCache, attach, group, short_path};
 use model::{Category, ProcessInfo, RuntimeItem, RuntimeSnapshot};
 use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
@@ -100,39 +101,166 @@ fn main() -> io::Result<()> {
     result
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    List,
+    Details,
+    Confirm { force: bool },
+}
+
+struct App {
+    selected: usize,
+    scroll: u16,
+    mode: Mode,
+    frozen: Vec<Identity>,
+    frozen_title: String,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            selected: 0,
+            scroll: 0,
+            mode: Mode::List,
+            frozen: Vec::new(),
+            frozen_title: String::new(),
+        }
+    }
+}
+
 fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     snapshot: &Arc<RwLock<RuntimeSnapshot>>,
     force: &mpsc::Sender<()>,
 ) -> io::Result<()> {
-    let mut drawn_version = u64::MAX; // force first draw
-    let mut scroll = 0u16;
+    let mut drawn_version = u64::MAX;
+    let mut app = App::new();
     loop {
         let snap = snapshot.read();
+        let n = count_items(&snap.logical_items);
+        if n == 0 {
+            app.selected = 0;
+        } else if app.selected >= n {
+            app.selected = n - 1;
+        }
         if snap.version != drawn_version {
             drawn_version = snap.version;
-            terminal.draw(|f| ui(f, &snap, scroll))?;
+            terminal.draw(|f| ui(f, &snap, &app))?;
         }
         drop(snap);
 
         if event::poll(EVENT_POLL)? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('r') => {
-                        let _ = force.send(());
-                    }
-                    KeyCode::Up => scroll = scroll.saturating_sub(1),
-                    KeyCode::Down => scroll = scroll.saturating_add(1),
-                    _ => {}
+                let snap = snapshot.read();
+                match handle_key(key.code, &snap, &mut app, force) {
+                    KeyResult::Quit => return Ok(()),
+                    KeyResult::Continue => {}
                 }
             }
-            terminal.draw(|f| ui(f, &snapshot.read(), scroll))?;
+            terminal.draw(|f| ui(f, &snapshot.read(), &app))?;
         }
     }
 }
 
-fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, scroll: u16) {
+enum KeyResult {
+    Quit,
+    Continue,
+}
+
+fn handle_key(
+    code: KeyCode,
+    snap: &RuntimeSnapshot,
+    app: &mut App,
+    force: &mpsc::Sender<()>,
+) -> KeyResult {
+    match app.mode {
+        Mode::List => match code {
+            KeyCode::Char('q') | KeyCode::Esc => KeyResult::Quit,
+            KeyCode::Char('r') => {
+                let _ = force.send(());
+                KeyResult::Continue
+            }
+            KeyCode::Up => {
+                app.selected = app.selected.saturating_sub(1);
+                app.scroll = app.selected.saturating_sub(2) as u16;
+                KeyResult::Continue
+            }
+            KeyCode::Down => {
+                let n = count_items(&snap.logical_items);
+                if n > 0 {
+                    app.selected = (app.selected + 1).min(n - 1);
+                }
+                app.scroll = app.selected.saturating_sub(2) as u16;
+                KeyResult::Continue
+            }
+            KeyCode::Enter => {
+                if count_items(&snap.logical_items) > 0 {
+                    app.mode = Mode::Details;
+                }
+                KeyResult::Continue
+            }
+            KeyCode::Char('k') => open_confirm(snap, app, false),
+            KeyCode::Char('K') => open_confirm(snap, app, true),
+            _ => KeyResult::Continue,
+        },
+        Mode::Details => match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.mode = Mode::List;
+                KeyResult::Continue
+            }
+            KeyCode::Char('k') => open_confirm(snap, app, false),
+            KeyCode::Char('K') => open_confirm(snap, app, true),
+            _ => KeyResult::Continue,
+        },
+        Mode::Confirm { force: kill_force } => match code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                app.mode = Mode::List;
+                KeyResult::Continue
+            }
+            KeyCode::Char('y') => {
+                let signal = if kill_force {
+                    Signal::Kill
+                } else {
+                    Signal::Term
+                };
+                let _ = process::send(&app.frozen, signal);
+                app.mode = Mode::List;
+                app.frozen.clear();
+                let _ = force.send(());
+                KeyResult::Continue
+            }
+            _ => KeyResult::Continue,
+        },
+    }
+}
+
+fn open_confirm(snap: &RuntimeSnapshot, app: &mut App, kill_force: bool) -> KeyResult {
+    let Some(item) = nth_item(&snap.logical_items, app.selected) else {
+        return KeyResult::Continue;
+    };
+    app.frozen = process::identities_for(item, &snap.processes);
+    app.frozen_title = item.title();
+    app.mode = Mode::Confirm { force: kill_force };
+    KeyResult::Continue
+}
+
+fn nth_item(items: &[RuntimeItem], mut n: usize) -> Option<&RuntimeItem> {
+    fn walk<'a>(items: &'a [RuntimeItem], n: &mut usize) -> Option<&'a RuntimeItem> {
+        for item in items {
+            if *n == 0 {
+                return Some(item);
+            }
+            *n -= 1;
+            if let Some(hit) = walk(&item.children, n) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+    walk(items, &mut n)
+}
+
+fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
 
@@ -148,36 +276,65 @@ fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, scroll: u16) {
     let inner = outer.inner(main);
     frame.render_widget(outer, main);
 
-    let lines: Vec<Line> = if snap.processes.is_empty() {
-        vec![Line::from(" scanning…")]
-    } else if snap.logical_items.is_empty() {
-        vec![Line::from(" no matching dev processes")]
-    } else {
-        let mut lines = Vec::new();
-        let overview = overview_line(&snap.logical_items);
-        if !overview.is_empty() {
-            lines.push(Line::from(overview));
-            lines.push(Line::from(""));
+    match app.mode {
+        Mode::List => {
+            let lines = list_lines(snap, app.selected);
+            frame.render_widget(Paragraph::new(lines).scroll((app.scroll, 0)), inner);
         }
-        let by_pid: HashMap<u32, &ProcessInfo> =
-            snap.processes.iter().map(|p| (p.pid, p)).collect();
-        render_items(&snap.logical_items, 0, &by_pid, &mut lines);
-        lines
-    };
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+        Mode::Details => {
+            let lines = details_lines(snap, app.selected);
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        Mode::Confirm { force } => {
+            frame.render_widget(Paragraph::new(confirm_lines(app, force)), inner);
+        }
+    }
 
+    let hint = match app.mode {
+        Mode::List => " ↑↓ select  enter details  k kill  K force  r refresh  q quit",
+        Mode::Details => " k kill  K force  esc back",
+        Mode::Confirm { force: true } => " y force kill  n/esc cancel",
+        Mode::Confirm { force: false } => " y terminate  n/esc cancel",
+    };
     frame.render_widget(
-        Paragraph::new(" ↑↓ scroll  r refresh  q quit")
-            .style(Style::default().add_modifier(Modifier::DIM)),
+        Paragraph::new(hint).style(Style::default().add_modifier(Modifier::DIM)),
         footer,
     );
+}
+
+fn list_lines(snap: &RuntimeSnapshot, selected: usize) -> Vec<Line<'static>> {
+    if snap.processes.is_empty() {
+        return vec![Line::from(" scanning…")];
+    }
+    if snap.logical_items.is_empty() {
+        return vec![Line::from(" no matching dev processes")];
+    }
+    let mut lines = Vec::new();
+    let overview = overview_line(&snap.logical_items);
+    if !overview.is_empty() {
+        lines.push(Line::from(overview));
+        lines.push(Line::from(""));
+    }
+    let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
+    let mut idx = 0usize;
+    render_items(
+        &snap.logical_items,
+        0,
+        &by_pid,
+        selected,
+        &mut idx,
+        &mut lines,
+    );
+    lines
 }
 
 fn render_items(
     items: &[RuntimeItem],
     depth: usize,
     by_pid: &HashMap<u32, &ProcessInfo>,
-    out: &mut Vec<Line>,
+    selected: usize,
+    idx: &mut usize,
+    out: &mut Vec<Line<'static>>,
 ) {
     let last = items.len().saturating_sub(1);
     for (i, item) in items.iter().enumerate() {
@@ -193,35 +350,138 @@ fn render_items(
         let age = proc
             .map(|p| fmt_age(p.start_time))
             .unwrap_or_else(|| "—".into());
-        let mut line = format!(
+        let mut text = format!(
             "{indent}{marker}{:<32} {:>9} {:>5.1}%  {age}",
             truncate(&item.title(), 32),
             fmt_bytes(item.memory_bytes),
             item.cpu_percent,
         );
         if item.state == model::RuntimeState::Persistent {
-            line.push_str("  persistent");
+            text.push_str("  persistent");
         }
         if !item.ports.is_empty() {
             let shown: Vec<String> = item.ports.iter().take(3).map(|p| p.label()).collect();
-            line.push_str("  ");
-            line.push_str(&shown.join(","));
+            text.push_str("  ");
+            text.push_str(&shown.join(","));
             if item.ports.len() > 3 {
-                line.push_str(&format!("+{}", item.ports.len() - 3));
+                text.push_str(&format!("+{}", item.ports.len() - 3));
             }
         }
         if let Some(project) = &item.project {
-            line.push_str("  ");
-            line.push_str(&short_path(&project.root));
+            text.push_str("  ");
+            text.push_str(&short_path(&project.root));
         } else if let Some(p) = proc
             && let Some(tty) = &p.tty
         {
-            line.push_str("  ");
-            line.push_str(tty);
+            text.push_str("  ");
+            text.push_str(tty);
         }
-        out.push(Line::from(line));
-        render_items(&item.children, depth + 1, by_pid, out);
+        let style = if *idx == selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(text).style(style));
+        *idx += 1;
+        render_items(&item.children, depth + 1, by_pid, selected, idx, out);
     }
+}
+
+fn details_lines(snap: &RuntimeSnapshot, selected: usize) -> Vec<Line<'static>> {
+    let Some(item) = nth_item(&snap.logical_items, selected) else {
+        return vec![Line::from(" no item")];
+    };
+    let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
+    let proc = item.root_pid.and_then(|pid| by_pid.get(&pid).copied());
+    let mut lines = vec![
+        Line::from(format!("{}  {}", item.title(), item.category.label())),
+        Line::from(""),
+    ];
+    if let Some(p) = proc {
+        lines.push(Line::from(format!(
+            "PID  {}    PPID  {}",
+            p.pid,
+            p.parent_pid
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "—".into())
+        )));
+        lines.push(Line::from(format!(
+            "RAM  {}    CPU  {:.1}%    age  {}",
+            fmt_bytes(p.memory_bytes),
+            p.cpu_percent,
+            fmt_age(p.start_time)
+        )));
+        if !p.command.is_empty() {
+            lines.push(Line::from(format!("cmd  {}", p.command.join(" "))));
+        }
+        if let Some(cwd) = &p.cwd {
+            lines.push(Line::from(format!("cwd  {}", short_path(cwd))));
+        }
+        if let Some(tty) = &p.tty {
+            lines.push(Line::from(format!("tty  {tty}")));
+        }
+    }
+    if let Some(project) = &item.project {
+        lines.push(Line::from(format!(
+            "project  {}  {}",
+            project.name,
+            short_path(&project.root)
+        )));
+    }
+    if !item.ports.is_empty() {
+        let ports = item
+            .ports
+            .iter()
+            .map(|p| format!("{}:{}", p.address, p.port))
+            .collect::<Vec<_>>()
+            .join("  ");
+        lines.push(Line::from(format!("ports  {ports}")));
+    }
+    lines.push(Line::from(format!(
+        "processes  {}",
+        item.process_ids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )));
+    if !item.children.is_empty() {
+        lines.push(Line::from(format!(
+            "children  {}",
+            item.children
+                .iter()
+                .map(|c| c.title())
+                .collect::<Vec<_>>()
+                .join("  ")
+        )));
+    }
+    lines
+}
+
+fn confirm_lines(app: &App, force: bool) -> Vec<Line<'static>> {
+    let verb = if force { "Force kill" } else { "Terminate" };
+    let mut lines = vec![
+        Line::from(format!(
+            "{verb} {} ({} processes)?",
+            app.frozen_title,
+            app.frozen.len()
+        )),
+        Line::from(""),
+    ];
+    for id in app.frozen.iter().take(12) {
+        lines.push(Line::from(format!(
+            "  PID {}  start {}",
+            id.pid, id.start_time
+        )));
+    }
+    if app.frozen.len() > 12 {
+        lines.push(Line::from(format!("  … {} more", app.frozen.len() - 12)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Identity is re-checked (PID + start time) before each signal.",
+    ));
+    lines
 }
 
 fn count_items(items: &[RuntimeItem]) -> usize {
@@ -348,7 +608,7 @@ mod tests {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let snap = fixture_snapshot();
-        terminal.draw(|f| ui(f, &snap, 0)).unwrap();
+        terminal.draw(|f| ui(f, &snap, &App::new())).unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
         for expected in [
             "wyd",
@@ -379,7 +639,7 @@ mod tests {
         let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| ui(f, &RuntimeSnapshot::default(), 0))
+            .draw(|f| ui(f, &RuntimeSnapshot::default(), &App::new()))
             .unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("scanning…"), "{rendered}");
@@ -393,5 +653,43 @@ mod tests {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
         assert_eq!(fmt_age(0), "—");
+    }
+
+    #[test]
+    fn details_show_pid_and_command() {
+        let snap = fixture_snapshot();
+        let text: String = details_lines(&snap, 0)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("PID  100"), "{text}");
+        assert!(text.contains("omp"), "{text}");
+        assert!(text.contains("children"), "{text}");
+    }
+
+    #[test]
+    fn confirm_lists_frozen_pids() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        open_confirm(&snap, &mut app, false);
+        assert!(!app.frozen.is_empty());
+        let text: String = confirm_lines(&app, false)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Terminate omp"), "{text}");
+        assert!(text.contains("PID 100"), "{text}");
+    }
+
+    #[test]
+    fn enter_does_not_confirm_kill() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        open_confirm(&snap, &mut app, false);
+        let (tx, _rx) = mpsc::channel();
+        handle_key(KeyCode::Enter, &snap, &mut app, &tx);
+        assert!(matches!(app.mode, Mode::Confirm { force: false }));
     }
 }
