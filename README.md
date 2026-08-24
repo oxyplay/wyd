@@ -1,10 +1,13 @@
 # wyd
 
-**What the hell is still running?**
+**wyd?** — *what you doing?* The question it asks every leftover process.
 
-AI agents, MCP servers, headless Chromium, Vite, and last week's Docker leftovers pile up on a developer machine. `ps` and `docker ps` show every PID. wyd shows the *session*: who started it, which project, whether it's leftover, and whether you can kill it.
+A fast TUI for seeing what your development tools and AI agents left running.
 
-Local TUI. macOS and Linux. No account, no network, no telemetry.
+Coding agents leave MCP servers, headless Chromium, Vite, and Docker junk on the machine. `ps` shows every PID. wyd shows the session: who started it, which project, whether it’s leftover, and whether you can kill it.
+
+Local, macOS and Linux. No account, no network, no telemetry.
+
 
 ```bash
 cargo install wyd
