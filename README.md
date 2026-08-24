@@ -2,7 +2,7 @@
 
 > A fast TUI for seeing what your development tools and AI agents left running.
 
-> **Status:** prototype. Classifies agents, MCP, browsers, dev servers, databases, and language servers; hides OS processes. Kill, ports, Docker are not built yet.
+> **Status:** prototype. Classifies agents, MCP, browsers, servers, DBs; shows listen ports and git project. Kill and Docker are not built yet.
 
 **wyd** is a fast terminal UI for understanding, inspecting, and cleaning up your local development runtime.
 

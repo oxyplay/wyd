@@ -1,3 +1,4 @@
+pub mod ports;
 pub mod processes;
 
 use crate::model::ProcessInfo;

@@ -139,6 +139,8 @@ fn build_item(
         } else {
             RuntimeState::Active
         },
+        ports: Vec::new(),
+        project: None,
         children,
     }
 }
@@ -182,6 +184,8 @@ fn rollup_browsers(
         memory_bytes,
         cpu_percent,
         state: RuntimeState::Active,
+        ports: Vec::new(),
+        project: None,
         children: Vec::new(),
     })
 }

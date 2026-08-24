@@ -25,7 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use classify::group;
+use classify::{ProjectCache, attach, group, short_path};
 use model::{Category, ProcessInfo, RuntimeItem, RuntimeSnapshot};
 use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 
@@ -43,14 +43,18 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 /// its `System` alive for the process lifetime.
 fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()>) {
     let mut scanner = SysinfoProcessScanner::new();
+    let mut projects = ProjectCache::default();
     let mut version = 0u64;
     loop {
         let next = (|| -> scanner::Result<RuntimeSnapshot> {
             let processes = scanner.scan()?;
+            let ports = scanner::ports::scan().unwrap_or_default();
+            let mut logical_items = group(&processes);
+            attach(&mut logical_items, &processes, &ports, &mut projects);
             let (used, total) = scanner.memory();
             version += 1;
             Ok(RuntimeSnapshot {
-                logical_items: group(&processes),
+                logical_items,
                 processes,
                 total_memory_bytes: total,
                 used_memory_bytes: used,
@@ -198,17 +202,22 @@ fn render_items(
         if item.state == model::RuntimeState::Persistent {
             line.push_str("  persistent");
         }
-        if let Some(p) = proc {
-            if let Some(tty) = &p.tty {
-                line.push_str("  ");
-                line.push_str(tty);
+        if !item.ports.is_empty() {
+            let shown: Vec<String> = item.ports.iter().take(3).map(|p| p.label()).collect();
+            line.push_str("  ");
+            line.push_str(&shown.join(","));
+            if item.ports.len() > 3 {
+                line.push_str(&format!("+{}", item.ports.len() - 3));
             }
-            if depth == 0
-                && let Some(cwd) = &p.cwd
-            {
-                line.push_str("  ");
-                line.push_str(&cwd.display().to_string());
-            }
+        }
+        if let Some(project) = &item.project {
+            line.push_str("  ");
+            line.push_str(&short_path(&project.root));
+        } else if let Some(p) = proc
+            && let Some(tty) = &p.tty
+        {
+            line.push_str("  ");
+            line.push_str(tty);
         }
         out.push(Line::from(line));
         render_items(&item.children, depth + 1, by_pid, out);

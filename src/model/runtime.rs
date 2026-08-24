@@ -1,4 +1,5 @@
-/// Logical category for a grouped runtime item.
+use crate::model::{ListeningPort, Project};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Category {
     Agent,
@@ -42,6 +43,8 @@ pub struct RuntimeItem {
     pub memory_bytes: u64,
     pub cpu_percent: f32,
     pub state: RuntimeState,
+    pub ports: Vec<ListeningPort>,
+    pub project: Option<Project>,
     pub children: Vec<RuntimeItem>,
 }
 
