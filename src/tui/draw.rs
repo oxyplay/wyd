@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
 use crate::classify::short_path;
@@ -77,6 +77,7 @@ fn draw_popup(
         .title_style(accent.add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_style(accent)
+        .padding(Padding::new(2, 2, 1, 1))
         .style(fill);
     let inner = block.inner(pop);
     frame.render_widget(block, pop);
@@ -139,7 +140,9 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
                 Paragraph::new(runtime_lines(snap, app, &rs, width)).scroll((app.scroll, 0)),
                 list,
             );
-            let pw = popup_rect(inner, 58, 50).width.saturating_sub(2) as usize;
+            let pw = popup_rect(inner, 58, 50)
+                .width
+                .saturating_sub(2 + 4) as usize;
             match app.mode {
                 Mode::Details => {
                     draw_popup(
@@ -200,7 +203,7 @@ const RAM_W: usize = 6;
 const CPU_W: usize = 6;
 const AGE_W: usize = 7;
 const WHAT_W: usize = 10;
-const FROM_W: usize = 16;
+const FROM_W: usize = 22;
 const NAME_MAX: usize = 28;
 const GAP: usize = 2;
 
@@ -390,11 +393,18 @@ fn role(item: &RuntimeItem) -> String {
     }
 }
 
-fn origin(item: &RuntimeItem, proc: Option<&ProcessInfo>) -> String {
+fn origin(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) -> String {
     if let Some(p) = &item.project {
         return short_path(&p.root);
     }
-    if let Some(tty) = proc.and_then(|p| p.tty.as_deref()) {
+    if let Some(cwd) = item.process_ids.iter().find_map(|pid| {
+        by_pid.get(pid).and_then(|p| p.cwd.as_ref())
+    }) {
+        return short_path(cwd);
+    }
+    if let Some(tty) = item.process_ids.iter().find_map(|pid| {
+        by_pid.get(pid).and_then(|p| p.tty.as_deref())
+    }) {
         return tty.to_string();
     }
     if item.state == RuntimeState::Persistent {
@@ -435,7 +445,7 @@ fn item_line(
     let mut line = cols(
         &left,
         &role(item),
-        &origin(item, proc),
+        &origin(item, by_pid),
         &fmt_bytes(item.memory_bytes),
         &cpu,
         &age,

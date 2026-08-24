@@ -1,4 +1,4 @@
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::model::ProcessInfo;
 use crate::platform::tty_of;
@@ -29,7 +29,17 @@ impl ProcessScanner for SysinfoProcessScanner {
     fn scan(&mut self) -> Result<Vec<ProcessInfo>> {
         self.sys.refresh_memory();
         self.sys.refresh_cpu_all();
-        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_cpu()
+                .with_disk_usage()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_cwd(UpdateKind::OnlyIfNotSet),
+        );
 
         let processes = self
             .sys
@@ -73,5 +83,6 @@ mod tests {
             .find(|p| p.pid == std::process::id())
             .expect("own process in snapshot");
         assert_eq!(me.parent_pid, Some(std::os::unix::process::parent_id()));
+        assert!(me.cwd.is_some(), "cwd missing for live process");
     }
 }

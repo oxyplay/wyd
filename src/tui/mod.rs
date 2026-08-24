@@ -509,7 +509,7 @@ mod tests {
             "Agents",
             "MCP",
             "● omp",
-            "chrome",
+            "mcp",
             "2 procs",
             "space mark",
         ] {
