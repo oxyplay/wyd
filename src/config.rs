@@ -18,7 +18,39 @@ pub struct Config {
     #[serde(default)]
     pub projects: ProjectsConfig,
     #[serde(default)]
+    pub keys: KeysConfig,
+    #[serde(default)]
     pub signature: Vec<SignatureConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct KeysConfig {
+    pub quit: String,
+    pub kill: String,
+    pub force_kill: String,
+    pub clean: String,
+    pub help: String,
+    pub refresh: String,
+}
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        Self {
+            quit: "q".into(),
+            kill: "k".into(),
+            force_kill: "K".into(),
+            clean: "x".into(),
+            help: "?".into(),
+            refresh: "r".into(),
+        }
+    }
+}
+
+impl KeysConfig {
+    pub fn hit(spec: &str, c: char) -> bool {
+        spec.starts_with(c)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +159,10 @@ commands = ["my-daemon"]
 [projects]
 roots = ["~/Work"]
 
+[keys]
+quit = "x"
+kill = "d"
+
 [[signature]]
 category = "agent"
 names = ["myagent"]
@@ -138,6 +174,8 @@ display = "myagent"
         let cfg = Config::load_from(&path);
         assert_eq!(cfg.leftovers.server_age_hours, 12);
         assert_eq!(cfg.persistent.commands, ["my-daemon"]);
+        assert_eq!(cfg.keys.quit, "x");
+        assert_eq!(cfg.keys.kill, "d");
         assert_eq!(cfg.signature[0].names, ["myagent"]);
         assert_eq!(cfg.signature[0].category(), Some(Category::Agent));
         let _ = std::fs::remove_dir_all(&dir);
