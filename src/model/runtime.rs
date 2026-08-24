@@ -31,6 +31,36 @@ impl Category {
 pub enum RuntimeState {
     Active,
     Persistent,
+    Suspicious,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspicionReason {
+    ParentExited,
+    NoTerminalAncestor,
+    OwningAgentMissing,
+    McpOwnerMissing,
+    HeadlessBrowserDetached,
+    LongRunningDevServer,
+}
+
+impl SuspicionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentExited => "parent exited / re-parented",
+            Self::NoTerminalAncestor => "no terminal ancestor",
+            Self::OwningAgentMissing => "owning agent missing",
+            Self::McpOwnerMissing => "MCP without owner",
+            Self::HeadlessBrowserDetached => "detached headless browser",
+            Self::LongRunningDevServer => "dev server older than threshold",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suspicion {
+    pub score: u8,
+    pub reasons: Vec<SuspicionReason>,
 }
 
 /// One grouped development runtime item (not a raw process).
@@ -43,6 +73,7 @@ pub struct RuntimeItem {
     pub memory_bytes: u64,
     pub cpu_percent: f32,
     pub state: RuntimeState,
+    pub suspicion: Option<Suspicion>,
     pub ports: Vec<ListeningPort>,
     pub project: Option<Project>,
     pub children: Vec<RuntimeItem>,

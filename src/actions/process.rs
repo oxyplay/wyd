@@ -160,6 +160,7 @@ mod tests {
             memory_bytes: 0,
             cpu_percent: 0.0,
             state: RuntimeState::Active,
+            suspicion: None,
             ports: Vec::new(),
             project: None,
             children,

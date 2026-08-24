@@ -17,6 +17,8 @@ parking_lot = "0.12"
 netstat2 = "0.11.2"
 bollard = "0.21.1"
 tokio = "1.53.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

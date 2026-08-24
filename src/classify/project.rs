@@ -17,9 +17,22 @@ const MARKERS: &[&str] = &[
 #[derive(Debug, Default)]
 pub struct ProjectCache {
     by_dir: HashMap<PathBuf, Option<Project>>,
+    extra_roots: Vec<PathBuf>,
 }
 
 impl ProjectCache {
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self {
+            by_dir: HashMap::new(),
+            extra_roots: roots.into_iter().map(|r| normalize(&r)).collect(),
+        }
+    }
+
+    fn under_configured_root(&self, dir: &Path) -> bool {
+        dir.parent()
+            .is_some_and(|parent| self.extra_roots.iter().any(|r| r == parent))
+    }
+
     pub fn detect(&mut self, start: &Path) -> Option<Project> {
         let start = normalize(start);
         let mut walked = Vec::new();
@@ -32,7 +45,7 @@ impl ProjectCache {
                 }
                 return result;
             }
-            if cur.join(".git").exists() {
+            if cur.join(".git").exists() || self.under_configured_root(cur) {
                 let project = Some(project_at(cur));
                 for dir in walked {
                     self.by_dir.insert(dir, project.clone());

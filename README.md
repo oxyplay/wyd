@@ -2,7 +2,7 @@
 
 > A fast TUI for seeing what your development tools and AI agents left running.
 
-> **Status:** prototype. Processes + Docker (containers, dangling images, volumes). Kill/`x` require `y` (volumes: `D`). Leftovers heuristics not built yet.
+> **Status:** prototype. Classifies runtime, Docker, and leftovers (`⚠` + reasons). Kill/`x` need `y` (volumes: `D`).
 
 **wyd** is a fast terminal UI for understanding, inspecting, and cleaning up your local development runtime.
 

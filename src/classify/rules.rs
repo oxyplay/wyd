@@ -22,6 +22,10 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         .unwrap_or_default();
     let hay = format!("{name} {argv0} {cmd} {exe}");
 
+    if let Some(class) = extra_signature(&name, &argv0, &hay) {
+        return Some(class);
+    }
+
     let pkg_manager = name_eq(&name, &argv0, "npm")
         || name_eq(&name, &argv0, "npx")
         || name_eq(&name, &argv0, "pnpm")
@@ -180,6 +184,34 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         }
     }
 
+    None
+}
+
+fn extra_signature(name: &str, argv0: &str, hay: &str) -> Option<Class> {
+    for sig in &crate::config::Config::global().signature {
+        let Some(category) = sig.category() else {
+            continue;
+        };
+        let hit = sig
+            .names
+            .iter()
+            .any(|n| name_eq(name, argv0, &n.to_ascii_lowercase()))
+            || sig
+                .contains
+                .iter()
+                .any(|n| hay.contains(&n.to_ascii_lowercase()));
+        if hit {
+            let display = if sig.display.is_empty() {
+                name.to_string()
+            } else {
+                sig.display.clone()
+            };
+            return Some(Class {
+                category,
+                display_name: display,
+            });
+        }
+    }
     None
 }
 

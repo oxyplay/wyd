@@ -1,5 +1,6 @@
 mod actions;
 mod classify;
+mod config;
 mod model;
 mod platform;
 mod scanner;
@@ -26,7 +27,7 @@ use ratatui::{
 };
 
 use actions::process::{self, Identity, Signal};
-use classify::{ProjectCache, attach, group, short_path};
+use classify::{ProjectCache, attach, group, leftover_count, leftover_ram, short_path};
 use model::{Category, ProcessInfo, RuntimeItem, RuntimeSnapshot};
 use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 
@@ -44,7 +45,7 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 /// its `System` alive for the process lifetime.
 fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()>) {
     let mut scanner = SysinfoProcessScanner::new();
-    let mut projects = ProjectCache::default();
+    let mut projects = ProjectCache::with_roots(config::Config::global().project_roots());
     let mut docker = model::DockerSnapshot::default();
     let mut version = 0u64;
     loop {
@@ -53,6 +54,7 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
             let ports = scanner::ports::scan().unwrap_or_default();
             let mut logical_items = group(&processes);
             attach(&mut logical_items, &processes, &ports, &mut projects);
+            classify::mark(&mut logical_items, &processes, config::Config::global());
             version += 1;
             if version == 1 || version.is_multiple_of(3) {
                 docker = crate::scanner::docker::scan_blocking();
@@ -379,8 +381,18 @@ fn list_lines(snap: &RuntimeSnapshot, selected: usize) -> Vec<Line<'static>> {
     }
     let mut lines = Vec::new();
     let overview = overview_line(&snap.logical_items);
-    if !overview.is_empty() {
+    let has_overview = !overview.is_empty();
+    if has_overview {
         lines.push(Line::from(overview));
+    }
+    let leftover_n = leftover_count(&snap.logical_items);
+    if leftover_n > 0 {
+        lines.push(Line::from(format!(
+            "⚠ leftovers {leftover_n}  ~{}",
+            fmt_bytes(leftover_ram(&snap.logical_items) + snap.docker.reclaimable_bytes)
+        )));
+    }
+    if has_overview || leftover_n > 0 {
         lines.push(Line::from(""));
     }
     let mut idx = 0usize;
@@ -450,7 +462,9 @@ fn render_items(
     let last = items.len().saturating_sub(1);
     for (i, item) in items.iter().enumerate() {
         let indent = "  ".repeat(depth);
-        let marker = if depth == 0 {
+        let marker = if item.state == model::RuntimeState::Suspicious && depth == 0 {
+            "⚠ "
+        } else if depth == 0 {
             "● "
         } else if i == last {
             "└ "
@@ -571,6 +585,13 @@ fn details_lines(snap: &RuntimeSnapshot, selected: usize) -> Vec<Line<'static>> 
                 .join("  ")
         )));
     }
+    if let Some(s) = &item.suspicion {
+        lines.push(Line::from(format!("⚠ leftover score {}", s.score)));
+        for r in &s.reasons {
+            lines.push(Line::from(format!("  · {}", r.as_str())));
+        }
+    }
+
     lines
 }
 

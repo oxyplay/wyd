@@ -9,5 +9,5 @@ pub use docker::{DockerKind, DockerResource, DockerSnapshot};
 pub use port::{ListeningPort, Protocol};
 pub use process::ProcessInfo;
 pub use project::Project;
-pub use runtime::{Category, RuntimeItem, RuntimeState};
+pub use runtime::{Category, RuntimeItem, RuntimeState, Suspicion, SuspicionReason};
 pub use snapshot::RuntimeSnapshot;
