@@ -3,7 +3,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::tty_of;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", test))]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::tty_of;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn tty_of(_pid: u32) -> Option<String> {
     None
 }
