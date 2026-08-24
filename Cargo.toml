@@ -15,6 +15,8 @@ ratatui = "0.30.2"
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 parking_lot = "0.12"
 netstat2 = "0.11.2"
+bollard = "0.21.1"
+tokio = "1.53.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

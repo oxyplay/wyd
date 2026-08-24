@@ -1,10 +1,11 @@
-use crate::model::{ProcessInfo, RuntimeItem};
+use crate::model::{DockerSnapshot, ProcessInfo, RuntimeItem};
 
 /// Immutable view of runtime state produced by the scanners, read by the TUI.
 #[derive(Debug, Default)]
 pub struct RuntimeSnapshot {
     pub processes: Vec<ProcessInfo>,
     pub logical_items: Vec<RuntimeItem>,
+    pub docker: DockerSnapshot,
     pub total_memory_bytes: u64,
     pub used_memory_bytes: u64,
     /// Aggregate CPU usage across all cores, percent.

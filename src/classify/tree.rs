@@ -144,7 +144,7 @@ mod tests {
         let forest = Forest::build(&fixture());
         assert_eq!(forest.children(130), &[140, 141]); // mem desc
         assert_eq!(forest.children(110), &[120]);
-        assert_eq!(forest.children(150), &[]);
+        assert!(forest.children(150).is_empty());
     }
 
     #[test]

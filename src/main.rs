@@ -45,6 +45,7 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()>) {
     let mut scanner = SysinfoProcessScanner::new();
     let mut projects = ProjectCache::default();
+    let mut docker = model::DockerSnapshot::default();
     let mut version = 0u64;
     loop {
         let next = (|| -> scanner::Result<RuntimeSnapshot> {
@@ -52,11 +53,15 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
             let ports = scanner::ports::scan().unwrap_or_default();
             let mut logical_items = group(&processes);
             attach(&mut logical_items, &processes, &ports, &mut projects);
-            let (used, total) = scanner.memory();
             version += 1;
+            if version == 1 || version.is_multiple_of(3) {
+                docker = crate::scanner::docker::scan_blocking();
+            }
+            let (used, total) = scanner.memory();
             Ok(RuntimeSnapshot {
                 logical_items,
                 processes,
+                docker: docker.clone(),
                 total_memory_bytes: total,
                 used_memory_bytes: used,
                 cpu_percent: scanner.cpu_percent(),
@@ -101,11 +106,12 @@ fn main() -> io::Result<()> {
     result
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Mode {
     List,
     Details,
-    Confirm { force: bool },
+    ConfirmKill { force: bool },
+    ConfirmDocker,
 }
 
 struct App {
@@ -114,6 +120,7 @@ struct App {
     mode: Mode,
     frozen: Vec<Identity>,
     frozen_title: String,
+    frozen_docker: Option<model::DockerResource>,
 }
 
 impl App {
@@ -124,8 +131,17 @@ impl App {
             mode: Mode::List,
             frozen: Vec::new(),
             frozen_title: String::new(),
+            frozen_docker: None,
         }
     }
+}
+
+fn n_proc(snap: &RuntimeSnapshot) -> usize {
+    count_items(&snap.logical_items)
+}
+
+fn n_rows(snap: &RuntimeSnapshot) -> usize {
+    n_proc(snap) + snap.docker.resources.len()
 }
 
 fn run(
@@ -137,7 +153,7 @@ fn run(
     let mut app = App::new();
     loop {
         let snap = snapshot.read();
-        let n = count_items(&snap.logical_items);
+        let n = n_rows(&snap);
         if n == 0 {
             app.selected = 0;
         } else if app.selected >= n {
@@ -186,7 +202,7 @@ fn handle_key(
                 KeyResult::Continue
             }
             KeyCode::Down => {
-                let n = count_items(&snap.logical_items);
+                let n = n_rows(snap);
                 if n > 0 {
                     app.selected = (app.selected + 1).min(n - 1);
                 }
@@ -194,13 +210,14 @@ fn handle_key(
                 KeyResult::Continue
             }
             KeyCode::Enter => {
-                if count_items(&snap.logical_items) > 0 {
+                if n_rows(snap) > 0 {
                     app.mode = Mode::Details;
                 }
                 KeyResult::Continue
             }
-            KeyCode::Char('k') => open_confirm(snap, app, false),
-            KeyCode::Char('K') => open_confirm(snap, app, true),
+            KeyCode::Char('k') => open_kill_confirm(snap, app, false),
+            KeyCode::Char('K') => open_kill_confirm(snap, app, true),
+            KeyCode::Char('x') => open_docker_confirm(snap, app),
             _ => KeyResult::Continue,
         },
         Mode::Details => match code {
@@ -208,11 +225,12 @@ fn handle_key(
                 app.mode = Mode::List;
                 KeyResult::Continue
             }
-            KeyCode::Char('k') => open_confirm(snap, app, false),
-            KeyCode::Char('K') => open_confirm(snap, app, true),
+            KeyCode::Char('k') => open_kill_confirm(snap, app, false),
+            KeyCode::Char('K') => open_kill_confirm(snap, app, true),
+            KeyCode::Char('x') => open_docker_confirm(snap, app),
             _ => KeyResult::Continue,
         },
-        Mode::Confirm { force: kill_force } => match code {
+        Mode::ConfirmKill { force: kill_force } => match code {
             KeyCode::Esc | KeyCode::Char('n') => {
                 app.mode = Mode::List;
                 KeyResult::Continue
@@ -231,17 +249,37 @@ fn handle_key(
             }
             _ => KeyResult::Continue,
         },
+        Mode::ConfirmDocker => match code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                app.mode = Mode::List;
+                app.frozen_docker = None;
+                KeyResult::Continue
+            }
+            KeyCode::Char('y') => {
+                if let Some(res) = &app.frozen_docker
+                    && !res.persistent
+                {
+                    let _ = actions::docker::remove_blocking(res);
+                    app.mode = Mode::List;
+                    app.frozen_docker = None;
+                    let _ = force.send(());
+                }
+                KeyResult::Continue
+            }
+            KeyCode::Char('D') => {
+                if let Some(res) = &app.frozen_docker
+                    && res.persistent
+                {
+                    let _ = actions::docker::remove_blocking(res);
+                    app.mode = Mode::List;
+                    app.frozen_docker = None;
+                    let _ = force.send(());
+                }
+                KeyResult::Continue
+            }
+            _ => KeyResult::Continue,
+        },
     }
-}
-
-fn open_confirm(snap: &RuntimeSnapshot, app: &mut App, kill_force: bool) -> KeyResult {
-    let Some(item) = nth_item(&snap.logical_items, app.selected) else {
-        return KeyResult::Continue;
-    };
-    app.frozen = process::identities_for(item, &snap.processes);
-    app.frozen_title = item.title();
-    app.mode = Mode::Confirm { force: kill_force };
-    KeyResult::Continue
 }
 
 fn nth_item(items: &[RuntimeItem], mut n: usize) -> Option<&RuntimeItem> {
@@ -260,6 +298,29 @@ fn nth_item(items: &[RuntimeItem], mut n: usize) -> Option<&RuntimeItem> {
     walk(items, &mut n)
 }
 
+fn open_kill_confirm(snap: &RuntimeSnapshot, app: &mut App, kill_force: bool) -> KeyResult {
+    if app.selected >= n_proc(snap) {
+        return KeyResult::Continue;
+    }
+    let Some(item) = nth_item(&snap.logical_items, app.selected) else {
+        return KeyResult::Continue;
+    };
+    app.frozen = process::identities_for(item, &snap.processes);
+    app.frozen_title = item.title();
+    app.mode = Mode::ConfirmKill { force: kill_force };
+    KeyResult::Continue
+}
+
+fn open_docker_confirm(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
+    let i = app.selected.checked_sub(n_proc(snap));
+    let Some(res) = i.and_then(|i| snap.docker.resources.get(i)) else {
+        return KeyResult::Continue;
+    };
+    app.frozen_docker = Some(res.clone());
+    app.mode = Mode::ConfirmDocker;
+    KeyResult::Continue
+}
+
 fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
@@ -270,7 +331,7 @@ fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &App) {
             fmt_bytes(snap.used_memory_bytes),
             fmt_bytes(snap.total_memory_bytes),
             snap.cpu_percent,
-            count_items(&snap.logical_items),
+            n_rows(snap),
         ))
         .borders(Borders::ALL);
     let inner = outer.inner(main);
@@ -285,16 +346,26 @@ fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &App) {
             let lines = details_lines(snap, app.selected);
             frame.render_widget(Paragraph::new(lines), inner);
         }
-        Mode::Confirm { force } => {
+        Mode::ConfirmKill { force } => {
             frame.render_widget(Paragraph::new(confirm_lines(app, force)), inner);
+        }
+        Mode::ConfirmDocker => {
+            frame.render_widget(Paragraph::new(docker_confirm_lines(app)), inner);
         }
     }
 
     let hint = match app.mode {
-        Mode::List => " ↑↓ select  enter details  k kill  K force  r refresh  q quit",
-        Mode::Details => " k kill  K force  esc back",
-        Mode::Confirm { force: true } => " y force kill  n/esc cancel",
-        Mode::Confirm { force: false } => " y terminate  n/esc cancel",
+        Mode::List => " ↑↓ select  enter details  k kill  x clean  r refresh  q quit",
+        Mode::Details => " k kill  x clean  esc back",
+        Mode::ConfirmKill { force: true } => " y force kill  n/esc cancel",
+        Mode::ConfirmKill { force: false } => " y terminate  n/esc cancel",
+        Mode::ConfirmDocker => {
+            if app.frozen_docker.as_ref().is_some_and(|r| r.persistent) {
+                " D delete volume  n/esc cancel"
+            } else {
+                " y remove  n/esc cancel"
+            }
+        }
     };
     frame.render_widget(
         Paragraph::new(hint).style(Style::default().add_modifier(Modifier::DIM)),
@@ -306,28 +377,68 @@ fn list_lines(snap: &RuntimeSnapshot, selected: usize) -> Vec<Line<'static>> {
     if snap.processes.is_empty() {
         return vec![Line::from(" scanning…")];
     }
-    if snap.logical_items.is_empty() {
-        return vec![Line::from(" no matching dev processes")];
-    }
     let mut lines = Vec::new();
     let overview = overview_line(&snap.logical_items);
     if !overview.is_empty() {
         lines.push(Line::from(overview));
         lines.push(Line::from(""));
     }
-    let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
     let mut idx = 0usize;
-    render_items(
-        &snap.logical_items,
-        0,
-        &by_pid,
-        selected,
-        &mut idx,
-        &mut lines,
-    );
+    if snap.logical_items.is_empty() {
+        lines.push(Line::from(" no matching dev processes"));
+    } else {
+        let by_pid: HashMap<u32, &ProcessInfo> =
+            snap.processes.iter().map(|p| (p.pid, p)).collect();
+        render_items(
+            &snap.logical_items,
+            0,
+            &by_pid,
+            selected,
+            &mut idx,
+            &mut lines,
+        );
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(docker_header(snap)));
+    for res in &snap.docker.resources {
+        let marker = if res.detail == "running" || res.detail == "attached" {
+            "● "
+        } else {
+            "○ "
+        };
+        let warn = if res.persistent { "⚠ " } else { "" };
+        let compose = res
+            .compose
+            .as_ref()
+            .map(|c| format!("  {c}"))
+            .unwrap_or_default();
+        let text = format!(
+            "  {marker}{warn}{:<24} {:<10} {:>9}{compose}",
+            truncate(&res.name, 24),
+            res.detail,
+            fmt_bytes(res.size_bytes),
+        );
+        let style = if idx == selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(text).style(style));
+        idx += 1;
+    }
     lines
 }
 
+fn docker_header(snap: &RuntimeSnapshot) -> String {
+    if !snap.docker.ok {
+        return format!("DOCKER ○ {}", snap.docker.note);
+    }
+    format!(
+        "DOCKER  disk {}  reclaimable {}",
+        fmt_bytes(snap.docker.disk_bytes),
+        fmt_bytes(snap.docker.reclaimable_bytes)
+    )
+}
 fn render_items(
     items: &[RuntimeItem],
     depth: usize,
@@ -388,6 +499,11 @@ fn render_items(
 }
 
 fn details_lines(snap: &RuntimeSnapshot, selected: usize) -> Vec<Line<'static>> {
+    if let Some(i) = selected.checked_sub(n_proc(snap))
+        && let Some(res) = snap.docker.resources.get(i)
+    {
+        return docker_details(res);
+    }
     let Some(item) = nth_item(&snap.logical_items, selected) else {
         return vec![Line::from(" no item")];
     };
@@ -481,6 +597,51 @@ fn confirm_lines(app: &App, force: bool) -> Vec<Line<'static>> {
     lines.push(Line::from(
         "Identity is re-checked (PID + start time) before each signal.",
     ));
+    lines
+}
+
+fn docker_details(res: &model::DockerResource) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("{}  {}", res.name, res.kind.label())),
+        Line::from(""),
+        Line::from(format!("id      {}", res.id)),
+        Line::from(format!("state   {}", res.detail)),
+        Line::from(format!("size    {}", fmt_bytes(res.size_bytes))),
+    ];
+    if let Some(c) = &res.compose {
+        lines.push(Line::from(format!("compose {c}")));
+    }
+    if res.persistent {
+        lines.push(Line::from("⚠ PERSISTENT DATA — may contain a database"));
+    }
+    lines
+}
+
+fn docker_confirm_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(res) = &app.frozen_docker else {
+        return vec![Line::from(" no docker target")];
+    };
+    let mut lines = Vec::new();
+    if res.persistent {
+        lines.push(Line::from("⚠ PERSISTENT DATA"));
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("Delete volume {}?", res.name)));
+        lines.push(Line::from(format!("size  {}", fmt_bytes(res.size_bytes))));
+        if let Some(c) = &res.compose {
+            lines.push(Line::from(format!("compose {c}")));
+        }
+        lines.push(Line::from("This volume may contain database data."));
+        lines.push(Line::from(""));
+        lines.push(Line::from("[D] Delete permanently    [Esc] Cancel"));
+    } else {
+        lines.push(Line::from(format!(
+            "Remove {} {}?",
+            res.kind.label(),
+            res.name
+        )));
+        lines.push(Line::from(format!("size  {}", fmt_bytes(res.size_bytes))));
+        lines.push(Line::from(format!("id    {}", res.id)));
+    }
     lines
 }
 
@@ -596,6 +757,7 @@ mod tests {
         RuntimeSnapshot {
             logical_items: group(&processes),
             processes,
+            docker: model::DockerSnapshot::default(),
             total_memory_bytes: 32 << 30,
             used_memory_bytes: 7 << 30,
             cpu_percent: 12.0,
@@ -672,7 +834,7 @@ mod tests {
     fn confirm_lists_frozen_pids() {
         let snap = fixture_snapshot();
         let mut app = App::new();
-        open_confirm(&snap, &mut app, false);
+        open_kill_confirm(&snap, &mut app, false);
         assert!(!app.frozen.is_empty());
         let text: String = confirm_lines(&app, false)
             .into_iter()
@@ -687,9 +849,51 @@ mod tests {
     fn enter_does_not_confirm_kill() {
         let snap = fixture_snapshot();
         let mut app = App::new();
-        open_confirm(&snap, &mut app, false);
+        open_kill_confirm(&snap, &mut app, false);
         let (tx, _rx) = mpsc::channel();
         handle_key(KeyCode::Enter, &snap, &mut app, &tx);
-        assert!(matches!(app.mode, Mode::Confirm { force: false }));
+        assert!(matches!(app.mode, Mode::ConfirmKill { force: false }));
+    }
+
+    #[test]
+    fn docker_down_is_visible_and_volume_needs_d() {
+        let mut snap = fixture_snapshot();
+        snap.docker = model::DockerSnapshot {
+            ok: true,
+            note: String::new(),
+            disk_bytes: 1 << 30,
+            reclaimable_bytes: 100,
+            resources: vec![model::DockerResource {
+                kind: model::DockerKind::Volume,
+                id: "old_pg".into(),
+                name: "old_pg".into(),
+                detail: "unused".into(),
+                size_bytes: 6 << 30,
+                compose: Some("oldproject".into()),
+                persistent: true,
+            }],
+        };
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &App::new())).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("DOCKER"), "{rendered}");
+        assert!(rendered.contains("old_pg"), "{rendered}");
+
+        let mut app = App::new();
+        app.selected = n_proc(&snap); // first docker row
+        open_docker_confirm(&snap, &mut app);
+        let text: String = docker_confirm_lines(&app)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("PERSISTENT DATA"), "{text}");
+        let (tx, _rx) = mpsc::channel();
+        handle_key(KeyCode::Char('y'), &snap, &mut app, &tx);
+        assert!(
+            matches!(app.mode, Mode::ConfirmDocker),
+            "y must not delete a volume"
+        );
     }
 }

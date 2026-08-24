@@ -1,6 +1,6 @@
+pub mod docker;
 pub mod ports;
 pub mod processes;
-
 use crate::model::ProcessInfo;
 
 /// Implementations must never spawn external commands per refresh.
