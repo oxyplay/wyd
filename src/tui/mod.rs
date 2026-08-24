@@ -122,7 +122,7 @@ fn run(
         app.clamp(&snap);
         if snap.version != drawn_version {
             drawn_version = snap.version;
-            terminal.draw(|f| ui(f, &snap, &app))?;
+            terminal.draw(|f| ui(f, &snap, &mut app))?;
         }
         drop(snap);
 
@@ -134,7 +134,7 @@ fn run(
                     KeyResult::Continue => {}
                 }
             }
-            terminal.draw(|f| ui(f, &snapshot.read(), &app))?;
+            terminal.draw(|f| ui(f, &snapshot.read(), &mut app))?;
         }
     }
 }
@@ -349,7 +349,6 @@ fn move_sel(app: &mut App, snap: &RuntimeSnapshot, delta: i32) {
         }
         let next = app.selected as i32 + delta;
         app.selected = next.clamp(0, n as i32 - 1) as usize;
-        app.scroll = app.selected.saturating_sub(2) as u16;
     }
 }
 
@@ -499,7 +498,8 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let snap = fixture_snapshot();
-        terminal.draw(|f| ui(f, &snap, &App::new())).unwrap();
+        let mut app = App::new();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
         for expected in [
             "wyd",
@@ -509,8 +509,8 @@ mod tests {
             "Agents",
             "MCP",
             "● omp",
-            "chrome-devtools-mcp",
-            "Chromium ×2",
+            "chrome",
+            "2 procs",
             "space mark",
         ] {
             assert!(
@@ -528,8 +528,9 @@ mod tests {
     fn renders_empty_snapshot_as_scanning() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
         terminal
-            .draw(|f| ui(f, &RuntimeSnapshot::default(), &App::new()))
+            .draw(|f| ui(f, &RuntimeSnapshot::default(), &mut app))
             .unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("scanning…"), "{rendered}");
@@ -546,14 +547,27 @@ mod tests {
     }
 
     #[test]
+    fn scroll_keeps_selection_in_view() {
+        let mut app = App::new();
+        app.selected = 20;
+        app.scroll = 0;
+        super::draw::follow_selected(&mut app, 10);
+        assert_eq!(app.scroll, 11);
+        app.selected = 2;
+        super::draw::follow_selected(&mut app, 10);
+        assert_eq!(app.scroll, 2);
+    }
+
+    #[test]
     fn details_show_pid_and_command() {
         let snap = fixture_snapshot();
-        let text: String = details_lines(&snap, &App::new())
+        let text: String = details_lines(&snap, &App::new(), 80)
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("PID  100"), "{text}");
+        assert!(text.contains("pid"), "{text}");
+        assert!(text.contains("100"), "{text}");
         assert!(text.contains("omp"), "{text}");
         assert!(text.contains("children"), "{text}");
     }
@@ -564,13 +578,14 @@ mod tests {
         let mut app = App::new();
         open_kill_confirm(&snap, &mut app, false);
         assert!(!app.frozen.is_empty());
-        let text: String = confirm_lines(&app, false)
+        let text: String = confirm_lines(&app, false, 80)
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Terminate omp"), "{text}");
-        assert!(text.contains("PID 100"), "{text}");
+        assert!(text.contains("omp"), "{text}");
+        assert!(text.contains("100"), "{text}");
+        assert!(text.contains("term"), "{text}");
     }
 
     #[test]
@@ -605,12 +620,12 @@ mod tests {
         app.section = Section::Docker;
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| ui(f, &snap, &app)).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("old_pg"), "{rendered}");
 
         open_docker_confirm(&snap, &mut app);
-        let text: String = docker_confirm_lines(&app)
+        let text: String = docker_confirm_lines(&app, 80)
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -750,7 +765,7 @@ mod tests {
         handle_key(KeyCode::Char(' '), &snap, &mut app, &tx);
         open_docker_confirm(&snap, &mut app);
         assert_eq!(app.frozen_docker.len(), 2);
-        let text: String = docker_confirm_lines(&app)
+        let text: String = docker_confirm_lines(&app, 80)
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()

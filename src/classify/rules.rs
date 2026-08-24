@@ -106,7 +106,9 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
     }
 
     // Dev servers — before generic node/python.
-    if hay.contains("node_modules/.bin/vite") || name_eq(&name, &argv0, "vite") {
+    // Real Vite is `node …/node_modules/vite/bin/vite.js`; `.bin/vite` is
+    // only the symlink form.
+    if is_vite(&hay, &name, &argv0) {
         return Some(dev(Category::DevServer, "vite"));
     }
     if hay.contains("next dev") || hay.contains("next-server") || hay.contains("node_modules/next")
@@ -235,6 +237,17 @@ fn argv0_base(p: &ProcessInfo) -> String {
         .to_ascii_lowercase()
 }
 
+pub(crate) fn is_vite(hay: &str, name: &str, argv0: &str) -> bool {
+    name_eq(name, argv0, "vite")
+        || hay.contains("node_modules/.bin/vite")
+        || hay.contains("node_modules/vite")
+        || hay.contains("/vite/bin/vite")
+        || hay.contains("vite/dist/node/cli")
+        || hay
+            .split(['/', '\\', ' ', ':'])
+            .any(|p| p == "vite" || p == "vite.js")
+}
+
 fn is_chromium_family(name: &str, argv0: &str, hay: &str) -> bool {
     const HINTS: &[&str] = &[
         "chromium",
@@ -316,6 +329,16 @@ mod tests {
     fn vite_bin_is_dev_server() {
         let p = proc("node", &["node", "node_modules/.bin/vite"]);
         assert_eq!(cat(p), Some((Category::DevServer, "vite".into())));
+        let resolved = proc(
+            "node",
+            &[
+                "node",
+                "/Users/x/app/node_modules/vite/bin/vite.js",
+                "--port",
+                "3000",
+            ],
+        );
+        assert_eq!(cat(resolved), Some((Category::DevServer, "vite".into())));
     }
 
     #[test]

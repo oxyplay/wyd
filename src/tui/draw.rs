@@ -2,64 +2,229 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
-    style::{Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, Paragraph},
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::classify::short_path;
 use crate::config;
 use crate::model::{DockerResource, ProcessInfo, RuntimeItem, RuntimeSnapshot, RuntimeState};
 
-use super::rows::{self, Row, fmt_age, fmt_bytes, truncate};
+use super::rows::{self, Row, Section, fmt_age, fmt_bytes, truncate};
 use super::{App, Focus, Mode};
 
-pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &App) {
+const CYAN: Color = Color::Cyan;
+const YELLOW: Color = Color::Yellow;
+const RED: Color = Color::LightRed;
+const DIM: Color = Color::DarkGray;
+
+fn chrome() -> Style {
+    Style::new().fg(CYAN)
+}
+fn warn() -> Style {
+    Style::new().fg(YELLOW)
+}
+fn hot() -> Style {
+    Style::new().fg(RED)
+}
+fn dim() -> Style {
+    Style::new().fg(DIM)
+}
+
+fn pane(title: &str, focused: bool) -> Block<'static> {
+    let style = if focused {
+        chrome().add_modifier(Modifier::BOLD)
+    } else {
+        dim()
+    };
+    Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title_style(style)
+}
+
+fn popup_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let [_, mid, _] = Layout::vertical([
+        Constraint::Percentage((100 - pct_y) / 2),
+        Constraint::Percentage(pct_y),
+        Constraint::Percentage((100 - pct_y) / 2),
+    ])
+    .areas(area);
+    let [_, pop, _] = Layout::horizontal([
+        Constraint::Percentage((100 - pct_x) / 2),
+        Constraint::Percentage(pct_x),
+        Constraint::Percentage((100 - pct_x) / 2),
+    ])
+    .areas(mid);
+    pop
+}
+
+fn draw_popup(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    accent: Style,
+    lines: Vec<Line<'static>>,
+) {
+    let pop = popup_rect(area, 58, 50);
+    frame.render_widget(Clear, pop);
+    let fill = Style::new().bg(Color::Black);
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .title_style(accent.add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(accent)
+        .style(fill);
+    let inner = block.inner(pop);
+    frame.render_widget(block, pop);
+    frame.render_widget(
+        Paragraph::new(lines).style(fill).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
-
     let rs = app.rows(snap);
+    let title = Line::from(vec![
+        Span::styled(" wyd ", chrome().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(
+                "RAM {}/{}",
+                fmt_bytes(snap.used_memory_bytes),
+                fmt_bytes(snap.total_memory_bytes)
+            ),
+            chrome(),
+        ),
+        Span::styled(
+            format!(" │ CPU {:.0}% │ {} items ", snap.cpu_percent, rs.len()),
+            dim(),
+        ),
+    ]);
+    let (border, title_style) = match app.mode {
+        Mode::ConfirmKill { force: true } => (hot(), hot().add_modifier(Modifier::BOLD)),
+        Mode::ConfirmDocker if app.frozen_docker.iter().any(|r| r.persistent) => (warn(), warn()),
+        _ => (chrome(), chrome()),
+    };
     let outer = Block::default()
-        .title(format!(
-            " wyd ── RAM {}/{} │ CPU {:.0}% │ {} items ",
-            fmt_bytes(snap.used_memory_bytes),
-            fmt_bytes(snap.total_memory_bytes),
-            snap.cpu_percent,
-            rs.len(),
-        ))
-        .borders(Borders::ALL);
+        .title(title)
+        .title_style(title_style)
+        .borders(Borders::ALL)
+        .border_style(border);
     let inner = outer.inner(main);
     frame.render_widget(outer, main);
 
     match app.mode {
-        Mode::List => {
+        Mode::List | Mode::Details | Mode::ConfirmKill { .. } | Mode::ConfirmDocker => {
             let [left, right] =
-                Layout::horizontal([Constraint::Length(26), Constraint::Min(20)]).areas(inner);
-            frame.render_widget(Paragraph::new(overview_lines(snap, app)), left);
+                Layout::horizontal([Constraint::Length(28), Constraint::Min(20)]).areas(inner);
             frame.render_widget(
-                Paragraph::new(runtime_lines(snap, app, &rs)).scroll((app.scroll, 0)),
-                right,
+                Paragraph::new(overview_lines(snap, app))
+                    .block(pane("Overview", app.focus == Focus::Overview)),
+                left,
             );
-        }
-        Mode::Details => {
-            frame.render_widget(Paragraph::new(details_lines(snap, app)), inner);
+            let block = pane(app.section.title(), app.focus == Focus::Runtime);
+            let body = block.inner(right);
+            frame.render_widget(block, right);
+            let [head, list] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+            let width = list.width as usize;
+            follow_selected(app, list.height);
+            frame.render_widget(Paragraph::new(col_header(width)), head);
+            frame.render_widget(
+                Paragraph::new(runtime_lines(snap, app, &rs, width)).scroll((app.scroll, 0)),
+                list,
+            );
+            let pw = popup_rect(inner, 58, 50).width.saturating_sub(2) as usize;
+            match app.mode {
+                Mode::Details => {
+                    draw_popup(
+                        frame,
+                        inner,
+                        "details",
+                        chrome(),
+                        details_lines(snap, app, pw),
+                    );
+                }
+                Mode::ConfirmKill { force } => {
+                    let (title, accent) = if force {
+                        ("force kill", hot())
+                    } else {
+                        ("terminate", warn())
+                    };
+                    draw_popup(frame, inner, title, accent, confirm_lines(app, force, pw));
+                }
+                Mode::ConfirmDocker => {
+                    draw_popup(
+                        frame,
+                        inner,
+                        "docker",
+                        if app.frozen_docker.iter().any(|r| r.persistent) {
+                            warn()
+                        } else {
+                            chrome()
+                        },
+                        docker_confirm_lines(app, pw),
+                    );
+                }
+                _ => {}
+            }
         }
         Mode::Help => {
             frame.render_widget(Paragraph::new(help_lines()), inner);
         }
-        Mode::ConfirmKill { force } => {
-            frame.render_widget(Paragraph::new(confirm_lines(app, force)), inner);
-        }
-        Mode::ConfirmDocker => {
-            frame.render_widget(Paragraph::new(docker_confirm_lines(app)), inner);
-        }
     }
 
-    frame.render_widget(
-        Paragraph::new(hint(app)).style(Style::default().add_modifier(Modifier::DIM)),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(hint(app)).style(dim()), footer);
+}
+
+pub(super) fn follow_selected(app: &mut App, view_h: u16) {
+    let h = view_h as usize;
+    if h == 0 {
+        return;
+    }
+    let sel = app.selected;
+    let scroll = app.scroll as usize;
+    if sel < scroll {
+        app.scroll = sel as u16;
+    } else if sel >= scroll + h {
+        app.scroll = (sel + 1 - h) as u16;
+    }
+}
+
+const RAM_W: usize = 6;
+const CPU_W: usize = 6;
+const AGE_W: usize = 7;
+const WHAT_W: usize = 10;
+const FROM_W: usize = 16;
+const NAME_MAX: usize = 28;
+const GAP: usize = 2;
+
+fn name_width(total: usize) -> usize {
+    let meta = WHAT_W + FROM_W + RAM_W + CPU_W + AGE_W + GAP * 5;
+    NAME_MAX.min(total.saturating_sub(meta)).max(10)
+}
+
+fn col_header(width: usize) -> Line<'static> {
+    let nw = name_width(width);
+    let g = " ".repeat(GAP);
+    Line::from(format!(
+        "{:<nw$}{g}{:<WHAT_W$}{g}{:<FROM_W$}{g}{:>RAM_W$}{g}{:>CPU_W$}{g}{:>AGE_W$}",
+        "NAME", "WHAT", "FROM", "RAM", "CPU", "AGE"
+    ))
+    .style(dim())
+}
+
+fn select_bar(line: Line<'static>, on: bool) -> Line<'static> {
+    if !on {
+        return line;
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    Line::from(text).style(Style::new().fg(Color::Black).bg(CYAN))
 }
 
 fn hint(app: &App) -> String {
@@ -91,7 +256,7 @@ fn hint(app: &App) -> String {
 }
 
 fn overview_lines(snap: &RuntimeSnapshot, app: &App) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from("Overview")];
+    let mut lines = Vec::new();
     for (i, row) in rows::overview(snap).into_iter().enumerate() {
         let mark = if row.section == app.section {
             "▸"
@@ -104,63 +269,139 @@ fn overview_lines(snap: &RuntimeSnapshot, app: &App) -> Vec<Line<'static>> {
             format!("  {}", row.extra)
         };
         let text = format!("{mark}{:<12} {:>3}{extra}", row.label, row.count);
-        let mut style = Style::default();
-        if app.focus == Focus::Overview && i == app.ov_sel {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        lines.push(Line::from(text).style(style));
+        let style = if row.section == Section::Leftovers && row.count > 0 {
+            warn()
+        } else if row.count == 0 && row.section != Section::All {
+            dim()
+        } else if row.section == app.section {
+            chrome()
+        } else {
+            Style::default()
+        };
+        let on = app.focus == Focus::Overview && i == app.ov_sel;
+        lines.push(select_bar(Line::from(text).style(style), on));
     }
     if let Some(p) = &app.project {
         lines.push(Line::from(""));
-        lines.push(Line::from(format!("filter {p}")));
+        lines.push(Line::from(format!("filter {p}")).style(chrome()));
     }
     lines
 }
 
-fn runtime_lines(snap: &RuntimeSnapshot, app: &App, rs: &[Row<'_>]) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(app.section.title())];
+fn runtime_lines(
+    snap: &RuntimeSnapshot,
+    app: &App,
+    rs: &[Row<'_>],
+    width: usize,
+) -> Vec<Line<'static>> {
     if snap.processes.is_empty() {
-        lines.push(Line::from(" scanning…"));
-        return lines;
+        return vec![Line::from(" scanning…").style(dim())];
     }
     if rs.is_empty() {
-        lines.push(Line::from(" no matching items"));
-        return lines;
+        return vec![Line::from(" no matching items").style(dim())];
     }
     let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
-    for (idx, row) in rs.iter().enumerate() {
-        let text = match row {
-            Row::Item { item, depth, last } => {
-                item_line(item, *depth, *last, &by_pid, &app.marked, idx)
-            }
-            Row::Docker(res) => docker_line(res, &app.marked, idx),
-            Row::Port { port, owner } => {
-                let proj = owner
-                    .project
-                    .as_ref()
-                    .map(|p| format!("  {}", short_path(&p.root)))
-                    .unwrap_or_default();
-                format!(
-                    " :{:<6} {:<20}{proj}",
-                    port.port,
-                    truncate(&owner.title(), 20)
-                )
-            }
-            Row::Project { name, ram, kids } => {
-                format!(
-                    " {:<22} {:>8}  {kids} items",
-                    truncate(name, 22),
-                    fmt_bytes(*ram)
-                )
-            }
-        };
-        let mut style = Style::default();
-        if app.focus == Focus::Runtime && idx == app.selected {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        lines.push(Line::from(text).style(style));
+    let nw = name_width(width);
+    rs.iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let line = match row {
+                Row::Item { item, depth, last } => {
+                    item_line(item, *depth, *last, &by_pid, &app.marked, idx, nw)
+                }
+                Row::Docker(res) => docker_line(res, &app.marked, idx, nw),
+                Row::Port { port, owner } => {
+                    let from = owner
+                        .project
+                        .as_ref()
+                        .map(|p| short_path(&p.root))
+                        .unwrap_or_else(|| "—".into());
+                    let left = pad_name(&format!(" :{}", port.port), "", nw);
+                    cols(&left, &owner.title(), &from, "", "", "")
+                }
+                Row::Project { name, ram, kids } => {
+                    let left = pad_name(name, "", nw);
+                    cols(
+                        &left,
+                        "project",
+                        &format!("{kids} items"),
+                        &fmt_bytes(*ram),
+                        "",
+                        "",
+                    )
+                }
+            };
+            select_bar(line, app.focus == Focus::Runtime && idx == app.selected)
+        })
+        .collect()
+}
+
+fn pad_name(title: &str, extra: &str, nw: usize) -> String {
+    let extra_n = extra.chars().count();
+    let budget = if extra_n > 0 && extra_n < nw {
+        nw - extra_n
+    } else {
+        nw
+    };
+    let t = truncate(title, budget.max(1));
+    let mut s = if extra_n > 0 && t.chars().count() + extra_n <= nw {
+        format!("{t}{extra}")
+    } else {
+        t
+    };
+    let n = s.chars().count();
+    if n < nw {
+        s.push_str(&" ".repeat(nw - n));
     }
-    lines
+    s
+}
+
+fn cols(name: &str, what: &str, from: &str, ram: &str, cpu: &str, age: &str) -> Line<'static> {
+    let g = " ".repeat(GAP);
+    Line::from(vec![
+        Span::raw(name.to_string()),
+        Span::styled(format!("{g}{:<WHAT_W$}", truncate(what, WHAT_W)), dim()),
+        Span::styled(format!("{g}{:<FROM_W$}", truncate(from, FROM_W)), chrome()),
+        Span::styled(format!("{g}{ram:>RAM_W$}"), chrome()),
+        Span::styled(format!("{g}{cpu:>CPU_W$}"), dim()),
+        Span::styled(format!("{g}{age:>AGE_W$}"), dim()),
+    ])
+}
+
+fn role(item: &RuntimeItem) -> String {
+    let n = item.process_ids.len();
+    if n > 1 {
+        return format!("{n} procs");
+    }
+    let port = item.ports.iter().map(|p| p.port).min();
+    match item.category {
+        crate::model::Category::Agent => "agent".into(),
+        crate::model::Category::Mcp => "mcp".into(),
+        crate::model::Category::Browser => "browser".into(),
+        crate::model::Category::DevServer => port
+            .map(|p| format!("srv :{p}"))
+            .unwrap_or_else(|| "server".into()),
+        crate::model::Category::Database => port
+            .map(|p| format!("db :{p}"))
+            .unwrap_or_else(|| "db".into()),
+        crate::model::Category::LanguageServer => "lsp".into(),
+        crate::model::Category::DevService => "svc".into(),
+        crate::model::Category::UnknownDev => "dev".into(),
+    }
+}
+
+fn origin(item: &RuntimeItem, proc: Option<&ProcessInfo>) -> String {
+    if let Some(p) = &item.project {
+        return short_path(&p.root);
+    }
+    if let Some(tty) = proc.and_then(|p| p.tty.as_deref()) {
+        return tty.to_string();
+    }
+    if item.state == RuntimeState::Persistent {
+        "svc".into()
+    } else {
+        "—".into()
+    }
 }
 
 fn item_line(
@@ -170,9 +411,11 @@ fn item_line(
     by_pid: &HashMap<u32, &ProcessInfo>,
     marked: &HashSet<usize>,
     idx: usize,
-) -> String {
+    nw: usize,
+) -> Line<'static> {
     let indent = "  ".repeat(depth);
-    let marker = if item.state == RuntimeState::Suspicious && depth == 0 {
+    let leftover = item.state == RuntimeState::Suspicious;
+    let marker = if leftover && depth == 0 {
         "⚠ "
     } else if depth == 0 {
         "● "
@@ -186,122 +429,124 @@ fn item_line(
         .map(|p| fmt_age(p.start_time))
         .unwrap_or_else(|| "—".into());
     let star = if marked.contains(&idx) { "*" } else { " " };
-    let mut text = format!(
-        "{indent}{star}{marker}{:<28} {:>8} {:>5.1}%  {age}",
-        truncate(&item.title(), 28),
-        fmt_bytes(item.memory_bytes),
-        item.cpu_percent,
+    let prefix = format!("{indent}{star}{marker}");
+    let left = pad_name(&format!("{prefix}{}", item.display_name), "", nw);
+    let cpu = format!("{:.1}%", item.cpu_percent);
+    let mut line = cols(
+        &left,
+        &role(item),
+        &origin(item, proc),
+        &fmt_bytes(item.memory_bytes),
+        &cpu,
+        &age,
     );
-    if item.state == RuntimeState::Persistent {
-        text.push_str("  persistent");
+    if leftover && let Some(span) = line.spans.get_mut(0) {
+        span.style = warn();
     }
-    if !item.ports.is_empty() {
-        let shown: Vec<String> = item.ports.iter().take(3).map(|p| p.label()).collect();
-        text.push(' ');
-        text.push_str(&shown.join(","));
-    }
-    if let Some(project) = &item.project {
-        text.push_str("  ");
-        text.push_str(&short_path(&project.root));
-    } else if let Some(p) = proc
-        && let Some(tty) = &p.tty
-    {
-        text.push_str("  ");
-        text.push_str(tty);
-    }
-    text
+    line
 }
 
-fn docker_line(res: &DockerResource, marked: &HashSet<usize>, idx: usize) -> String {
-    let marker = if res.detail == "running" || res.detail == "attached" {
-        "● "
-    } else {
-        "○ "
-    };
-    let warn = if res.persistent { "⚠ " } else { "" };
-    let compose = res
-        .compose
-        .as_ref()
-        .map(|c| format!("  {c}"))
-        .unwrap_or_default();
+fn docker_line(
+    res: &DockerResource,
+    marked: &HashSet<usize>,
+    idx: usize,
+    nw: usize,
+) -> Line<'static> {
+    let running = res.detail == "running" || res.detail == "attached";
+    let marker = if running { "● " } else { "○ " };
     let star = if marked.contains(&idx) { "*" } else { " " };
-    format!(
-        " {star}{marker}{warn}{:<20} {:<10} {:>8}{compose}",
-        truncate(&res.name, 20),
-        res.detail,
-        fmt_bytes(res.size_bytes),
+    let from = res.compose.clone().unwrap_or_else(|| "—".into());
+    let left = pad_name(&format!(" {star}{marker}{}", res.name), "", nw);
+    cols(
+        &left,
+        res.kind.label(),
+        &from,
+        &fmt_bytes(res.size_bytes),
+        "",
+        &res.detail,
     )
 }
 
-pub fn details_lines(snap: &RuntimeSnapshot, app: &App) -> Vec<Line<'static>> {
+pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Line<'static>> {
     let rs = app.rows(snap);
     match rs.get(app.selected) {
-        Some(Row::Item { item, .. }) => item_details(item, snap),
-        Some(Row::Docker(res)) => docker_details(res),
+        Some(Row::Item { item, .. }) => item_details(item, snap, width),
+        Some(Row::Docker(res)) => docker_details(res, width),
         Some(Row::Port { port, owner }) => {
-            let mut lines = vec![
-                Line::from(format!("{}  {}", port.label(), owner.title())),
-                Line::from(""),
-                Line::from(format!("pid   {}", port.pid)),
-                Line::from(format!("{}:{}", port.address, port.port)),
-            ];
-            if let Some(p) = &owner.project {
-                lines.push(Line::from(format!(
-                    "project  {}  {}",
-                    p.name,
-                    short_path(&p.root)
-                )));
-            }
+            let nw = name_width(width);
+            let mut lines = vec![col_header(width)];
+            let from = owner
+                .project
+                .as_ref()
+                .map(|p| short_path(&p.root))
+                .unwrap_or_else(|| "—".into());
+            lines.push(cols(
+                &pad_name(&format!(":{}", port.port), "", nw),
+                &owner.display_name,
+                &from,
+                "",
+                "",
+                "",
+            ));
+            lines.push(Line::from(""));
+            lines.push(fact_row("pid", &port.pid.to_string(), nw));
+            lines.push(fact_row(
+                "addr",
+                &format!("{}:{}", port.address, port.port),
+                nw,
+            ));
             lines
         }
-        Some(Row::Project { name, ram, kids }) => vec![
-            Line::from(name.clone()),
-            Line::from(""),
-            Line::from(format!("RAM   {}", fmt_bytes(*ram))),
-            Line::from(format!("items {kids}")),
-            Line::from("enter  filter other views to this project"),
-        ],
+        Some(Row::Project { name, ram, kids }) => {
+            let nw = name_width(width);
+            vec![
+                col_header(width),
+                cols(
+                    &pad_name(name, "", nw),
+                    "project",
+                    "",
+                    &fmt_bytes(*ram),
+                    "",
+                    "",
+                ),
+                Line::from(""),
+                fact_row("items", &kids.to_string(), nw),
+            ]
+        }
         None => vec![Line::from(" no item")],
     }
 }
 
-fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot) -> Vec<Line<'static>> {
+fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot, width: usize) -> Vec<Line<'static>> {
     let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
     let proc = item.root_pid.and_then(|pid| by_pid.get(&pid).copied());
+    let nw = name_width(width);
     let mut lines = vec![
-        Line::from(format!("{}  {}", item.title(), item.category.label())),
+        col_header(width),
+        item_line(item, 0, true, &by_pid, &HashSet::new(), 0, nw),
         Line::from(""),
     ];
     if let Some(p) = proc {
-        lines.push(Line::from(format!(
-            "PID  {}    PPID  {}",
-            p.pid,
-            p.parent_pid
+        lines.push(fact_row("pid", &p.pid.to_string(), nw));
+        lines.push(fact_row(
+            "ppid",
+            &p.parent_pid
                 .map(|n| n.to_string())
-                .unwrap_or_else(|| "—".into())
-        )));
-        lines.push(Line::from(format!(
-            "RAM  {}    CPU  {:.1}%    age  {}",
-            fmt_bytes(p.memory_bytes),
-            p.cpu_percent,
-            fmt_age(p.start_time)
-        )));
+                .unwrap_or_else(|| "—".into()),
+            nw,
+        ));
         if !p.command.is_empty() {
-            lines.push(Line::from(format!("cmd  {}", p.command.join(" "))));
+            lines.push(fact_row("cmd", &p.command.join(" "), nw));
         }
         if let Some(cwd) = &p.cwd {
-            lines.push(Line::from(format!("cwd  {}", short_path(cwd))));
+            lines.push(fact_row("cwd", &short_path(cwd), nw));
         }
         if let Some(tty) = &p.tty {
-            lines.push(Line::from(format!("tty  {tty}")));
+            lines.push(fact_row("tty", tty, nw));
         }
     }
     if let Some(project) = &item.project {
-        lines.push(Line::from(format!(
-            "project  {}  {}",
-            project.name,
-            short_path(&project.root)
-        )));
+        lines.push(fact_row("project", &short_path(&project.root), nw));
     }
     if !item.ports.is_empty() {
         let ports = item
@@ -309,143 +554,165 @@ fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot) -> Vec<Line<'static>
             .iter()
             .map(|p| format!("{}:{}", p.address, p.port))
             .collect::<Vec<_>>()
-            .join("  ");
-        lines.push(Line::from(format!("ports  {ports}")));
+            .join(" ");
+        lines.push(fact_row("ports", &ports, nw));
     }
-    lines.push(Line::from(format!(
-        "processes  {}",
-        item.process_ids
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    )));
-    if !item.children.is_empty() {
-        lines.push(Line::from(format!(
-            "children  {}",
-            item.children
+    if item.process_ids.len() > 1 {
+        lines.push(fact_row(
+            "procs",
+            &item
+                .process_ids
                 .iter()
-                .map(|c| c.title())
+                .map(|p| p.to_string())
                 .collect::<Vec<_>>()
-                .join("  ")
-        )));
+                .join(" "),
+            nw,
+        ));
+    }
+    if !item.children.is_empty() {
+        lines.push(fact_row(
+            "children",
+            &item
+                .children
+                .iter()
+                .map(|c| c.display_name.clone())
+                .collect::<Vec<_>>()
+                .join("  "),
+            nw,
+        ));
     }
     if let Some(s) = &item.suspicion {
-        lines.push(Line::from(format!("⚠ leftover score {}", s.score)));
+        lines.push(Line::from(""));
+        lines.push(fact_row("leftover", &format!("score {}", s.score), nw).style(warn()));
         for r in &s.reasons {
-            lines.push(Line::from(format!("  · {}", r.as_str())));
+            lines.push(fact_row("", r.as_str(), nw).style(warn()));
         }
     }
     lines
 }
 
-pub fn confirm_lines(app: &App, force: bool) -> Vec<Line<'static>> {
-    let verb = if force { "Force kill" } else { "Terminate" };
+fn fact_row(label: &str, value: &str, nw: usize) -> Line<'static> {
+    cols(&pad_name(label, "", nw), "", value, "", "", "")
+}
+
+pub fn confirm_lines(app: &App, force: bool, width: usize) -> Vec<Line<'static>> {
+    let nw = name_width(width);
+    let what = if force { "kill" } else { "term" };
     let mut lines = vec![
-        Line::from(format!(
-            "{verb} {} ({} processes)?",
-            app.frozen_title,
-            app.frozen.len()
-        )),
+        col_header(width),
+        cols(
+            &pad_name(&app.frozen_title, "", nw),
+            what,
+            "",
+            "",
+            "",
+            &format!("{}x", app.frozen.len()),
+        ),
         Line::from(""),
     ];
     for id in app.frozen.iter().take(12) {
-        lines.push(Line::from(format!(
-            "  PID {}  start {}",
-            id.pid, id.start_time
-        )));
+        lines.push(fact_row(
+            &format!("pid {}", id.pid),
+            &format!("start {}", id.start_time),
+            nw,
+        ));
     }
     if app.frozen.len() > 12 {
-        lines.push(Line::from(format!("  … {} more", app.frozen.len() - 12)));
+        lines.push(fact_row(
+            "…",
+            &format!("{} more", app.frozen.len() - 12),
+            nw,
+        ));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(
-        "Identity is re-checked (PID + start time) before each signal.",
-    ));
     lines
 }
 
-pub fn docker_details(res: &DockerResource) -> Vec<Line<'static>> {
+pub fn docker_details(res: &DockerResource, width: usize) -> Vec<Line<'static>> {
+    let nw = name_width(width);
     let mut lines = vec![
-        Line::from(format!("{}  {}", res.name, res.kind.label())),
+        col_header(width),
+        cols(
+            &pad_name(&res.name, "", nw),
+            res.kind.label(),
+            res.compose.as_deref().unwrap_or("—"),
+            &fmt_bytes(res.size_bytes),
+            "",
+            &res.detail,
+        ),
         Line::from(""),
-        Line::from(format!("id      {}", res.id)),
-        Line::from(format!("state   {}", res.detail)),
-        Line::from(format!("size    {}", fmt_bytes(res.size_bytes))),
+        fact_row("id", &res.id, nw),
     ];
-    if let Some(c) = &res.compose {
-        lines.push(Line::from(format!("compose {c}")));
-    }
     if res.persistent {
-        lines.push(Line::from("⚠ PERSISTENT DATA — may contain a database"));
+        lines.push(Line::from(""));
+        lines.push(fact_row("warn", "PERSISTENT DATA", nw).style(warn()));
     }
     lines
 }
 
-pub fn docker_confirm_lines(app: &App) -> Vec<Line<'static>> {
+pub fn docker_confirm_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     if app.frozen_docker.is_empty() {
         return vec![Line::from(" no docker target")];
     }
-    let mut lines = Vec::new();
-    if app.frozen_docker.iter().any(|r| r.persistent) {
-        lines.push(Line::from("⚠ PERSISTENT DATA"));
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(format!(
-        "Remove {} Docker resource(s)?",
-        app.frozen_docker.len()
-    )));
+    let nw = name_width(width);
+    let mut lines = vec![col_header(width)];
     for res in &app.frozen_docker {
-        let warn = if res.persistent { "  ⚠ volume" } else { "" };
-        lines.push(Line::from(format!(
-            "  {} {}  {}{warn}",
-            res.kind.label(),
-            res.name,
-            fmt_bytes(res.size_bytes)
-        )));
+        let what = if res.persistent {
+            "volume"
+        } else {
+            res.kind.label()
+        };
+        lines.push(cols(
+            &pad_name(&res.name, "", nw),
+            what,
+            res.compose.as_deref().unwrap_or("—"),
+            &fmt_bytes(res.size_bytes),
+            "",
+            &res.detail,
+        ));
     }
     if app.frozen_docker.iter().any(|r| r.persistent) {
         lines.push(Line::from(""));
-        lines.push(Line::from("Volumes may contain database data."));
-        lines.push(Line::from("[D] Delete volumes    [Esc] Cancel"));
+        lines.push(fact_row("warn", "PERSISTENT DATA — D to delete", nw).style(warn()));
     }
     lines
 }
 
 pub fn help_lines() -> Vec<Line<'static>> {
     let k = &config::Config::global().keys;
-    [
-        "wyd",
-        "",
-        "← →          overview / runtime",
-        "↑↓           move selection",
-        "space        mark / unmark",
-        "/            filter list",
-        "p            projects; enter pins a project filter",
-        "enter        details (or open overview section)",
-        "",
-    ]
-    .into_iter()
-    .map(Line::from)
-    .chain([
-        Line::from(format!("{}            terminate (confirm with y)", k.kill)),
-        Line::from(format!(
-            "{}            force kill (confirm with y)",
-            k.force_kill
-        )),
-        Line::from(format!(
-            "{}            docker clean (y, or D for volumes)",
-            k.clean
-        )),
-        Line::from(format!("{}            refresh", k.refresh)),
-        Line::from(format!("{}            this help", k.help)),
-        Line::from(format!("{}            quit", k.quit)),
-        Line::from(""),
-        Line::from("esc          clear filter / project / back / quit"),
-        Line::from("y            confirm terminate / docker remove"),
-        Line::from("D            confirm volume delete"),
-        Line::from(""),
-        Line::from("Keys: ~/.config/wyd/config.toml  [keys]"),
-    ])
-    .collect()
+    std::iter::once(Line::from("wyd").style(chrome().add_modifier(Modifier::BOLD)))
+        .chain(
+            [
+                "",
+                "← →          overview / runtime",
+                "↑↓           move selection",
+                "space        mark / unmark",
+                "/            filter list",
+                "p            projects; enter pins a project filter",
+                "enter        details (or open overview section)",
+                "",
+            ]
+            .into_iter()
+            .map(Line::from),
+        )
+        .chain([
+            Line::from(format!("{}            terminate (confirm with y)", k.kill)),
+            Line::from(format!(
+                "{}            force kill (confirm with y)",
+                k.force_kill
+            )),
+            Line::from(format!(
+                "{}            docker clean (y, or D for volumes)",
+                k.clean
+            )),
+            Line::from(format!("{}            refresh", k.refresh)),
+            Line::from(format!("{}            this help", k.help)),
+            Line::from(format!("{}            quit", k.quit)),
+            Line::from(""),
+            Line::from("esc          clear filter / project / back / quit"),
+            Line::from("y            confirm terminate / docker remove"),
+            Line::from("D            confirm volume delete"),
+            Line::from(""),
+            Line::from("Keys: ~/.config/wyd/config.toml  [keys]"),
+        ])
+        .collect()
 }

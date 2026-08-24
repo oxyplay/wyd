@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::model::{ListeningPort, ProcessInfo, Project, RuntimeItem};
+use crate::classify::rules;
+use crate::model::{Category, ListeningPort, ProcessInfo, Project, RuntimeItem, RuntimeState};
 
 const MARKERS: &[&str] = &[
     "package.json",
@@ -91,17 +92,20 @@ fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Attach listening ports and project roots to grouped items.
 pub fn attach(
-    items: &mut [RuntimeItem],
+    items: &mut Vec<RuntimeItem>,
     processes: &[ProcessInfo],
     ports: &[ListeningPort],
     cache: &mut ProjectCache,
 ) {
     let by_pid: HashMap<u32, &ProcessInfo> = processes.iter().map(|p| (p.pid, p)).collect();
-    for item in items {
+    for item in items.iter_mut() {
         attach_one(item, &by_pid, ports, cache);
     }
+    for item in items.iter_mut() {
+        promote_listeners(item, &by_pid);
+    }
+    adopt_port_orphans(items, processes, ports, cache);
 }
 
 fn attach_one(
@@ -127,6 +131,102 @@ fn attach_one(
         if item.project.is_none() {
             item.project = child.project.clone();
         }
+    }
+}
+
+fn promote_listeners(item: &mut RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) {
+    for child in &mut item.children {
+        promote_listeners(child, by_pid);
+    }
+    if item.ports.is_empty() || item.category != Category::UnknownDev {
+        return;
+    }
+    item.category = Category::DevServer;
+    if let Some(p) = item.root_pid.and_then(|pid| by_pid.get(&pid).copied()) {
+        let argv0 = p
+            .command
+            .first()
+            .and_then(|s| Path::new(s).file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or(&p.name)
+            .to_ascii_lowercase();
+        let hay = format!(
+            "{} {} {}",
+            p.name.to_ascii_lowercase(),
+            p.command.join(" ").to_ascii_lowercase(),
+            p.executable
+                .as_ref()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        );
+        if rules::is_vite(&hay, &p.name.to_ascii_lowercase(), &argv0) {
+            item.display_name = "vite".into();
+        }
+    }
+}
+
+fn adopt_port_orphans(
+    items: &mut Vec<RuntimeItem>,
+    processes: &[ProcessInfo],
+    ports: &[ListeningPort],
+    cache: &mut ProjectCache,
+) {
+    let mut seen = HashSet::new();
+    collect_pids(items, &mut seen);
+    let by_pid: HashMap<u32, &ProcessInfo> = processes.iter().map(|p| (p.pid, p)).collect();
+    let mut by_listen: HashMap<u32, Vec<ListeningPort>> = HashMap::new();
+    for port in ports {
+        by_listen.entry(port.pid).or_default().push(port.clone());
+    }
+    for (pid, listen) in by_listen {
+        if seen.contains(&pid) {
+            continue;
+        }
+        let Some(p) = by_pid.get(&pid).copied() else {
+            continue;
+        };
+        let Some(class) = rules::classify(p).or_else(|| runtime_guess(p)) else {
+            continue;
+        };
+        if class.category == Category::Browser {
+            continue;
+        }
+        let mut item = RuntimeItem {
+            category: class.category,
+            display_name: class.display_name,
+            root_pid: Some(pid),
+            process_ids: vec![pid],
+            memory_bytes: p.memory_bytes,
+            cpu_percent: p.cpu_percent,
+            state: RuntimeState::Active,
+            suspicion: None,
+            ports: listen,
+            project: None,
+            children: Vec::new(),
+        };
+        item.project = project_for(&item, &by_pid, cache);
+        promote_listeners(&mut item, &by_pid);
+        items.push(item);
+    }
+}
+
+fn collect_pids(items: &[RuntimeItem], out: &mut HashSet<u32>) {
+    for item in items {
+        out.extend(&item.process_ids);
+        collect_pids(&item.children, out);
+    }
+}
+
+fn runtime_guess(p: &ProcessInfo) -> Option<rules::Class> {
+    let name = p.name.to_ascii_lowercase();
+    match name.as_str() {
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3" | "php" | "ruby" => {
+            Some(rules::Class {
+                category: Category::UnknownDev,
+                display_name: name,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -264,5 +364,37 @@ mod tests {
             Some(root.canonicalize().unwrap())
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopt_node_listener_without_argv() {
+        use crate::classify::group;
+        use crate::model::{Category, ListeningPort, ProcessInfo, Protocol};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let processes = vec![ProcessInfo {
+            pid: 10,
+            parent_pid: Some(1),
+            name: "node".into(),
+            command: vec![],
+            executable: None,
+            cwd: None,
+            cpu_percent: 0.0,
+            memory_bytes: 40 << 20,
+            start_time: 0,
+            tty: None,
+        }];
+        let mut items = group(&processes);
+        assert!(items.is_empty());
+        let ports = vec![ListeningPort {
+            protocol: Protocol::Tcp,
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 3000,
+            pid: 10,
+        }];
+        attach(&mut items, &processes, &ports, &mut ProjectCache::default());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].category, Category::DevServer);
+        assert_eq!(items[0].ports[0].port, 3000);
     }
 }
