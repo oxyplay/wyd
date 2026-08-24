@@ -2,8 +2,18 @@
 name = "wyd"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A fast TUI for seeing what your development tools and AI agents left running."
+license = "Apache-2.0"
+authors = ["Maksym Nevinchanyy"]
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+parking_lot = "0.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

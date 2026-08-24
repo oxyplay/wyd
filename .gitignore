@@ -1,1 +1,5 @@
 /target
+.DS_Store
+tasks/
+SPEC.md
+AGENTS.md

@@ -1,6 +1,8 @@
 # wyd
 
-> See what your AI agents left running.
+> A fast TUI for seeing what your development tools and AI agents left running.
+
+> **Status:** prototype. Classifies agents, MCP, browsers, dev servers, databases, and language servers; hides OS processes. Kill, ports, Docker are not built yet.
 
 **wyd** is a fast terminal UI for understanding, inspecting, and cleaning up your local development runtime.
 
@@ -623,6 +625,12 @@ Or, more casually:
 
 ## Status
 
-Concept / early design.
+Early prototype: live process snapshot and ancestry tree.
 
-See [`SPEC.md`](./SPEC.md) for the detailed implementation specification.
+The mockup in this README is the target UI, not what `cargo run` renders today.
+
+## License
+
+Copyright 2026 Maksym Nevinchanyy.
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
