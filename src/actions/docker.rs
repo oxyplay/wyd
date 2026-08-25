@@ -1,13 +1,27 @@
 use crate::model::{DockerKind, DockerResource};
 
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// Remove one selected Docker resource. Volumes are never implied — caller
 /// must have required the `D` confirm.
 pub fn remove_blocking(res: &DockerResource) -> Result<(), String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    rt.block_on(remove(res))
+    runtime()?.block_on(remove(res))
+}
+
+/// Graceful stop (SIGTERM, engine default timeout). Only valid on running containers.
+pub fn stop_blocking(res: &DockerResource) -> Result<(), String> {
+    runtime()?.block_on(async {
+        let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| e.to_string())?;
+        docker
+            .stop_container(&res.id, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
 }
 
 async fn remove(res: &DockerResource) -> Result<(), String> {

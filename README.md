@@ -45,6 +45,7 @@ Built for people who run coding agents all day and then ask *what did that sessi
 | `enter` | details popup; on a project, pin that project |
 | `space` | mark several |
 | `k` / `K` | terminate / force kill (`y` confirms) |
+| `s` | stop running Docker container |
 | `x` | Docker clean (`y`; volumes need `D`) |
 | `p` | projects |
 | `/` | filter |
@@ -95,6 +96,7 @@ quit = "q"
 kill = "k"
 force_kill = "K"
 clean = "x"
+stop = "s"
 help = "?"
 refresh = "r"
 

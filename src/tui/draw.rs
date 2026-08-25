@@ -221,13 +221,14 @@ pub(super) fn follow_selected(app: &mut App, view_h: u16) {
 const RAM_W: usize = 6;
 const CPU_W: usize = 6;
 const AGE_W: usize = 7;
+const STATUS_W: usize = 11;
 const WHAT_W: usize = 10;
 const FROM_W: usize = 22;
 const NAME_MAX: usize = 28;
 const GAP: usize = 2;
 
 fn name_width(total: usize) -> usize {
-    let meta = WHAT_W + FROM_W + RAM_W + CPU_W + AGE_W + GAP * 5;
+    let meta = WHAT_W + FROM_W + RAM_W + CPU_W + STATUS_W + AGE_W + GAP * 6;
     NAME_MAX.min(total.saturating_sub(meta)).max(10)
 }
 
@@ -235,8 +236,8 @@ fn col_header(width: usize) -> Line<'static> {
     let nw = name_width(width);
     let g = " ".repeat(GAP);
     Line::from(format!(
-        "{:<nw$}{g}{:<WHAT_W$}{g}{:<FROM_W$}{g}{:>RAM_W$}{g}{:>CPU_W$}{g}{:>AGE_W$}",
-        "NAME", "WHAT", "FROM", "RAM", "CPU", "AGE"
+        "{:<nw$}{g}{:<WHAT_W$}{g}{:<FROM_W$}{g}{:>RAM_W$}{g}{:>CPU_W$}{g}{:<STATUS_W$}{g}{:>AGE_W$}",
+        "NAME", "WHAT", "FROM", "RAM", "CPU", "STATUS", "AGE"
     ))
     .style(dim())
 }
@@ -257,10 +258,10 @@ fn hint(app: &App) -> String {
             format!(" /{}{caret}   enter apply  esc clear", app.query)
         }
         Mode::List => format!(
-            " ←→ pane  ↑↓  space mark  enter  {} kill  {} clean  p projects  / filter  {} help  {} quit",
-            keys.kill, keys.clean, keys.help, keys.quit
+            " ←→ pane  ↑↓  space mark  enter  {} kill  {} stop  {} clean  p projects  / filter  {} help  {} quit",
+            keys.kill, keys.stop, keys.clean, keys.help, keys.quit
         ),
-        Mode::Details => " k kill  x clean  esc back".into(),
+        Mode::Details => " k kill  s stop  x clean  esc back".into(),
         Mode::Help => " esc back".into(),
         Mode::ConfirmKill { force: true } => " y force kill  n/esc cancel".into(),
         Mode::ConfirmKill { force: false } => " y terminate  n/esc cancel".into(),
@@ -344,7 +345,7 @@ fn runtime_lines(
                         .map(|p| short_path(&p.root))
                         .unwrap_or_else(|| "—".into());
                     let left = pad_name(&format!(" :{}", port.port), "", nw);
-                    cols(&left, &owner.title(), &from, "", "", "")
+                    cols(&left, &owner.title(), &from, "", "", "", "")
                 }
                 Row::Project { name, ram, kids } => {
                     let left = pad_name(name, "", nw);
@@ -353,6 +354,7 @@ fn runtime_lines(
                         "project",
                         &format!("{kids} items"),
                         &fmt_bytes(*ram),
+                        "",
                         "",
                         "",
                     )
@@ -383,7 +385,15 @@ fn pad_name(title: &str, extra: &str, nw: usize) -> String {
     s
 }
 
-fn cols(name: &str, what: &str, from: &str, ram: &str, cpu: &str, age: &str) -> Line<'static> {
+fn cols(
+    name: &str,
+    what: &str,
+    from: &str,
+    ram: &str,
+    cpu: &str,
+    status: &str,
+    age: &str,
+) -> Line<'static> {
     let g = " ".repeat(GAP);
     Line::from(vec![
         Span::raw(name.to_string()),
@@ -391,6 +401,10 @@ fn cols(name: &str, what: &str, from: &str, ram: &str, cpu: &str, age: &str) -> 
         Span::styled(format!("{g}{:<FROM_W$}", truncate(from, FROM_W)), chrome()),
         Span::styled(format!("{g}{ram:>RAM_W$}"), chrome()),
         Span::styled(format!("{g}{cpu:>CPU_W$}"), dim()),
+        Span::styled(
+            format!("{g}{:<STATUS_W$}", truncate(status, STATUS_W)),
+            dim(),
+        ),
         Span::styled(format!("{g}{age:>AGE_W$}"), dim()),
     ])
 }
@@ -476,6 +490,7 @@ fn item_line(
         &origin(item, by_pid),
         &fmt_bytes(item.memory_bytes),
         &cpu,
+        "",
         &age,
     );
     if leftover && let Some(span) = line.spans.get_mut(0) {
@@ -490,7 +505,7 @@ fn docker_line(
     idx: usize,
     nw: usize,
 ) -> Line<'static> {
-    let running = res.detail == "running" || res.detail == "attached";
+    let running = res.running() || res.detail == "attached";
     let marker = if running { "● " } else { "○ " };
     let star = if marked.contains(&idx) { "*" } else { " " };
     let from = res.compose.clone().unwrap_or_else(|| "—".into());
@@ -502,6 +517,7 @@ fn docker_line(
         &fmt_bytes(res.size_bytes),
         "",
         &res.detail,
+        &fmt_age(res.created.max(0) as u64),
     )
 }
 
@@ -525,6 +541,7 @@ pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Lin
                 "",
                 "",
                 "",
+                "",
             ));
             lines.push(Line::from(""));
             lines.push(fact_row("pid", &port.pid.to_string(), nw));
@@ -544,6 +561,7 @@ pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Lin
                     "project",
                     "",
                     &fmt_bytes(*ram),
+                    "",
                     "",
                     "",
                 ),
@@ -630,7 +648,7 @@ fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot, width: usize) -> Vec
 }
 
 fn fact_row(label: &str, value: &str, nw: usize) -> Line<'static> {
-    cols(&pad_name(label, "", nw), "", value, "", "", "")
+    cols(&pad_name(label, "", nw), "", value, "", "", "", "")
 }
 
 pub fn confirm_lines(app: &App, force: bool, width: usize) -> Vec<Line<'static>> {
@@ -641,6 +659,7 @@ pub fn confirm_lines(app: &App, force: bool, width: usize) -> Vec<Line<'static>>
         cols(
             &pad_name(&app.frozen_title, "", nw),
             what,
+            "",
             "",
             "",
             "",
@@ -676,6 +695,7 @@ pub fn docker_details(res: &DockerResource, width: usize) -> Vec<Line<'static>> 
             &fmt_bytes(res.size_bytes),
             "",
             &res.detail,
+            &fmt_age(res.created.max(0) as u64),
         ),
         Line::from(""),
         fact_row("id", &res.id, nw),
@@ -706,6 +726,7 @@ pub fn docker_confirm_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             &fmt_bytes(res.size_bytes),
             "",
             &res.detail,
+            &fmt_age(res.created.max(0) as u64),
         ));
     }
     if app.frozen_docker.iter().any(|r| r.persistent) {
@@ -738,6 +759,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
                 "{}            force kill (confirm with y)",
                 k.force_kill
             )),
+            Line::from(format!("{}            stop running container", k.stop)),
             Line::from(format!(
                 "{}            docker clean (y, or D for volumes)",
                 k.clean

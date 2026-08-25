@@ -213,6 +213,9 @@ fn handle_key(
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.force_kill, c) => {
                     open_kill_confirm(snap, app, true)
                 }
+                KeyCode::Char(c) if config::KeysConfig::hit(&keys.stop, c) => {
+                    stop_docker(snap, app, force)
+                }
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.clean, c) => {
                     open_docker_confirm(snap, app)
                 }
@@ -233,6 +236,9 @@ fn handle_key(
             }
             KeyCode::Char('k') => open_kill_confirm(snap, app, false),
             KeyCode::Char('K') => open_kill_confirm(snap, app, true),
+            KeyCode::Char(c) if config::KeysConfig::hit(&config::Config::global().keys.stop, c) => {
+                stop_docker(snap, app, force)
+            }
             KeyCode::Char('x') => open_docker_confirm(snap, app),
             _ => KeyResult::Continue,
         },
@@ -474,6 +480,30 @@ fn open_kill_confirm(snap: &RuntimeSnapshot, app: &mut App, kill_force: bool) ->
     KeyResult::Continue
 }
 
+/// Stop marked (or selected) running containers, then rescan. Stopping is
+/// reversible (`docker start`), so no confirm — unlike remove.
+fn stop_docker(snap: &RuntimeSnapshot, app: &mut App, force: &mpsc::Sender<()>) -> KeyResult {
+    let rs = app.rows(snap);
+    let mut idxs: Vec<usize> = app.marked.iter().copied().collect();
+    if idxs.is_empty() {
+        idxs.push(app.selected);
+    }
+    idxs.sort_unstable();
+    let mut stopped = false;
+    for i in idxs {
+        if let Some(Row::Docker(res)) = rs.get(i)
+            && res.running()
+        {
+            stopped |= crate::actions::docker::stop_blocking(res).is_ok();
+        }
+    }
+    if stopped {
+        app.marked.clear();
+        let _ = force.send(());
+    }
+    KeyResult::Continue
+}
+
 fn open_docker_confirm(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
     let rs = app.rows(snap);
     let mut idxs: Vec<usize> = app.marked.iter().copied().collect();
@@ -675,6 +705,7 @@ mod tests {
                 size_bytes: 6 << 30,
                 compose: Some("oldproject".into()),
                 persistent: true,
+                created: 0,
             }],
         };
         let mut app = App::new();
@@ -806,6 +837,7 @@ mod tests {
                     size_bytes: 40 << 20,
                     compose: None,
                     persistent: false,
+                    created: 0,
                 },
                 model::DockerResource {
                     kind: model::DockerKind::Volume,
@@ -815,6 +847,7 @@ mod tests {
                     size_bytes: 6 << 30,
                     compose: Some("oldproject".into()),
                     persistent: true,
+                    created: 0,
                 },
             ],
         };

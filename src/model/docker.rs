@@ -9,6 +9,8 @@ pub struct DockerResource {
     pub compose: Option<String>,
     /// Volumes always; UI requires `D` to delete.
     pub persistent: bool,
+    /// Unix seconds when created; 0 = unknown.
+    pub created: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +19,13 @@ pub enum DockerKind {
     DanglingImage,
     Volume,
     BuildCache,
+}
+
+impl DockerResource {
+    /// Running container — the only resource wyd can stop.
+    pub fn running(&self) -> bool {
+        self.kind == DockerKind::Container && self.detail == "running"
+    }
 }
 
 impl DockerKind {

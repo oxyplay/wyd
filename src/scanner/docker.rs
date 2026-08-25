@@ -91,9 +91,12 @@ pub fn assemble(
                 size_bytes: size,
                 compose: None,
                 persistent: false,
+                created: 0,
             });
         }
     }
+    // Running containers on top; stable — keeps kind grouping for the rest.
+    resources.sort_by_key(|r| !r.running());
 
     let disk_bytes = resources.iter().map(|r| r.size_bytes).sum();
     let reclaimable_bytes = resources
@@ -144,6 +147,7 @@ fn container_row(c: &ContainerSummary) -> DockerResource {
         size_bytes: c.size_rw.unwrap_or(0).max(0) as u64,
         compose,
         persistent: false,
+        created: c.created.unwrap_or(0),
     }
 }
 
@@ -156,6 +160,7 @@ fn dangling_row(img: &ImageSummary) -> DockerResource {
         size_bytes: img.size.max(0) as u64,
         compose: None,
         persistent: false,
+        created: img.created.max(0),
     }
 }
 
@@ -173,6 +178,7 @@ fn volume_row(vol: &Volume, attached: bool) -> DockerResource {
         size_bytes: size,
         compose: vol.labels.get(COMPOSE_PROJECT).cloned(),
         persistent: true,
+        created: vol.created_at.as_deref().map_or(0, parse_rfc3339),
     }
 }
 
@@ -187,6 +193,43 @@ fn attached_volumes(containers: &[ContainerSummary]) -> HashSet<String> {
         }
     }
     out
+}
+
+/// Docker's RFC3339 ("2024-01-02T15:04:05[.frac][Z|±hh:mm]") → unix secs; 0 on garbage.
+fn parse_rfc3339(s: &str) -> i64 {
+    let num = |r: Option<&str>| r.and_then(|x| x.parse::<i64>().ok());
+    let (Some(y), Some(mo), Some(d)) = (num(s.get(0..4)), num(s.get(5..7)), num(s.get(8..10)))
+    else {
+        return 0;
+    };
+    let (Some(h), Some(mi), Some(sec)) =
+        (num(s.get(11..13)), num(s.get(14..16)), num(s.get(17..19)))
+    else {
+        return 0;
+    };
+    // days-from-civil (Hinnant)
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * ((mo + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let mut t = days * 86_400 + h * 3_600 + mi * 60 + sec;
+    let zone = s
+        .get(19..)
+        .unwrap_or("")
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    let (sign, rest) = match zone.as_bytes().first() {
+        Some(b'+') => (1, zone.get(1..)),
+        Some(b'-') => (-1, zone.get(1..)),
+        _ => return t.max(0),
+    };
+    if let (Some(zh), Some(zm)) = (
+        num(rest.and_then(|r| r.get(0..2))),
+        num(rest.and_then(|r| r.get(3..5))),
+    ) {
+        t -= sign * (zh * 3_600 + zm * 60);
+    }
+    t.max(0)
 }
 
 fn short_id(id: &str) -> String {
@@ -212,6 +255,43 @@ mod tests {
         assert!(dangling(&image(vec![])));
         assert!(dangling(&image(vec!["<none>:<none>".into()])));
         assert!(!dangling(&image(vec!["nginx:latest".into()])));
+    }
+
+    #[test]
+    fn running_containers_sort_first() {
+        let stopped = ContainerSummary {
+            id: Some("aaa".into()),
+            names: Some(vec!["/old".into()]),
+            state: Some(ContainerSummaryStateEnum::EXITED),
+            ..Default::default()
+        };
+        let running = ContainerSummary {
+            id: Some("bbb".into()),
+            names: Some(vec!["/live".into()]),
+            state: Some(ContainerSummaryStateEnum::RUNNING),
+            ..Default::default()
+        };
+        let snap = assemble(
+            &[stopped, running],
+            &[],
+            &VolumeListResponse::default(),
+            None,
+        );
+        assert_eq!(snap.resources[0].name, "live");
+        assert_eq!(snap.resources[1].name, "old");
+    }
+
+    #[test]
+    fn parses_rfc3339() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(parse_rfc3339("1970-01-01T01:00:00+01:00"), 0);
+        assert_eq!(parse_rfc3339("2024-01-02T03:04:05Z"), 1_704_164_645);
+        assert_eq!(
+            parse_rfc3339("2024-01-02T03:04:05.123456789Z"),
+            1_704_164_645
+        );
+        assert_eq!(parse_rfc3339("garbage"), 0);
+        assert_eq!(parse_rfc3339(""), 0);
     }
 
     #[test]
