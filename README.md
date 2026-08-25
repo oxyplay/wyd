@@ -10,11 +10,14 @@ Local, macOS and Linux. No account, no network, no telemetry.
 
 
 ```bash
+brew install oxyplay/tap/wyd
+# or
 cargo install wyd
 wyd
 ```
 
 Binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases). From a clone: `cargo install --path .`
+
 
 ![wyd TUI — agents, MCP, Vite, and project folders](docs/screenshot.webp)
 
