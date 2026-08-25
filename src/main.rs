@@ -9,20 +9,26 @@ mod scanner;
 mod tui;
 
 use std::io;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
-use parking_lot::RwLock;
-
 use classify::{ProjectCache, attach, group};
 use model::RuntimeSnapshot;
+use parking_lot::RwLock;
 use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 
 /// See what your dev sessions left running.
 #[derive(Parser)]
-#[command(name = "wyd", version, about)]
+#[command(
+    name = "wyd",
+    version,
+    about,
+    after_help = "  wyd upgrade    update via brew or cargo\n"
+)]
 struct Cli {
     /// Print JSON and exit (no TUI)
     #[arg(long)]
@@ -85,6 +91,9 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
 }
 
 fn main() -> io::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("upgrade") {
+        return run_upgrade();
+    }
     let cli = Cli::parse();
     if cli.json || cli.plain {
         return run_cli(cli);
@@ -96,6 +105,32 @@ fn main() -> io::Result<()> {
         move || scanner_loop(snapshot, force_rx)
     });
     tui::run_tui(snapshot, force_tx)
+}
+
+fn run_upgrade() -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let (cmd, args) = updater_for(&resolved).ok_or_else(|| {
+        io::Error::other("unknown install; try:\n  brew upgrade wyd\n  cargo install wyd")
+    })?;
+    eprintln!("+ {cmd} {}", args.join(" "));
+    let status = Command::new(cmd).args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{cmd} exited {status}")))
+    }
+}
+
+fn updater_for(exe: &Path) -> Option<(&'static str, &'static [&'static str])> {
+    let p = exe.to_string_lossy();
+    if p.contains("Cellar/wyd") {
+        Some(("brew", &["upgrade", "wyd"]))
+    } else if p.contains("/.cargo/") || p.contains("/cargo/bin/") {
+        Some(("cargo", &["install", "wyd"]))
+    } else {
+        None
+    }
 }
 
 fn run_cli(cli: Cli) -> io::Result<()> {
@@ -122,4 +157,22 @@ fn run_cli(cli: Cli) -> io::Result<()> {
     };
     println!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn updater_detects_brew_and_cargo() {
+        assert_eq!(
+            updater_for(Path::new("/opt/homebrew/Cellar/wyd/0.4.1/bin/wyd")).map(|(c, _)| c),
+            Some("brew")
+        );
+        assert_eq!(
+            updater_for(Path::new("/Users/x/.cargo/bin/wyd")).map(|(c, _)| c),
+            Some("cargo")
+        );
+        assert!(updater_for(Path::new("/usr/local/bin/wyd")).is_none());
+    }
 }

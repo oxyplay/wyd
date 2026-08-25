@@ -14,6 +14,7 @@ brew install oxyplay/tap/wyd
 # or
 cargo install wyd
 wyd
+wyd upgrade   # brew or cargo, matching the install
 ```
 
 Binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases). From a clone: `cargo install --path .`
@@ -42,10 +43,10 @@ Built for people who run coding agents all day and then ask *what did that sessi
 |---|---|
 | `←` `→` | overview / list |
 | `↑` `↓` | move |
-| `enter` | details popup; on a project, pin that project |
+| `enter` | details; clickable `http://` URL on Vite/Nuxt; pin a project |
 | `space` | mark several |
 | `k` / `K` | terminate / force kill (`y` confirms) |
-| `s` | stop running Docker container |
+| `s` | stop running Docker container (running ones sort first) |
 | `x` | Docker clean (`y`; volumes need `D`) |
 | `p` | projects |
 | `/` | filter |
