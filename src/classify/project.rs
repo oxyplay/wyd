@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use crate::classify::rules;
-use crate::model::{Category, ListeningPort, ProcessInfo, Project, RuntimeItem, RuntimeState};
+use crate::model::{
+    Category, ListeningPort, ProcessInfo, Project, Protocol, RuntimeItem, RuntimeState,
+};
 
 const MARKERS: &[&str] = &[
     "package.json",
@@ -120,10 +123,6 @@ fn attach_one(
         .filter(|p| pids.contains(&p.pid))
         .cloned()
         .collect();
-    item_ports.sort_by_key(|p| p.port);
-    item_ports.dedup_by_key(|p| p.port);
-    item.ports = item_ports;
-
     item.project = project_for(item, by_pid, cache);
 
     for child in &mut item.children {
@@ -131,7 +130,49 @@ fn attach_one(
         if item.project.is_none() {
             item.project = child.project.clone();
         }
+        for p in &child.ports {
+            if !item_ports.iter().any(|x| x.port == p.port) {
+                item_ports.push(p.clone());
+            }
+        }
     }
+    if item_ports.is_empty() {
+        item_ports.extend(ports_from_argv(item, by_pid));
+    }
+    item_ports.sort_by_key(|p| p.port);
+    item_ports.dedup_by_key(|p| p.port);
+    item.ports = item_ports;
+}
+
+fn ports_from_argv(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) -> Vec<ListeningPort> {
+    let mut out = Vec::new();
+    for &pid in &item.process_ids {
+        let Some(p) = by_pid.get(&pid) else { continue };
+        if let Some(port) = port_from_cmd(&p.command) {
+            out.push(ListeningPort {
+                protocol: Protocol::Tcp,
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                pid,
+            });
+        }
+    }
+    out
+}
+
+/// `--port 5555` / `--port=3000`. Vite/Nuxt/Next put this on argv even
+/// when the listen socket belongs to a worker netstat can't map.
+fn port_from_cmd(cmd: &[String]) -> Option<u16> {
+    let mut parts = cmd.iter().flat_map(|a| a.split_whitespace());
+    while let Some(a) = parts.next() {
+        if let Some(v) = a.strip_prefix("--port=") {
+            return v.parse().ok();
+        }
+        if a == "--port" {
+            return parts.next()?.parse().ok();
+        }
+    }
+    None
 }
 
 fn promote_listeners(item: &mut RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) {
@@ -481,5 +522,49 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].category, Category::DevServer);
         assert_eq!(items[0].ports[0].port, 3000);
+    }
+
+    #[test]
+    fn port_from_cmd_parses_flag() {
+        assert_eq!(
+            port_from_cmd(&["nuxt".into(), "dev".into(), "--port".into(), "5555".into()]),
+            Some(5555)
+        );
+        assert_eq!(
+            port_from_cmd(&["vite".into(), "--port=3000".into()]),
+            Some(3000)
+        );
+        assert_eq!(port_from_cmd(&["vite".into()]), None);
+    }
+
+    #[test]
+    fn attach_uses_port_flag_when_socket_missing() {
+        use crate::classify::group;
+        use crate::model::ProcessInfo;
+
+        let processes = vec![ProcessInfo {
+            pid: 10,
+            parent_pid: Some(1),
+            name: "node".into(),
+            command: vec![
+                "node".into(),
+                "node_modules/nuxt/bin/nuxt.mjs".into(),
+                "dev".into(),
+                "--port".into(),
+                "5555".into(),
+            ],
+            executable: None,
+            cwd: None,
+            cpu_percent: 0.0,
+            memory_bytes: 10,
+            start_time: 0,
+            tty: None,
+        }];
+        let mut items = group(&processes);
+        attach(&mut items, &processes, &[], &mut ProjectCache::default());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "nuxt");
+        assert_eq!(items[0].ports[0].port, 5555);
+        assert_eq!(items[0].ports[0].url(), "http://127.0.0.1:5555");
     }
 }

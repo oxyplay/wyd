@@ -410,6 +410,11 @@ fn cols(
 }
 
 fn role(item: &RuntimeItem) -> String {
+    if item.category == crate::model::Category::DevServer
+        && let Some(p) = item.ports.iter().map(|x| x.port).min()
+    {
+        return format!("srv :{p}");
+    }
     let n = item.process_ids.len();
     if n > 1 {
         return format!("{n} procs");
@@ -608,6 +613,9 @@ fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot, width: usize) -> Vec
         item_line(item, 0, true, &by_pid, &HashSet::new(), 0, nw),
         Line::from(""),
     ];
+    for p in &item.ports {
+        lines.push(fact_row("url", &p.url(), nw));
+    }
     if let Some(p) = proc {
         lines.push(fact_row("pid", &p.pid.to_string(), nw));
         lines.push(fact_row(
@@ -629,15 +637,6 @@ fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot, width: usize) -> Vec
     }
     if let Some(project) = &item.project {
         lines.push(fact_row("project", &short_path(&project.root), nw));
-    }
-    if !item.ports.is_empty() {
-        let ports = item
-            .ports
-            .iter()
-            .map(|p| format!("{}:{}", p.address, p.port))
-            .collect::<Vec<_>>()
-            .join(" ");
-        lines.push(fact_row("ports", &ports, nw));
     }
     if item.process_ids.len() > 1 {
         lines.push(fact_row(
