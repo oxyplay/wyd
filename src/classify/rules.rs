@@ -30,7 +30,10 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         || name_eq(&name, &argv0, "npx")
         || name_eq(&name, &argv0, "pnpm")
         || name_eq(&name, &argv0, "yarn")
-        || name_eq(&name, &argv0, "bun");
+        || name_eq(&name, &argv0, "bun")
+        || hay.contains("npm-cli.js")
+        || hay.contains("npx-cli.js")
+        || hay.contains("npm exec");
 
     // Package-manager wrappers mention the package on argv; the child node
     // is the real server — don't double-count.
@@ -79,30 +82,32 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         }
     }
 
-    // Language servers.
-    for (needle, display) in [
-        ("rust-analyzer", "rust-analyzer"),
-        ("gopls", "gopls"),
-        ("typescript-language-server", "typescript-language-server"),
-        ("copilot-language-server", "copilot-language-server"),
-        ("pyright-langserver", "pyright"),
-        ("pyright", "pyright"),
-        ("clangd", "clangd"),
-        ("lua-language-server", "lua-language-server"),
-        ("intelephense", "intelephense"),
-    ] {
-        if name_eq(&name, &argv0, needle) || hay.contains(needle) {
+    // Language servers. Skip npm/npx wrappers — the child node is the real LSP.
+    if !pkg_manager {
+        for (needle, display) in [
+            ("rust-analyzer", "rust-analyzer"),
+            ("gopls", "gopls"),
+            ("typescript-language-server", "typescript"),
+            ("copilot-language-server", "copilot"),
+            ("pyright-langserver", "pyright"),
+            ("pyright", "pyright"),
+            ("clangd", "clangd"),
+            ("lua-language-server", "lua"),
+            ("intelephense", "intelephense"),
+        ] {
+            if name_eq(&name, &argv0, needle) || hay.contains(needle) {
+                return Some(Class {
+                    category: Category::LanguageServer,
+                    display_name: display.into(),
+                });
+            }
+        }
+        if hay.contains("language-server") || hay.contains("langserver") {
             return Some(Class {
                 category: Category::LanguageServer,
-                display_name: display.into(),
+                display_name: p.label().to_string(),
             });
         }
-    }
-    if hay.contains("language-server") || hay.contains("langserver") {
-        return Some(Class {
-            category: Category::LanguageServer,
-            display_name: p.label().to_string(),
-        });
     }
 
     // Dev servers — before generic node/python.
@@ -353,6 +358,63 @@ mod tests {
                 &["postgres", "-D", "/opt/homebrew/var/postgresql"]
             )),
             Some((Category::Database, "postgres".into()))
+        );
+    }
+
+    #[test]
+    fn copilot_lsp_skips_npm_wrapper() {
+        assert_eq!(
+            cat(proc(
+                "node",
+                &[
+                    "node",
+                    "/Users/x/.npm/_npx/x/node_modules/.bin/copilot-language-server",
+                    "--stdio",
+                ],
+            )),
+            Some((Category::LanguageServer, "copilot".into()))
+        );
+        assert_ne!(
+            cat(proc(
+                "npm",
+                &[
+                    "npm",
+                    "exec",
+                    "@github/copilot-language-server@^1.408.0",
+                    "--stdio",
+                ],
+            ))
+            .map(|(c, _)| c),
+            Some(Category::LanguageServer)
+        );
+        assert_ne!(
+            cat(proc(
+                "node",
+                &[
+                    "node",
+                    "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js",
+                    "exec",
+                    "@github/copilot-language-server@^1.408.0",
+                    "--stdio",
+                ],
+            ))
+            .map(|(c, _)| c),
+            Some(Category::LanguageServer)
+        );
+        assert_ne!(
+            cat(proc(
+                "node",
+                &["npm exec @github/copilot-language-server@^1.408.0 --stdio"],
+            ))
+            .map(|(c, _)| c),
+            Some(Category::LanguageServer)
+        );
+        assert_eq!(
+            cat(proc(
+                "typescript-language-server",
+                &["typescript-language-server", "--stdio"],
+            )),
+            Some((Category::LanguageServer, "typescript".into()))
         );
     }
 

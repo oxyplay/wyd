@@ -43,10 +43,19 @@ fn mark_one(
     let orphaned = parent.is_none()
         && matches!(
             item.category,
-            Category::Mcp | Category::Browser | Category::DevServer | Category::UnknownDev
+            Category::Mcp
+                | Category::Browser
+                | Category::DevServer
+                | Category::UnknownDev
+                | Category::LanguageServer
         );
 
-    if orphaned && matches!(item.category, Category::Mcp | Category::Browser) {
+    if orphaned
+        && matches!(
+            item.category,
+            Category::Mcp | Category::Browser | Category::LanguageServer
+        )
+    {
         reasons.push(SuspicionReason::OwningAgentMissing);
         score += 50;
     }
@@ -100,10 +109,13 @@ fn exempt(item: &RuntimeItem, processes: &[ProcessInfo], cfg: &Config) -> bool {
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default()
     );
-    if hay.contains("homebrew")
-        || hay.contains("valet")
-        || hay.contains("com.docker")
-        || hay.contains("docker desktop")
+    // Homebrew in the *node* path is not a persistent service — leftover
+    // LSPs launched via brew-installed node must still score as leftovers.
+    if !matches!(item.category, Category::LanguageServer)
+        && (hay.contains("homebrew")
+            || hay.contains("valet")
+            || hay.contains("com.docker")
+            || hay.contains("docker desktop"))
     {
         return true;
     }
@@ -201,6 +213,61 @@ mod tests {
         assert!(s.reasons.contains(&SuspicionReason::OwningAgentMissing));
         assert!(s.reasons.contains(&SuspicionReason::McpOwnerMissing));
         assert!(s.score >= 60);
+    }
+
+    #[test]
+    fn orphaned_lsp_is_leftover_nested_is_not() {
+        let detached = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(
+                10,
+                Some(1),
+                "node",
+                &[
+                    "node",
+                    "/x/.npm/_npx/x/node_modules/.bin/copilot-language-server",
+                    "--stdio",
+                ],
+                100,
+            ),
+        ];
+        let mut detached = detached;
+        detached[1].executable = Some("/opt/homebrew/bin/node".into());
+        let mut items = group(&detached);
+        mark(&mut items, &detached, &Config::default());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "copilot");
+        assert_eq!(items[0].state, RuntimeState::Suspicious);
+        assert!(
+            items[0]
+                .suspicion
+                .as_ref()
+                .unwrap()
+                .reasons
+                .contains(&SuspicionReason::OwningAgentMissing)
+        );
+
+        let nested = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(10, Some(1), "omp", &["omp"], 100),
+            proc(
+                11,
+                Some(10),
+                "node",
+                &[
+                    "node",
+                    "/x/.npm/_npx/x/node_modules/.bin/copilot-language-server",
+                    "--stdio",
+                ],
+                100,
+            ),
+        ];
+        let mut items = group(&nested);
+        mark(&mut items, &nested, &Config::default());
+        assert_eq!(items[0].category, Category::Agent);
+        assert_eq!(items[0].children[0].display_name, "copilot");
+        assert_eq!(items[0].children[0].state, RuntimeState::Active);
+        assert!(items[0].children[0].suspicion.is_none());
     }
 
     #[test]

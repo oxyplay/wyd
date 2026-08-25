@@ -388,13 +388,45 @@ mod tests {
         let items = group(&procs);
         assert_eq!(
             titles(&items),
-            [
-                "opencode",
-                "omp",
-                "rust-analyzer",
-                "typescript-language-server"
-            ]
+            ["opencode", "omp", "rust-analyzer", "typescript"]
         );
+    }
+
+    #[test]
+    fn copilot_nests_under_agent_not_npm() {
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(10, Some(1), "omp", &["omp"], 100),
+            proc(
+                11,
+                Some(10),
+                "npm",
+                &[
+                    "npm",
+                    "exec",
+                    "@github/copilot-language-server@^1.408.0",
+                    "--stdio",
+                ],
+                100,
+            ),
+            proc(
+                12,
+                Some(11),
+                "node",
+                &[
+                    "node",
+                    "/Users/x/.npm/_npx/x/node_modules/.bin/copilot-language-server",
+                    "--stdio",
+                ],
+                100,
+            ),
+        ];
+        let items = group(&procs);
+        assert_eq!(titles(&items), ["omp"]);
+        assert_eq!(items[0].children.len(), 1);
+        assert_eq!(items[0].children[0].display_name, "copilot");
+        assert_eq!(items[0].children[0].process_ids, vec![12]);
+        assert_eq!(items[0].children[0].category, Category::LanguageServer);
     }
 
     #[test]

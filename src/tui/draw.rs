@@ -440,7 +440,13 @@ fn origin(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) -> String {
         .iter()
         .find_map(|pid| by_pid.get(pid).and_then(|p| p.cwd.as_ref()))
     {
-        return short_path(cwd);
+        let s = short_path(cwd);
+        if s != "~" {
+            return s;
+        }
+    }
+    if let Some(pwd) = pwd_along(item, by_pid) {
+        return short_path(&pwd);
     }
     if let Some(tty) = item
         .process_ids
@@ -449,11 +455,31 @@ fn origin(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) -> String {
     {
         return tty.to_string();
     }
+    if item.state == RuntimeState::Suspicious {
+        return "orphan".into();
+    }
     if item.state == RuntimeState::Persistent {
         "svc".into()
     } else {
         "—".into()
     }
+}
+
+fn pwd_along(
+    item: &RuntimeItem,
+    by_pid: &HashMap<u32, &ProcessInfo>,
+) -> Option<std::path::PathBuf> {
+    for &start in &item.process_ids {
+        let mut pid = start;
+        for _ in 0..64 {
+            let p = by_pid.get(&pid)?;
+            if let Some(pwd) = crate::classify::pwd_from_cmd(&p.command) {
+                return Some(pwd);
+            }
+            pid = p.parent_pid?;
+        }
+    }
+    None
 }
 
 fn item_line(

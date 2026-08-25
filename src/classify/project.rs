@@ -247,7 +247,26 @@ fn project_for(
         {
             return Some(project);
         }
+        if let Some(pwd) = pwd_from_cmd(&proc.command)
+            && let Some(project) = cache.detect(&pwd)
+        {
+            return Some(project);
+        }
         pid = proc.parent_pid?;
+    }
+    None
+}
+
+/// macOS sysinfo sometimes stuffs `PWD=/path` into cmd (or a single argv blob).
+pub fn pwd_from_cmd(cmd: &[String]) -> Option<PathBuf> {
+    for arg in cmd {
+        for part in arg.split(char::is_whitespace) {
+            if let Some(p) = part.strip_prefix("PWD=")
+                && !p.is_empty()
+            {
+                return Some(PathBuf::from(p));
+            }
+        }
     }
     None
 }
@@ -305,6 +324,72 @@ mod tests {
         let p = cache.detect(&root).unwrap();
         assert_eq!(p.root, root.canonicalize().unwrap());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pwd_from_cmd_reads_blob_and_env() {
+        assert_eq!(
+            pwd_from_cmd(&[
+                "npm exec @github/copilot-language-server --stdio".into(),
+                "PWD=/Users/max/111/directories/web".into(),
+            ]),
+            Some(PathBuf::from("/Users/max/111/directories/web"))
+        );
+        assert_eq!(pwd_from_cmd(&["node".into(), "--stdio".into()]), None);
+    }
+
+    #[test]
+    fn lsp_project_from_parent_pwd_env() {
+        use crate::classify::group;
+
+        let root = tmp("copilot-web");
+        fs::create_dir(root.join(".git")).unwrap();
+        let home = tmp("not-a-project");
+        let proc = |pid: u32, ppid: Option<u32>, name: &str, cmd: Vec<String>| ProcessInfo {
+            pid,
+            parent_pid: ppid,
+            name: name.into(),
+            command: cmd,
+            executable: None,
+            cwd: Some(home.clone()),
+            cpu_percent: 0.0,
+            memory_bytes: 10,
+            start_time: 0,
+            tty: None,
+        };
+        let processes = vec![
+            proc(1, None, "launchd", vec!["launchd".into()]),
+            proc(
+                10,
+                Some(1),
+                "node",
+                vec![
+                    format!("npm exec @github/copilot-language-server@^1.408.0 --stdio"),
+                    format!("PWD={}", root.display()),
+                ],
+            ),
+            proc(
+                11,
+                Some(10),
+                "node",
+                vec![
+                    "node".into(),
+                    "/x/.npm/_npx/x/node_modules/.bin/copilot-language-server".into(),
+                    "--stdio".into(),
+                ],
+            ),
+        ];
+        let mut items = group(&processes);
+        attach(&mut items, &processes, &[], &mut ProjectCache::default());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "copilot");
+        assert_eq!(items[0].process_ids, vec![11]);
+        assert_eq!(
+            items[0].project.as_ref().map(|p| p.root.clone()),
+            Some(root.canonicalize().unwrap())
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
