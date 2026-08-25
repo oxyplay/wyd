@@ -62,6 +62,27 @@ fn popup_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     pop
 }
 
+pub(super) struct Hits {
+    pub overview: Rect,
+    pub list: Rect,
+    pub popup: Rect,
+}
+
+pub(super) fn hits(area: Rect) -> Hits {
+    let [main, _] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let inner = Block::default().borders(Borders::ALL).inner(main);
+    let [left, right] =
+        Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(inner);
+    let overview = Block::default().borders(Borders::ALL).inner(left);
+    let body = Block::default().borders(Borders::ALL).inner(right);
+    let [_, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+    Hits {
+        overview,
+        list,
+        popup: popup_rect(inner, 58, 50),
+    }
+}
+
 fn draw_popup(
     frame: &mut Frame,
     area: Rect,
@@ -122,7 +143,7 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
     match app.mode {
         Mode::List | Mode::Details | Mode::ConfirmKill { .. } | Mode::ConfirmDocker => {
             let [left, right] =
-                Layout::horizontal([Constraint::Length(28), Constraint::Min(20)]).areas(inner);
+                Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(inner);
             frame.render_widget(
                 Paragraph::new(overview_lines(snap, app))
                     .block(pane("Overview", app.focus == Focus::Overview)),
@@ -267,9 +288,14 @@ fn overview_lines(snap: &RuntimeSnapshot, app: &App) -> Vec<Line<'static>> {
         let extra = if row.extra.is_empty() {
             String::new()
         } else {
-            format!("  {}", row.extra)
+            truncate(&row.extra, 8)
         };
-        let text = format!("{mark}{:<12} {:>3}{extra}", row.label, row.count);
+        let text = format!(
+            "{mark}{:<18} {:>4} {:>8}",
+            truncate(row.label, 18),
+            row.count,
+            extra
+        );
         let style = if row.section == Section::Leftovers && row.count > 0 {
             warn()
         } else if row.count == 0 && row.section != Section::All {

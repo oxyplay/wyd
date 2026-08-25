@@ -7,18 +7,22 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use parking_lot::RwLock;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Position, Rect},
+};
 
 use crate::actions::process::{self, Identity, Signal};
 use crate::config;
 use crate::model::{DockerResource, RuntimeSnapshot};
 
-use draw::ui;
+use draw::{hits, ui};
 use rows::{Focus, Row, Section, overview, rows as visible_rows};
 
 const EVENT_POLL: Duration = Duration::from_millis(100);
@@ -101,12 +105,16 @@ enum KeyResult {
 pub fn run_tui(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Sender<()>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let result = run(&mut terminal, &snapshot, &force);
     drop(force);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     result
 }
 
@@ -127,13 +135,19 @@ fn run(
         drop(snap);
 
         if event::poll(EVENT_POLL)? {
-            if let Event::Key(key) = event::read()? {
-                let snap = snapshot.read();
-                match handle_key(key.code, &snap, &mut app, force) {
-                    KeyResult::Quit => return Ok(()),
-                    KeyResult::Continue => {}
-                }
+            let ev = event::read()?;
+            let snap = snapshot.read();
+            let size = terminal.size()?;
+            let area = Rect::new(0, 0, size.width, size.height);
+            let quit = match ev {
+                Event::Key(key) => handle_key(key.code, &snap, &mut app, force),
+                Event::Mouse(m) => handle_mouse(m, &snap, &mut app, area),
+                _ => KeyResult::Continue,
+            };
+            if matches!(quit, KeyResult::Quit) {
+                return Ok(());
             }
+            drop(snap);
             terminal.draw(|f| ui(f, &snapshot.read(), &mut app))?;
         }
     }
@@ -287,6 +301,53 @@ fn handle_key(
             _ => KeyResult::Continue,
         },
     }
+}
+
+fn handle_mouse(
+    m: event::MouseEvent,
+    snap: &RuntimeSnapshot,
+    app: &mut App,
+    area: Rect,
+) -> KeyResult {
+    let h = hits(area);
+    let pos = Position {
+        x: m.column,
+        y: m.row,
+    };
+    if !matches!(app.mode, Mode::List) {
+        if matches!(m.kind, MouseEventKind::Down(_)) && !h.popup.contains(pos) {
+            app.mode = Mode::List;
+            app.frozen_docker.clear();
+        }
+        return KeyResult::Continue;
+    }
+    match m.kind {
+        MouseEventKind::Down(_) | MouseEventKind::Drag(_) => {
+            if h.overview.contains(pos) {
+                let i = m.row.saturating_sub(h.overview.y) as usize;
+                if i < overview(snap).len() {
+                    app.ov_sel = i;
+                    app.focus = Focus::Overview;
+                    apply_overview(snap, app);
+                }
+            } else if h.list.contains(pos) {
+                let i = m.row.saturating_sub(h.list.y) as usize + app.scroll as usize;
+                let n = app.rows(snap).len();
+                if i < n {
+                    let again = app.focus == Focus::Runtime && app.selected == i;
+                    app.selected = i;
+                    app.focus = Focus::Runtime;
+                    if again && matches!(m.kind, MouseEventKind::Down(_)) {
+                        app.mode = Mode::Details;
+                    }
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => move_sel(app, snap, -1),
+        MouseEventKind::ScrollDown => move_sel(app, snap, 1),
+        _ => {}
+    }
+    KeyResult::Continue
 }
 
 fn handle_filter_key(code: KeyCode, app: &mut App) -> KeyResult {

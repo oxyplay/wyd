@@ -148,7 +148,7 @@ pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
         extra: if snap.docker.ok {
             fmt_bytes(snap.docker.disk_bytes)
         } else {
-            snap.docker.note.clone()
+            "—".into()
         },
     });
     lines.push(OverviewLine {
