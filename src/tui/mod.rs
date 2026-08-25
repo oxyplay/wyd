@@ -1,15 +1,12 @@
 mod draw;
 mod rows;
 
-use std::collections::HashSet;
-use std::io;
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
-
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    },
 };
 use parking_lot::RwLock;
 use ratatui::{
@@ -17,6 +14,10 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Position, Rect},
 };
+use std::collections::HashSet;
+use std::io;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use crate::actions::process::{self, Identity, Signal};
 use crate::config;
@@ -131,6 +132,7 @@ fn run(
         if snap.version != drawn_version {
             drawn_version = snap.version;
             terminal.draw(|f| ui(f, &snap, &mut app))?;
+            execute!(terminal.backend_mut(), SetTitle(draw::window_title(&snap)))?;
         }
         drop(snap);
 
@@ -148,7 +150,9 @@ fn run(
                 return Ok(());
             }
             drop(snap);
-            terminal.draw(|f| ui(f, &snapshot.read(), &mut app))?;
+            let snap = snapshot.read();
+            terminal.draw(|f| ui(f, &snap, &mut app))?;
+            execute!(terminal.backend_mut(), SetTitle(draw::window_title(&snap)))?;
         }
     }
 }
@@ -534,7 +538,9 @@ mod tests {
     use crate::classify::group;
     use crate::model::{self, ProcessInfo, Project, RuntimeSnapshot};
 
-    use super::draw::{confirm_lines, details_lines, docker_confirm_lines, help_lines};
+    use super::draw::{
+        confirm_lines, details_lines, docker_confirm_lines, help_lines, window_title,
+    };
     use super::rows::{fmt_age, fmt_bytes, truncate};
 
     fn fixture_snapshot() -> RuntimeSnapshot {
@@ -582,6 +588,15 @@ mod tests {
             cpu_percent: 12.0,
             version: 1,
         }
+    }
+    #[test]
+    fn window_title_lists_running_counts() {
+        let snap = fixture_snapshot();
+        let title = window_title(&snap);
+        assert!(title.starts_with("wyd ·"), "{title}");
+        assert!(title.contains("1 agents"), "{title}");
+        assert!(title.contains("1 mcp"), "{title}");
+        assert!(!title.contains("left"), "{title}");
     }
 
     #[test]

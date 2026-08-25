@@ -108,6 +108,35 @@ fn draw_popup(
     );
 }
 
+/// Ghostty/iTerm tab title: how much is running.
+pub(super) fn window_title(snap: &RuntimeSnapshot) -> String {
+    let mut parts = vec!["wyd".into()];
+    for line in rows::overview(snap) {
+        if line.count == 0 {
+            continue;
+        }
+        let Some(tag) = title_tag(line.section) else {
+            continue;
+        };
+        parts.push(format!("{} {tag}", line.count));
+    }
+    parts.join(" · ")
+}
+
+fn title_tag(section: Section) -> Option<&'static str> {
+    match section {
+        Section::Category(crate::model::Category::Agent) => Some("agents"),
+        Section::Category(crate::model::Category::Mcp) => Some("mcp"),
+        Section::Category(crate::model::Category::Browser) => Some("browsers"),
+        Section::Category(crate::model::Category::DevServer) => Some("srv"),
+        Section::Category(crate::model::Category::Database) => Some("db"),
+        Section::Category(crate::model::Category::LanguageServer) => Some("lsp"),
+        Section::Docker => Some("docker"),
+        Section::Leftovers => Some("left"),
+        _ => None,
+    }
+}
+
 pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
