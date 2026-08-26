@@ -4,13 +4,32 @@ All notable changes to wyd.
 
 ## [Unreleased]
 
+### Fixed
+- Detached headless Chromium now surfaces as a leftover item instead of silently disappearing.
+- Docker snapshot is Arc-cloned (O(1)) instead of full clone every 2 s.
+- Leftover scoring uses HashMap lookup instead of linear scan for ancestor processes.
+- `KeysConfig::hit` is exact match (was `starts_with`).
+- Project filter is case-insensitive in TUI (already was in CLI).
+- Named volumes are no longer flagged as leftover in `--json leftovers`.
+- Ports are deduplicated in the Ports view.
+- `prune --dry-run` reports `docker not running` when the daemon is down.
+- `XDG_CONFIG_HOME` is respected on Linux.
+- `count_projects` is O(n) instead of O(n²).
+- `with_disk_usage` flag dropped (unused sysinfo data).
+
+## [0.4.4] - 2026-08-26
+
 ### Added
-- Vim navigation: `j`/`h`/`l` move (up is `k`, which is kill by default — remap `kill` in config to free it).
-- `Tab` toggles focus between overview and list.
-- `backspace` goes back (clears filter → project → section) without quitting.
-- Anonymous unused volumes collapse into one summary row in the Docker section.
-- `wyd prune` CLI (mirrors the `P` key): `--dry-run` lists what would be deleted, `--yes` skips the prompt.
+- Vim navigation: `j`/`k`/`h`/`l` + `Tab` focus + `backspace` back. Kill moved to `x`, docker clean to `c`.
+- `wyd prune` CLI: `--dry-run` / `--yes`.
 - `--json` docker entries now include `anonymous` and `created`.
+- Anonymous unused volumes collapse into one summary row.
+- CHANGELOG.md.
+
+### Changed
+- Confirmations are dedicated popups (not embedded tables).
+- Footer hint is context-aware and brighter.
+- Details mode keys use config now (not hardcoded).
 
 ## [0.4.3] - 2026-08-25
 
@@ -18,7 +37,6 @@ All notable changes to wyd.
 - `P` prunes unused anonymous volumes with a confirmation dialog; named volume data is always kept.
 - Confirmation dialogs are now dedicated popups with the action keys visible inside.
 - Footer hint line is context-aware and brighter.
-- `wyd prune` groundwork (engine-side `all=false` filter).
 - Server URLs are clickable/openable (`o` or click) from details.
 
 ### Fixed
