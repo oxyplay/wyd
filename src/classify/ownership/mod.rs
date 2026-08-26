@@ -8,6 +8,9 @@
 //! the produced tree and records which session each resource provably
 //! originated from. No heuristic scoring — only directly observed ancestry.
 
+mod resolver;
+mod rules;
+
 use crate::model::process::ProcessIdentity;
 use crate::model::runtime::{Category, RuntimeItem};
 use crate::model::session::{RuntimeSession, RuntimeSessionId, fnv1a};
