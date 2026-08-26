@@ -504,6 +504,13 @@ impl RuntimeStore {
             params![],
         )
         .map_err(err)?;
+        // Drop aliases pointing at sessions GC'd away.
+        tx.execute(
+            "DELETE FROM session_aliases
+             WHERE session_id NOT IN (SELECT session_id FROM sessions)",
+            params![],
+        )
+        .map_err(err)?;
         tx.commit().map_err(err)?;
         Ok(())
     }
@@ -683,12 +690,13 @@ impl RuntimeStore {
                 "INSERT OR IGNORE INTO sessions
                    (session_id, boot_id, agent, root_pid, root_start_time,
                     started_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     id.as_u64() as i64,
                     boot.to_le_bytes().to_vec(),
                     agent,
                     pid as i64,
+                    start_time as i64,
                     start_time as i64,
                     now as i64,
                 ],
@@ -1355,6 +1363,13 @@ mod tests {
         store
             .register_alias(sid, "junie", "junie-48372", 1000)
             .unwrap();
+        // started_at must be the process start_time, not the registration time
+        // — otherwise the resolver's temporal/predates evidence is wrong.
+        assert_eq!(
+            store.session_record(sid).unwrap().unwrap().started_at,
+            500,
+            "started_at = process start_time, not registration time"
+        );
 
         let looked = store
             .session_id_for_alias("junie", "junie-48372")

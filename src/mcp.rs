@@ -20,9 +20,11 @@ use std::thread;
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
 pub fn serve_stdio() -> std::io::Result<()> {
-    // Keep the store fresh while serving, even with no `wyd serve`/TUI open
-    // (item 10): a background collector refreshes provenance.
-    thread::spawn(server::collect_loop);
+    // Keep the store fresh while serving, even with no `wyd serve`/TUI open —
+    // but only if no daemon is already collecting, to avoid duplicate writers.
+    if !server::serve_alive() {
+        thread::spawn(server::collect_loop);
+    }
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

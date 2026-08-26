@@ -23,6 +23,12 @@ fn socket_path() -> PathBuf {
     RuntimeStore::default_path().with_file_name("wyd.sock")
 }
 
+/// Is a `wyd serve` daemon currently listening on the socket?
+pub fn serve_alive() -> bool {
+    let path = socket_path();
+    path.exists() && UnixStream::connect(&path).is_ok()
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -35,18 +41,11 @@ fn now() -> u64 {
 /// listening on the socket, instead of silently replacing it.
 pub fn serve() -> std::io::Result<()> {
     let path = socket_path();
-    if std::path::Path::new(&path).exists() {
-        match UnixStream::connect(&path) {
-            Ok(_) => {
-                eprintln!("wyd serve already running ({})", path.display());
-                return Ok(());
-            }
-            Err(_) => {
-                // Stale socket from a dead run: clear it and take over.
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+    if serve_alive() {
+        eprintln!("wyd serve already running ({})", path.display());
+        return Ok(());
     }
+    let _ = std::fs::remove_file(&path); // stale socket from a dead run
     let pid_path = RuntimeStore::default_path().with_file_name("wyd.pid");
     std::fs::write(&pid_path, std::process::id().to_string())?;
 

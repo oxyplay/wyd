@@ -80,8 +80,11 @@ impl OwnershipTracker {
         let now = now();
         let result = derive_ownership(items, &identities, now);
         let _ = store.apply_ownership(&result, now);
-        let live_roots: HashSet<ProcessIdentity> = result.sessions.iter().map(|s| s.root).collect();
-        let _ = store.end_absent_sessions(&live_roots, now);
+        // A session ends only when its root process is absent from ALL live
+        // processes — not when the classifier stops recognizing it. This keeps
+        // a vendor-registered unknown agent alive while its process runs.
+        let live: HashSet<ProcessIdentity> = identities.values().copied().collect();
+        let _ = store.end_absent_sessions(&live, now);
         // Resolve + persist a decision for resources with recorded provenance
         // (exact ancestry may already be gone). Heuristic only for gaps.
         for item in items {
@@ -482,6 +485,34 @@ mod tests {
         assert_eq!(
             count, 1,
             "a second identical scan must not add another decision"
+        );
+    }
+
+    #[test]
+    fn vendor_session_survives_while_process_is_alive() {
+        let boot = BootId::from_u128(7);
+        // An agent Wyd's classifier does not recognize ("junie").
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(300, Some(1), "junie", &["junie"], 1000),
+        ];
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let sid = store
+            .ensure_session(&boot, "junie", 300, 1000, 5000)
+            .unwrap();
+
+        // The collector must NOT end the session while pid 300 is live, even
+        // though derive_ownership produces no session for "junie".
+        let ids = identities(&procs, &boot);
+        let out = derive_ownership(&group(&procs), &ids, 5000);
+        assert!(out.sessions.is_empty(), "classifier recognizes no agent");
+
+        let live: HashSet<ProcessIdentity> = ids.values().copied().collect();
+        store.end_absent_sessions(&live, 5000).unwrap();
+        assert_eq!(
+            store.session_record(sid).unwrap().unwrap().ended_at,
+            None,
+            "an unrecognized-but-alive vendor agent session must stay active"
         );
     }
 }
