@@ -37,6 +37,24 @@ OS daemons stay hidden. Desktop Chrome stays hidden. Agent-spawned Chromium does
 
 Built for people who run coding agents all day and then ask *what did that session leave behind?*
 
+## Runtime ownership
+
+Beyond the live view, wyd tracks **coding-agent runtime sessions** — which
+resources a session spawned, keyed by `boot_id + pid + start_time`, so the
+provenance survives process re-parenting and Wyd restarts. A deterministic
+resolver attributes resources to a session with an explainable score when
+exact ancestry is gone.
+
+- **Sessions** view in the TUI (top-level): agent · project · state · age · id, with a details panel.
+- **`wyd why <pid>`** — which session owns a process, and the evidence.
+- **`wyd --json sessions`** — recorded sessions as JSON.
+- **`wyd serve`** — a local daemon over a Unix socket (`wyd.sock`, mode 0600, single-instance). Keeps provenance fresh and answers read-only queries; vendors can register sessions with `session_start` / `session_end` (their id maps to a Wyd session as an alias).
+- **`wyd mcp`** — a Model Context Protocol server over stdio, so a coding agent can ask wyd for its sessions and who owns a PID.
+
+Provenance lives in SQLite (`~/Library/Application Support/wyd/state.db` on
+macOS, `$XDG_DATA_HOME/wyd/state.db` on Linux), kept fresh by the TUI,
+`wyd serve`, or `wyd mcp` (whichever is running; never more than one writer).
+
 ## Keys
 
 | Key | Action |
@@ -69,11 +87,15 @@ Same snapshot as the TUI — useful after an agent finishes a task:
 wyd --json leftovers
 wyd --plain mcp
 wyd --json project myapp
-wyd prune --dry-run     # list anonymous volumes that would be deleted
-wyd prune               # confirm, then delete them
+wyd --json sessions      # recorded agent sessions
+wyd why <pid>            # which session owns a process, and the evidence
+wyd serve                # local daemon: Unix-socket API + keeps provenance fresh
+wyd mcp                  # MCP server over stdio (for coding agents)
+wyd prune --dry-run      # list anonymous volumes that would be deleted
+wyd prune                # confirm, then delete them
 ```
 
-Filters: `leftovers`, `mcp`, `agents`, `docker`, `project`.
+Filters: `leftovers`, `mcp`, `agents`, `docker`, `project`, `sessions` (JSON only).
 
 ```json
 {
