@@ -43,11 +43,13 @@ Built for people who run coding agents all day and then ask *what did that sessi
 |---|---|
 | `←` `→` | overview / list |
 | `↑` `↓` | move |
-| `enter` | details; clickable `http://` URL on Vite/Nuxt; pin a project |
+| `enter` | details popup; on a project, pin that project |
 | `space` | mark several |
 | `k` / `K` | terminate / force kill (`y` confirms) |
 | `s` | stop running Docker container (running ones sort first) |
 | `x` | Docker clean (`y`; volumes need `D`) |
+| `P` | prune unused anonymous volumes (confirm; named data kept) |
+| `o` | open server URL from details (`http://…` shown only for a live socket) |
 | `p` | projects |
 | `/` | filter |
 | `r` | refresh |
@@ -96,8 +98,8 @@ roots = ["~/Work"]
 quit = "q"
 kill = "k"
 force_kill = "K"
-clean = "x"
 stop = "s"
+prune = "P"
 help = "?"
 refresh = "r"
 

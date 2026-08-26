@@ -1,6 +1,12 @@
 mod draw;
 mod rows;
 
+use std::collections::HashSet;
+use std::io;
+use std::process::Command;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
     execute,
@@ -14,10 +20,6 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Position, Rect},
 };
-use std::collections::HashSet;
-use std::io;
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
 
 use crate::actions::process::{self, Identity, Signal};
 use crate::config;
@@ -35,6 +37,7 @@ enum Mode {
     Help,
     ConfirmKill { force: bool },
     ConfirmDocker,
+    ConfirmPrune,
 }
 
 struct App {
@@ -220,6 +223,9 @@ fn handle_key(
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.stop, c) => {
                     stop_docker(snap, app, force)
                 }
+                KeyCode::Char(c) if config::KeysConfig::hit(&keys.prune, c) => {
+                    open_prune_confirm(snap, app)
+                }
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.clean, c) => {
                     open_docker_confirm(snap, app)
                 }
@@ -242,6 +248,10 @@ fn handle_key(
             KeyCode::Char('K') => open_kill_confirm(snap, app, true),
             KeyCode::Char(c) if config::KeysConfig::hit(&config::Config::global().keys.stop, c) => {
                 stop_docker(snap, app, force)
+            }
+            KeyCode::Char('o') => {
+                open_selected_url(snap, app, 0);
+                KeyResult::Continue
             }
             KeyCode::Char('x') => open_docker_confirm(snap, app),
             _ => KeyResult::Continue,
@@ -310,6 +320,19 @@ fn handle_key(
             }
             _ => KeyResult::Continue,
         },
+        Mode::ConfirmPrune => match code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                app.mode = Mode::List;
+                KeyResult::Continue
+            }
+            KeyCode::Char('y') => {
+                let _ = crate::actions::docker::prune_anonymous_volumes_blocking();
+                app.mode = Mode::List;
+                let _ = force.send(());
+                KeyResult::Continue
+            }
+            _ => KeyResult::Continue,
+        },
     }
 }
 
@@ -325,9 +348,13 @@ fn handle_mouse(
         y: m.row,
     };
     if !matches!(app.mode, Mode::List) {
-        if matches!(m.kind, MouseEventKind::Down(_)) && !h.popup.contains(pos) {
-            app.mode = Mode::List;
-            app.frozen_docker.clear();
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            if h.popup.contains(pos) {
+                open_popup_url(snap, app, m.row.saturating_sub(h.popup.y));
+            } else {
+                app.mode = Mode::List;
+                app.frozen_docker.clear();
+            }
         }
         return KeyResult::Continue;
     }
@@ -508,6 +535,31 @@ fn stop_docker(snap: &RuntimeSnapshot, app: &mut App, force: &mpsc::Sender<()>) 
     KeyResult::Continue
 }
 
+/// Open the i-th URL of the selected item. Mouse capture keeps the terminal
+/// from opening links itself, so wyd does it.
+fn open_selected_url(snap: &RuntimeSnapshot, app: &App, index: usize) {
+    if let Some(Row::Item { item, .. }) = app.rows(snap).get(app.selected)
+        && let Some(p) = item.ports.get(index)
+    {
+        open_url(&p.url());
+    }
+}
+
+/// URL fact rows sit right under the popup header block: 1 row of padding,
+/// then col_header + item_line + blank.
+fn open_popup_url(snap: &RuntimeSnapshot, app: &App, popup_line: u16) {
+    open_selected_url(snap, app, popup_line.saturating_sub(4) as usize);
+}
+
+fn open_url(url: &str) {
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = Command::new(cmd).arg(url).spawn();
+}
+
 fn open_docker_confirm(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
     let rs = app.rows(snap);
     let mut idxs: Vec<usize> = app.marked.iter().copied().collect();
@@ -515,7 +567,6 @@ fn open_docker_confirm(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
         idxs.push(app.selected);
     }
     idxs.sort_unstable();
-    app.frozen_docker.clear();
     for i in idxs {
         if let Some(Row::Docker(res)) = rs.get(i) {
             app.frozen_docker.push((*res).clone());
@@ -525,6 +576,15 @@ fn open_docker_confirm(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
         return KeyResult::Continue;
     }
     app.mode = Mode::ConfirmDocker;
+    KeyResult::Continue
+}
+
+/// `P`: offer to delete all unused anonymous volumes. Named volumes and
+/// anything attached survive — the engine filters, wyd only counts.
+fn open_prune_confirm(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
+    if snap.docker.ok && snap.docker.prunable_stats().0 > 0 {
+        app.mode = Mode::ConfirmPrune;
+    }
     KeyResult::Continue
 }
 
@@ -631,6 +691,23 @@ mod tests {
     }
 
     #[test]
+    fn details_show_url_for_real_socket() {
+        let mut snap = fixture_snapshot();
+        snap.logical_items[0].ports = vec![model::ListeningPort {
+            protocol: model::Protocol::Tcp,
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 5555,
+            pid: 100,
+        }];
+        let text: String = details_lines(&snap, &App::new(), 100)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("http://127.0.0.1:5555"), "{text}");
+    }
+
+    #[test]
     fn renders_empty_snapshot_as_scanning() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -720,6 +797,7 @@ mod tests {
                 size_bytes: 6 << 30,
                 compose: Some("oldproject".into()),
                 persistent: true,
+                anonymous: false,
                 created: 0,
             }],
         };
@@ -852,6 +930,7 @@ mod tests {
                     size_bytes: 40 << 20,
                     compose: None,
                     persistent: false,
+                    anonymous: false,
                     created: 0,
                 },
                 model::DockerResource {
@@ -862,6 +941,7 @@ mod tests {
                     size_bytes: 6 << 30,
                     compose: Some("oldproject".into()),
                     persistent: true,
+                    anonymous: false,
                     created: 0,
                 },
             ],
