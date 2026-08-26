@@ -51,8 +51,9 @@ restore
 
 PHASE 2 CORE  ✅ ALL IMPLEMENTED
    follow-ups: macOS boot via kern.bootsessionuuid (NTP-stable),
-   live attribution resolver in the tracker, session-aware
-   leftovers in both TUI and CLI
+   live attribution resolver (raw evidence persisted), TUI Sessions
+   view, session-aware leftovers in TUI and CLI, agent project
+   wired into sessions and the resolver
 resolver
 candidate sets
 scores
