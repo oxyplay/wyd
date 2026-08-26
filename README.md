@@ -1,10 +1,21 @@
 # wyd
 
-**wyd?** — *what you doing?* The question it asks every leftover process.
+**wyd?** — *what you doing?*
 
-A fast TUI for seeing what your development tools and AI agents left running.
+See what your coding agents left running.
 
-Coding agents leave MCP servers, headless Chromium, Vite, and Docker junk on the machine. `ps` shows every PID. wyd shows the session: who started it, which project, whether it’s leftover, and whether you can kill it.
+Coding agents spawn MCP servers, headless browsers, dev servers, workers, and databases.
+
+`ps` tells you what is running. `wyd` tells you **why** — which session started it, in which project, and whether it's leftover.
+
+```text
+OpenCode
+└─ chrome-devtools-mcp
+   └─ Chromium ×8       1.2 GB
+
+Agent exited 47m ago
+⚠ leftover
+```
 
 Local, macOS and Linux. No account, no network, no telemetry.
 

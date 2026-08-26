@@ -2,42 +2,30 @@
 
 All notable changes to wyd.
 
+## [0.5.0] - 2026-08-26
+
 ### Added
-- Runtime-ownership foundation: agent runtime sessions keyed by `boot_id + pid + start_time`, exact observed ownership over the process tree, durable SQLite provenance that survives process ancestry loss and Wyd restarts, and a deterministic ownership resolver (`wyd why` explains a process's origin session and attribution).
-- `wyd why <pid>`: reconstruct a process's origin session and attribution from recorded provenance.
-- `wyd --json sessions`: list recorded agent sessions.
-- Session-aware leftovers: a resource whose origin session ended (and that is not persistent) is flagged as a leftover in both the TUI and CLI (`--json`/`--plain`).
-- The attribution resolver now runs live in the tracker: it persists a per-resource decision (re-affirming the recorded owner) so `wyd why` shows the attribution, including the raw evidence (cwd match, start-time correlation, tool relationship).
-- A new top-level **Sessions** view in the TUI lists recorded agent sessions (agent · project · state · age · id) with a details panel; sessions now record the agent's project so the resolver's project evidence works.
-- `wyd serve`: a local read-only Unix-socket API (daemon) exposing `list_sessions`, `get_session`, `explain`, plus vendor `session_start`/`session_end` registration (vendor ids map to Wyd sessions as aliases).
-- `wyd mcp`: a minimal MCP server over stdio exposing Wyd ownership queries (`list_sessions`, `explain`) to coding agents.
-- New **Workers** category for background watchers/queues: Celery, Sidekiq, Laravel `horizon`/`queue:work`, nodemon, cargo-watch, watchexec, air, and `tsc`/`tailwindcss --watch`. They score as leftovers by age, like dev servers.
-- Detection for agents: Amp, Crush, Goose, Qwen Code, Factory Droid, Kiro, Antigravity (`agy`), Pi.
-- Detection for databases: Elasticsearch, OpenSearch, ClickHouse, CockroachDB, Cassandra, Memcached, Neo4j, Qdrant, Weaviate, Milvus, Meilisearch, Typesense, InfluxDB, SQL Server.
-- Detection for language servers: Vue, Svelte, Tailwind, ESLint, YAML, Bash, Docker, jdtls, Ruby (`ruby-lsp`/`solargraph`), nixd, nil, Biome (`lsp-proxy` only).
-- Semantic dev-server labels: Astro, SvelteKit, Remix/React Router, Parcel, Rsbuild/Rspack, Nest, Puma, Rails, Phoenix.
+- **Runtime ownership & durable provenance**: coding-agent runtime sessions keyed by `boot_id + pid + start_time`, exact observed ownership over the process tree, and SQLite provenance that survives process re-parenting and Wyd restarts.
+- **Sessions** view in the TUI (top-level): agent · project · state · age · id, with a details panel.
+- **`wyd why <pid>`**: which session owns a process, with the evidence behind the attribution.
+- **`wyd --json sessions`**: recorded sessions as JSON.
+- **Session-aware leftovers**: a resource whose origin session ended is flagged as a leftover (TUI and CLI).
+- **`wyd serve`**: a local daemon over a Unix socket — read queries plus vendor `session_start` / `session_end` registration (a vendor session id maps to a Wyd session as an alias).
+- **`wyd mcp`**: a Model Context Protocol server over stdio, so a coding agent can ask wyd for its sessions and who owns a PID.
+- **Workers** category for background watchers/queues (Celery, Sidekiq, Laravel horizon, nodemon, cargo-watch, watchexec, air, `tsc`/`tailwindcss --watch`), scored as leftovers by age.
+- Expanded agent detection (Amp, Crush, Goose, Qwen Code, Factory Droid, Kiro, Antigravity, Pi), database detection (Elasticsearch, ClickHouse, CockroachDB, Cassandra, Qdrant, …), language servers (Vue, Svelte, Tailwind, jdtls, nil, Biome, …), and semantic dev-server labels (Astro, SvelteKit, Remix, Nest, Rails, Phoenix, …).
 
 ### Changed
-- Runtime store uses WAL + `synchronous=NORMAL` + a 2 s busy timeout, so concurrent readers (TUI/CLI/MCP) don't block the `wyd serve` writer.
-- `wyd serve` is single-instance (refuses to start if another is running), writes a PID file, and restricts the socket to the owner (`0600`).
-- Vendor `session_end` is metadata on the session alias, not a runtime-session end; a runtime session ends only when its process exits.
-- `wyd mcp` pins the MCP protocol version (2025-11-25) and returns a proper JSON-RPC error for unknown methods.
-- A vendor-registered session records the process start time (not the registration time), and stays active while its process runs even if Wyd's classifier does not recognize the agent.
-- Databases are no longer unconditionally `persistent`. A database is persistent only when run as a service (Homebrew/Docker/Valet path, `persistent.commands`, or parented to launchd/systemd/init); an agent- or shell-spawned DB (`postgres -D /tmp/test-db`) is session-scoped and can become a leftover. State is now derived in `mark`, not at group time.
+- Safer Docker cleanup: named volumes are never treated as garbage; only anonymous, unattached ones are offered for pruning.
+- Runtime store uses WAL + `synchronous=NORMAL` + a busy timeout, so concurrent readers (TUI/CLI/MCP) don't block the `wyd serve` writer.
+- `wyd serve` is single-instance and restricts its socket to the owner (`0600`).
+- Databases are persistent only when run as a real service, not unconditionally.
 
 ### Fixed
-- macOS boot identity now uses `kern.bootsessionuuid` (stable per boot) instead of the clock-derived `kern.boottime`, so an NTP clock adjustment no longer reads as a new boot and wipes session provenance.
-- Detached headless Chromium now surfaces as a leftover item instead of silently disappearing.
-- Docker snapshot is Arc-cloned (O(1)) instead of full clone every 2 s.
-- Leftover scoring uses HashMap lookup instead of linear scan for ancestor processes.
-- `KeysConfig::hit` is exact match (was `starts_with`).
-- Project filter is case-insensitive in TUI (already was in CLI).
-- Named volumes are no longer flagged as leftover in `--json leftovers`.
-- Ports are deduplicated in the Ports view.
-- `prune --dry-run` reports `docker not running` when the daemon is down.
-- `XDG_CONFIG_HOME` is respected on Linux.
-- `count_projects` is O(n) instead of O(n²).
-- `with_disk_usage` flag dropped (unused sysinfo data).
+- Stable macOS boot identity (`kern.bootsessionuuid`): an NTP clock adjustment no longer reads as a new boot and wipes session provenance.
+- Detached headless Chromium surfaces as a leftover instead of silently disappearing.
+- Docker snapshot is Arc-cloned (O(1)) instead of fully cloned every scan; leftover scoring and project counting are O(n).
+- Named volumes are no longer flagged as leftover in `--json leftovers`; ports are deduplicated; `prune --dry-run` reports when the daemon is down.
 
 ## [0.4.4] - 2026-08-26
 
