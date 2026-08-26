@@ -8,7 +8,7 @@ license = "Apache-2.0"
 authors = ["Maksym Nevinchanyy"]
 readme = "README.md"
 repository = "https://github.com/oxyplay/wyd"
-homepage = "https://github.com/oxyplay/wyd"
+homepage = "https://wyd.sh"
 keywords = ["tui", "process", "docker", "mcp", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 

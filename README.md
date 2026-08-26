@@ -19,6 +19,7 @@ Agent exited 47m ago
 
 Local, macOS and Linux. No account, no network, no telemetry.
 
+**https://wyd.sh**
 
 ```bash
 brew install oxyplay/tap/wyd
@@ -28,10 +29,10 @@ wyd
 wyd upgrade   # brew or cargo, matching the install
 ```
 
-For brew installs, a new release reaches `wyd upgrade` only after
+Each tagged release publishes the crate to crates.io and bumps
 `Formula/wyd.rb` in [oxyplay/homebrew-tap](https://github.com/oxyplay/homebrew-tap)
-is bumped — otherwise `brew upgrade` reports "already installed". `wyd upgrade`
-prints a hint when that happens.
+automatically, so `wyd upgrade` stays current with no manual step. `wyd upgrade`
+still prints a hint if a formula bump is ever lagging.
 
 Binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases). From a clone: `cargo install --path .`
 
