@@ -17,6 +17,11 @@ wyd
 wyd upgrade   # brew or cargo, matching the install
 ```
 
+For brew installs, a new release reaches `wyd upgrade` only after
+`Formula/wyd.rb` in [oxyplay/homebrew-tap](https://github.com/oxyplay/homebrew-tap)
+is bumped — otherwise `brew upgrade` reports "already installed". `wyd upgrade`
+prints a hint when that happens.
+
 Binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases). From a clone: `cargo install --path .`
 
 

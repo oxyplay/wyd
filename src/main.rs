@@ -148,12 +148,39 @@ fn run_upgrade() -> io::Result<()> {
         io::Error::other("unknown install; try:\n  brew upgrade wyd\n  cargo install wyd")
     })?;
     eprintln!("+ {cmd} {}", args.join(" "));
+    if cmd == "brew" {
+        return run_brew_upgrade();
+    }
     let status = Command::new(cmd).args(args).status()?;
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::other(format!("{cmd} exited {status}")))
     }
+}
+
+/// `brew upgrade` silently no-ops when the tap formula has no newer version
+/// than what is installed. A new wyd release must bump `Formula/wyd.rb` in
+/// oxyplay/homebrew-tap first, or brew users never receive it — so a no-op is
+/// reported honestly instead of looking like a successful update.
+fn run_brew_upgrade() -> io::Result<()> {
+    let out = Command::new("brew").args(["upgrade", "wyd"]).output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprint!("{text}");
+    if !out.status.success() {
+        return Err(io::Error::other("brew upgrade exited with an error"));
+    }
+    if text.contains("already installed") || text.contains("already up-to-date") {
+        println!(
+            "no newer version from the tap — either you are current, or the\n\
+             homebrew formula (oxyplay/tap) has not been bumped for this release"
+        );
+    }
+    Ok(())
 }
 
 fn updater_for(exe: &Path) -> Option<(&'static str, &'static [&'static str])> {
