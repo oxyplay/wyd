@@ -13,8 +13,10 @@
 
 use crate::classify::ownership::OwnershipResult;
 use crate::model::boot::{BootEpoch, BootId};
+use crate::model::process::ProcessIdentity;
 use crate::model::session::RuntimeSessionId;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -300,6 +302,186 @@ impl RuntimeStore {
             .map_err(err)?;
         Ok(session.map(|s| RuntimeSessionId::from_u64(s as u64)))
     }
+
+    /// Mark any active session whose root process is no longer live as ended.
+    /// `live_roots` are the exact root identities observed in the current
+    /// scan. A session whose root is absent has ended; `ended_at` is the first
+    /// observation time where the process was absent.
+    pub fn end_absent_sessions(
+        &mut self,
+        live_roots: &std::collections::HashSet<ProcessIdentity>,
+        now: u64,
+    ) -> io::Result<()> {
+        let tx = self.conn.transaction().map_err(err)?;
+        let mut stmt = tx
+            .prepare(
+                "SELECT session_id, boot_id, root_pid, root_start_time
+                      FROM sessions WHERE ended_at IS NULL",
+            )
+            .map_err(err)?;
+        let active: Vec<(i64, Vec<u8>, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?;
+        drop(stmt);
+
+        for (id, boot, pid, start) in active {
+            let root = ProcessIdentity {
+                boot_id: bytes_to_boot(&boot),
+                pid: pid as u32,
+                start_time: start as u64,
+            };
+            if !live_roots.contains(&root) {
+                tx.execute(
+                    "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
+                    params![now as i64, id],
+                )
+                .map_err(err)?;
+            }
+        }
+        tx.commit().map_err(err)?;
+        Ok(())
+    }
+
+    /// Delete provenance older than `retention_secs`: ended sessions and their
+    /// now-orphaned, old resources. A session is kept while any resource that
+    /// references it has a member (or root) process still alive on the system,
+    /// so a survived orphan keeps its origin regardless of age.
+    ///
+    /// `live` is the set of process identities currently observed by the
+    /// collector — the real liveness signal, not retention arithmetic.
+    pub fn gc(
+        &mut self,
+        retention_secs: u64,
+        now: u64,
+        live: &HashSet<ProcessIdentity>,
+    ) -> io::Result<()> {
+        let cutoff = now.saturating_sub(retention_secs) as i64;
+        let tx = self.conn.transaction().map_err(err)?;
+
+        // Which resources have a live member or root?
+        let mut live_resources: HashSet<i64> = HashSet::new();
+        let roots = quads(
+            &tx,
+            "SELECT resource_id, root_boot_id, root_pid, root_start_time FROM resources",
+            None,
+        )?;
+        for (rid, boot, pid, start) in roots {
+            if live.contains(&ProcessIdentity {
+                boot_id: bytes_to_boot(&boot),
+                pid: pid as u32,
+                start_time: start as u64,
+            }) {
+                live_resources.insert(rid);
+            }
+        }
+        let members = quads(
+            &tx,
+            "SELECT resource_id, boot_id, pid, start_time FROM resource_members",
+            None,
+        )?;
+        for (rid, boot, pid, start) in members {
+            if live.contains(&ProcessIdentity {
+                boot_id: bytes_to_boot(&boot),
+                pid: pid as u32,
+                start_time: start as u64,
+            }) {
+                live_resources.insert(rid);
+            }
+        }
+
+        // Sessions referenced by a live resource are protected.
+        let mut protected: HashSet<i64> = HashSet::new();
+        let edges: Vec<(i64, i64)> = pairs(
+            &tx,
+            "SELECT resource_id, session_id FROM exact_ownership",
+            None,
+        )?;
+        for (rid, sid) in edges {
+            if live_resources.contains(&rid) {
+                protected.insert(sid);
+            }
+        }
+
+        // Delete ended, old, unprotected sessions and their ownership edges.
+        let candidates: Vec<i64> = scalars(
+            &tx,
+            "SELECT session_id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+            Some(&cutoff),
+        )?;
+        for sid in candidates {
+            if protected.contains(&sid) {
+                continue;
+            }
+            tx.execute("DELETE FROM sessions WHERE session_id = ?1", params![sid])
+                .map_err(err)?;
+            tx.execute(
+                "DELETE FROM exact_ownership WHERE session_id = ?1",
+                params![sid],
+            )
+            .map_err(err)?;
+        }
+
+        // Old orphaned resources (no ownership edge) and their members.
+        tx.execute(
+            "DELETE FROM resources
+             WHERE resource_id NOT IN (SELECT resource_id FROM exact_ownership)
+               AND last_seen_at < ?1",
+            params![cutoff],
+        )
+        .map_err(err)?;
+        tx.execute(
+            "DELETE FROM resource_members
+             WHERE resource_id NOT IN (SELECT resource_id FROM resources)",
+            params![],
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)?;
+        Ok(())
+    }
+}
+
+/// `(resource_id, boot_id/root_boot_id, pid, start_time)` rows.
+type Quad = (i64, Vec<u8>, i64, i64);
+
+fn quads(conn: &Connection, sql: &str, arg: Option<&i64>) -> io::Result<Vec<Quad>> {
+    query_rows(conn, sql, arg, |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })
+}
+
+/// Two-column rows.
+fn pairs(conn: &Connection, sql: &str, arg: Option<&i64>) -> io::Result<Vec<(i64, i64)>> {
+    query_rows(conn, sql, arg, |r| Ok((r.get(0)?, r.get(1)?)))
+}
+
+/// Single-column rows.
+fn scalars(conn: &Connection, sql: &str, arg: Option<&i64>) -> io::Result<Vec<i64>> {
+    query_rows(conn, sql, arg, |r| r.get(0))
+}
+
+/// Run `sql` (with optional `?1` bound), mapping each row with `map`.
+fn query_rows<T>(
+    conn: &Connection,
+    sql: &str,
+    arg: Option<&i64>,
+    map: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> io::Result<Vec<T>> {
+    let mut stmt = conn.prepare(sql).map_err(err)?;
+    let rows = match arg {
+        Some(a) => stmt
+            .query_map(params![a], &map)
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<T>>>(),
+        None => stmt
+            .query_map([], &map)
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<T>>>(),
+    }
+    .map_err(err)?;
+    drop(stmt);
+    Ok(rows)
 }
 
 fn bytes_to_boot(b: &[u8]) -> BootId {
@@ -485,5 +667,86 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ended_session_is_kept_while_a_surviving_member_is_alive() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        apply_chain(&mut store, 1000);
+
+        // The agent dies; Chromium survives (re-parented). No live roots.
+        let gone = std::collections::HashSet::new();
+        store.end_absent_sessions(&gone, 2000).unwrap();
+
+        // Chromium's process is still alive on the system → its resource is
+        // live → the origin session must survive GC regardless of age.
+        let boot = BootId::from_u128(7);
+        let live = std::collections::HashSet::from([ProcessIdentity {
+            boot_id: boot,
+            pid: 120,
+            start_time: 1007,
+        }]);
+        store.gc(0, 1_000_000, &live).unwrap();
+        assert!(
+            store
+                .owning_session_for_process(&boot, 120, 1007)
+                .unwrap()
+                .is_some(),
+            "surviving member must keep its origin session across GC"
+        );
+    }
+
+    #[test]
+    fn ended_session_with_no_live_member_is_gced() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        apply_chain(&mut store, 1000);
+
+        // Everything died: no live roots and no surviving member.
+        let gone = std::collections::HashSet::new();
+        store.end_absent_sessions(&gone, 2000).unwrap();
+        let live = std::collections::HashSet::new();
+        store.gc(0, 3000, &live).unwrap();
+        let boot = BootId::from_u128(7);
+        assert!(
+            store
+                .owning_session_for_process(&boot, 120, 1007)
+                .unwrap()
+                .is_none(),
+            "fully-dead provenance must be collected"
+        );
+    }
+
+    #[test]
+    fn end_absent_sessions_marks_only_gone_roots() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        apply_chain(&mut store, 1000);
+
+        // Session root (omp pid 100 / start 1000) is still live.
+        let boot = BootId::from_u128(7);
+        let live_root = ProcessIdentity {
+            boot_id: boot,
+            pid: 100,
+            start_time: 1000,
+        };
+        let live = std::collections::HashSet::from([live_root]);
+        store.end_absent_sessions(&live, 2000).unwrap();
+        assert!(
+            store
+                .owning_session_for_process(&boot, 120, 1007)
+                .unwrap()
+                .is_some(),
+            "live root keeps its session active"
+        );
+
+        // Root gone on the next scan → session ended (but provenance kept).
+        let gone = std::collections::HashSet::new();
+        store.end_absent_sessions(&gone, 3000).unwrap();
+        assert!(
+            store
+                .owning_session_for_process(&boot, 120, 1007)
+                .unwrap()
+                .is_some(),
+            "ended session still keeps provenance"
+        );
     }
 }

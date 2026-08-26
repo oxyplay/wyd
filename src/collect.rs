@@ -9,7 +9,7 @@ use crate::model::runtime::RuntimeItem;
 use crate::platform::{BootIdentityProvider, SystemBoot};
 use crate::scanner::{ProcessScanner, ports, processes::SysinfoProcessScanner};
 use crate::store::RuntimeStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// One scan of processes, ports, Docker, and leftover scores.
@@ -42,6 +42,7 @@ pub fn snapshot() -> RuntimeSnapshot {
 pub struct OwnershipTracker {
     store: Option<RuntimeStore>,
     boot: Option<BootId>,
+    gc_pending: bool,
 }
 
 impl OwnershipTracker {
@@ -54,11 +55,16 @@ impl OwnershipTracker {
                 .ok()
                 .and_then(|e| s.boot_id_for_epoch(e, now).ok())
         });
-        Self { store, boot }
+        Self {
+            store,
+            boot,
+            gc_pending: true,
+        }
     }
 
-    /// Record the exact-observed ownership of one scan. Best-effort: any
-    /// failure is swallowed so the live view is never affected.
+    /// Record the exact-observed ownership of one scan, and end any session
+    /// whose root process is no longer live. Best-effort: any failure is
+    /// swallowed so the live view is never affected.
     pub fn record(&mut self, processes: &[ProcessInfo], items: &[RuntimeItem]) {
         let (Some(store), Some(boot)) = (self.store.as_mut(), self.boot) else {
             return;
@@ -67,8 +73,19 @@ impl OwnershipTracker {
         let now = now();
         let result = derive_ownership(items, &identities, now);
         let _ = store.apply_ownership(&result, now);
+        let live_roots: HashSet<ProcessIdentity> = result.sessions.iter().map(|s| s.root).collect();
+        let _ = store.end_absent_sessions(&live_roots, now);
+        // GC once per run, using the first scan's real live-process set.
+        if self.gc_pending {
+            let live: HashSet<ProcessIdentity> = identities.values().copied().collect();
+            let _ = store.gc(RETENTION_SECS, now, &live);
+            self.gc_pending = false;
+        }
     }
 }
+
+/// Provenance retention before GC (contract §13 `[history] retention_days`).
+const RETENTION_SECS: u64 = 30 * 24 * 3600;
 
 fn identities(processes: &[ProcessInfo], boot: &BootId) -> HashMap<u32, ProcessIdentity> {
     processes
