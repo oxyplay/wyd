@@ -19,7 +19,7 @@ impl ListeningPort {
         format!(":{}", self.port)
     }
 
-    /// Loopback/unspecified → 127.0.0.1 so terminals make a clickable link.
+    /// Loopback/unspecified → 127.0.0.1 so the browser opens the local server.
     pub fn url(&self) -> String {
         let host = match self.address {
             IpAddr::V4(a) if a.is_unspecified() || a.is_loopback() => "127.0.0.1".into(),

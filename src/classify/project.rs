@@ -1,11 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use crate::classify::rules;
-use crate::model::{
-    Category, ListeningPort, ProcessInfo, Project, Protocol, RuntimeItem, RuntimeState,
-};
+use crate::model::{Category, ListeningPort, ProcessInfo, Project, RuntimeItem, RuntimeState};
 
 const MARKERS: &[&str] = &[
     "package.json",
@@ -136,43 +133,9 @@ fn attach_one(
             }
         }
     }
-    if item_ports.is_empty() {
-        item_ports.extend(ports_from_argv(item, by_pid));
-    }
     item_ports.sort_by_key(|p| p.port);
     item_ports.dedup_by_key(|p| p.port);
     item.ports = item_ports;
-}
-
-fn ports_from_argv(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) -> Vec<ListeningPort> {
-    let mut out = Vec::new();
-    for &pid in &item.process_ids {
-        let Some(p) = by_pid.get(&pid) else { continue };
-        if let Some(port) = port_from_cmd(&p.command) {
-            out.push(ListeningPort {
-                protocol: Protocol::Tcp,
-                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                port,
-                pid,
-            });
-        }
-    }
-    out
-}
-
-/// `--port 5555` / `--port=3000`. Vite/Nuxt/Next put this on argv even
-/// when the listen socket belongs to a worker netstat can't map.
-fn port_from_cmd(cmd: &[String]) -> Option<u16> {
-    let mut parts = cmd.iter().flat_map(|a| a.split_whitespace());
-    while let Some(a) = parts.next() {
-        if let Some(v) = a.strip_prefix("--port=") {
-            return v.parse().ok();
-        }
-        if a == "--port" {
-            return parts.next()?.parse().ok();
-        }
-    }
-    None
 }
 
 fn promote_listeners(item: &mut RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>) {
@@ -525,20 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn port_from_cmd_parses_flag() {
-        assert_eq!(
-            port_from_cmd(&["nuxt".into(), "dev".into(), "--port".into(), "5555".into()]),
-            Some(5555)
-        );
-        assert_eq!(
-            port_from_cmd(&["vite".into(), "--port=3000".into()]),
-            Some(3000)
-        );
-        assert_eq!(port_from_cmd(&["vite".into()]), None);
-    }
-
-    #[test]
-    fn attach_uses_port_flag_when_socket_missing() {
+    fn argv_port_flag_is_not_claimed_without_socket() {
         use crate::classify::group;
         use crate::model::ProcessInfo;
 
@@ -564,7 +514,9 @@ mod tests {
         attach(&mut items, &processes, &[], &mut ProjectCache::default());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].display_name, "nuxt");
-        assert_eq!(items[0].ports[0].port, 5555);
-        assert_eq!(items[0].ports[0].url(), "http://127.0.0.1:5555");
+        assert!(
+            items[0].ports.is_empty(),
+            "argv --port is a flag, not a listening socket"
+        );
     }
 }
