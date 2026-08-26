@@ -9,6 +9,8 @@ All notable changes to wyd.
 - Session-aware leftovers: a resource whose origin session ended (and that is not persistent) is flagged as a leftover in both the TUI and CLI (`--json`/`--plain`).
 - The attribution resolver now runs live in the tracker: it persists a per-resource decision (re-affirming the recorded owner) so `wyd why` shows the attribution, including the raw evidence (cwd match, start-time correlation, tool relationship).
 - A new top-level **Sessions** view in the TUI lists recorded agent sessions (agent · project · state · age · id) with a details panel; sessions now record the agent's project so the resolver's project evidence works.
+- `wyd serve`: a local read-only Unix-socket API (daemon) exposing `list_sessions`, `get_session`, `explain`, plus vendor `session_start`/`session_end` registration (vendor ids map to Wyd sessions as aliases).
+- `wyd mcp`: a minimal MCP server over stdio exposing Wyd ownership queries (`list_sessions`, `explain`) to coding agents.
 - New **Workers** category for background watchers/queues: Celery, Sidekiq, Laravel `horizon`/`queue:work`, nodemon, cargo-watch, watchexec, air, and `tsc`/`tailwindcss --watch`. They score as leftovers by age, like dev servers.
 - Detection for agents: Amp, Crush, Goose, Qwen Code, Factory Droid, Kiro, Antigravity (`agy`), Pi.
 - Detection for databases: Elasticsearch, OpenSearch, ClickHouse, CockroachDB, Cassandra, Memcached, Neo4j, Qdrant, Weaviate, Milvus, Meilisearch, Typesense, InfluxDB, SQL Server.

@@ -62,13 +62,8 @@ propagation
 
 ↓ much later
 
-PHASE 3
-daemon
-MCP
-ACP
-web
-vendor protocol
-Fleet
+PHASE 3  ✅ daemon + Unix-socket API, MCP, vendor protocol
+   deferred: ACP, web UI, desktop UI, Fleet
 ```
 
 This document is the contract for PHASE 1. It is frozen until the first eight implementation steps complete.
