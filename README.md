@@ -68,10 +68,23 @@ exact ancestry is gone.
 - **`wyd serve`** — a local daemon over a Unix socket (`wyd.sock`, mode 0600, single-instance). Keeps provenance fresh and answers read-only queries; vendors can register sessions with `session_start` / `session_end` (their id maps to a Wyd session as an alias).
 - **`wyd mcp`** — a Model Context Protocol server over stdio, so a coding agent can ask wyd for its sessions and who owns a PID.
 
-Provenance lives in SQLite (`~/Library/Application Support/wyd/state.db` on
-macOS, `$XDG_DATA_HOME/wyd/state.db` on Linux), kept fresh by the TUI,
-`wyd serve`, or `wyd mcp`. The WAL-backed local store supports concurrent
-access, so several processes can write at once.
+## MCP
+
+`wyd` also speaks the Model Context Protocol over stdio, so a coding agent
+can ask the machine what it — or other agents — left running.
+
+```bash
+wyd mcp
+```
+
+Starts the local MCP server (read-only). It exposes two tools:
+`list_sessions` (recorded agent sessions) and `explain` (which session owns a
+process, by pid). No network, no account — the answers come from the local
+provenance store.
+
+Registered in the MCP Registry:
+
+- MCP Registry name: `mcp-name: io.github.oxyplay/wyd`
 
 ## Keys
 
