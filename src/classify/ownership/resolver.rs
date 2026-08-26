@@ -63,6 +63,39 @@ pub struct CandidateInput {
     pub reaches_other_agent: bool,
 }
 
+/// A raw observed fact supporting a candidate (contract §14): what Wyd
+/// actually saw, separate from what the resolver concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceKind {
+    PersistedOwnership,
+    CwdMatch,
+    GitRoot,
+    StartTimeCorrelation,
+    ToolRelationship,
+    PredatesSession,
+    ReachesOtherAgent,
+}
+
+impl EvidenceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PersistedOwnership => "persisted ownership",
+            Self::CwdMatch => "cwd match",
+            Self::GitRoot => "git root",
+            Self::StartTimeCorrelation => "start-time correlation",
+            Self::ToolRelationship => "known tool relationship",
+            Self::PredatesSession => "predates session",
+            Self::ReachesOtherAgent => "reaches another agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub kind: EvidenceKind,
+    pub value: String,
+}
+
 /// One scored candidate for a resource, with its rejected reason if any.
 #[derive(Debug, Clone)]
 pub struct AttributionCandidate {
@@ -74,6 +107,8 @@ pub struct AttributionCandidate {
     pub relationship_support: u8,
     pub total: u8,
     pub rejected: Option<Rejection>,
+    /// Raw observed facts, for reproducibility / `wyd why`.
+    pub evidence: Vec<Evidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,10 +179,58 @@ pub fn resolve(rules: &ResolverRules, inputs: Vec<CandidateInput>) -> Attributio
             relationship_support,
             total,
             rejected,
+            evidence: evidence_for(&input, anchor),
         });
     }
 
     select(rules, candidates)
+}
+
+fn evidence_for(input: &CandidateInput, anchor: AnchorKind) -> Vec<Evidence> {
+    let mut ev = Vec::new();
+    if matches!(anchor, AnchorKind::PersistedPrevious) {
+        ev.push(Evidence {
+            kind: EvidenceKind::PersistedOwnership,
+            value: "previous observation".into(),
+        });
+    }
+    if input.exact_cwd {
+        ev.push(Evidence {
+            kind: EvidenceKind::CwdMatch,
+            value: "exact".into(),
+        });
+    }
+    if input.same_git_root {
+        ev.push(Evidence {
+            kind: EvidenceKind::GitRoot,
+            value: "shared".into(),
+        });
+    }
+    if let Some(d) = input.start_delta_secs {
+        ev.push(Evidence {
+            kind: EvidenceKind::StartTimeCorrelation,
+            value: format!("{d}s after session start"),
+        });
+    }
+    if input.tool_relationship {
+        ev.push(Evidence {
+            kind: EvidenceKind::ToolRelationship,
+            value: "known chain".into(),
+        });
+    }
+    if input.predates_session {
+        ev.push(Evidence {
+            kind: EvidenceKind::PredatesSession,
+            value: "resource started first".into(),
+        });
+    }
+    if input.reaches_other_agent {
+        ev.push(Evidence {
+            kind: EvidenceKind::ReachesOtherAgent,
+            value: "ancestry reaches another session".into(),
+        });
+    }
+    ev
 }
 
 fn project_support(rules: &ResolverRules, input: &CandidateInput) -> u8 {

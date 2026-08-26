@@ -8,12 +8,12 @@
 //! process identity is `boot_id + pid + start_time`, not PID alone.
 
 use crate::classify::ownership::OwnershipResult;
-use crate::classify::ownership::resolver::AttributionDecision;
+use crate::classify::ownership::resolver::{AttributionDecision, Evidence, EvidenceKind};
 use crate::model::boot::{BootEpoch, BootId};
 use crate::model::process::ProcessIdentity;
 use crate::model::session::RuntimeSessionId;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -126,6 +126,13 @@ impl RuntimeStore {
                 total_score INTEGER NOT NULL,
                 rejected_reason TEXT,
                 PRIMARY KEY (decision_id, session_id)
+            );
+            CREATE TABLE IF NOT EXISTS evidence (
+                decision_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (decision_id, session_id, kind)
             );
             COMMIT;",
             )
@@ -478,6 +485,7 @@ impl RuntimeStore {
         .map_err(err)?;
         let decision_id = tx.last_insert_rowid();
         for c in &d.candidates {
+            let sid = c.session.as_u64() as i64;
             tx.execute(
                 "INSERT INTO attribution_candidates
                    (decision_id, session_id, anchor_kind, anchor_score,
@@ -486,7 +494,7 @@ impl RuntimeStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     decision_id,
-                    c.session.as_u64() as i64,
+                    sid,
                     format!("{:?}", c.anchor),
                     c.anchor_score as i64,
                     c.project_support as i64,
@@ -497,6 +505,16 @@ impl RuntimeStore {
                 ],
             )
             .map_err(err)?;
+            for e in &c.evidence {
+                tx.execute(
+                    "INSERT INTO evidence (decision_id, session_id, kind, value)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(decision_id, session_id, kind)
+                     DO UPDATE SET value = excluded.value",
+                    params![decision_id, sid, e.kind.as_str(), e.value],
+                )
+                .map_err(err)?;
+            }
         }
         tx.commit().map_err(err)?;
         Ok(())
@@ -688,22 +706,56 @@ impl RuntimeStore {
                 })
                 .map_err(err)?
                 .collect();
-            drop(stmt);
-            rows.map_err(err)?
+            let mut cands = rows
+                .map_err(err)?
                 .into_iter()
-                .map(
-                    |(sid, anchor, a, p, t, rel, total, rejected)| CandidateRecord {
-                        session: RuntimeSessionId::from_u64(sid as u64),
-                        anchor_kind: anchor,
-                        anchor_score: a as u8,
-                        project_support: p as u8,
-                        temporal_support: t as u8,
-                        relationship_support: rel as u8,
-                        total: total as u8,
-                        rejected_reason: rejected,
-                    },
-                )
-                .collect()
+                .map(|(sid, anchor, a, p, t, rel, total, rejected)| {
+                    (
+                        sid,
+                        CandidateRecord {
+                            session: RuntimeSessionId::from_u64(sid as u64),
+                            anchor_kind: anchor,
+                            anchor_score: a as u8,
+                            project_support: p as u8,
+                            temporal_support: t as u8,
+                            relationship_support: rel as u8,
+                            total: total as u8,
+                            rejected_reason: rejected,
+                            evidence: Vec::new(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut by_sid: HashMap<i64, &mut CandidateRecord> =
+                cands.iter_mut().map(|(sid, c)| (*sid, c)).collect();
+            let mut estmt = self
+                .conn
+                .prepare("SELECT session_id, kind, value FROM evidence WHERE decision_id = ?1")
+                .map_err(err)?;
+            let erows: Vec<(i64, String, String)> = estmt
+                .query_map(params![decision_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .map_err(err)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(err)?;
+            drop(estmt);
+            for (sid, kind, value) in erows {
+                if let Some(c) = by_sid.get_mut(&sid) {
+                    let kind = match kind.as_str() {
+                        "persisted ownership" => EvidenceKind::PersistedOwnership,
+                        "cwd match" => EvidenceKind::CwdMatch,
+                        "git root" => EvidenceKind::GitRoot,
+                        "start-time correlation" => EvidenceKind::StartTimeCorrelation,
+                        "known tool relationship" => EvidenceKind::ToolRelationship,
+                        "predates session" => EvidenceKind::PredatesSession,
+                        "reaches another agent" => EvidenceKind::ReachesOtherAgent,
+                        _ => continue,
+                    };
+                    c.evidence.push(Evidence { kind, value });
+                }
+            }
+            cands.into_iter().map(|(_, c)| c).collect()
         };
         Ok(Some(DecisionRecord {
             resolver_version: version as u32,
@@ -752,6 +804,7 @@ pub struct CandidateRecord {
     pub relationship_support: u8,
     pub total: u8,
     pub rejected_reason: Option<String>,
+    pub evidence: Vec<Evidence>,
 }
 
 /// `(resource_id, boot_id/root_boot_id, pid, start_time)` rows.
@@ -1090,6 +1143,21 @@ mod tests {
             .unwrap();
         assert_eq!(total, 95, "worked example total must round-trip");
         assert_eq!(project, 10);
+
+        // Raw evidence (§14) round-trips too.
+        let decision = store.latest_decision(42).unwrap().unwrap();
+        let cand = decision.candidates.first().unwrap();
+        assert!(
+            cand.evidence
+                .iter()
+                .any(|e| e.kind == crate::classify::ownership::resolver::EvidenceKind::CwdMatch),
+            "exact-cwd evidence must be persisted and readable"
+        );
+        assert!(
+            cand.evidence.iter().any(|e| e.kind
+                == crate::classify::ownership::resolver::EvidenceKind::StartTimeCorrelation),
+            "start-time evidence must be persisted and readable"
+        );
     }
 
     #[test]

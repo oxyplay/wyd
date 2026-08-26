@@ -303,6 +303,9 @@ fn print_session_owner(store: &store::RuntimeStore, exp: &store::Explanation) {
                 sign(c.relationship_support),
                 c.total,
             );
+            for e in &c.evidence {
+                println!("    evidence: {} ({})", e.kind.as_str(), e.value);
+            }
         }
     }
 }
