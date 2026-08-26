@@ -394,4 +394,105 @@ mod tests {
         );
         assert!(db.suspicion.is_none());
     }
+    // ── Realistic session fixtures (classify/test_fixtures.rs) ────────────
+
+    /// Agent alive: the whole tree stays clean — nothing is a leftover while
+    /// its session is running.
+    #[test]
+    fn fixture_agent_alive_marks_nothing_leftover() {
+        use crate::classify::test_fixtures;
+        let procs = test_fixtures::live_agent_session();
+        let mut items = group(&procs);
+        mark(&mut items, &procs, &Config::default());
+
+        fn assert_clean(items: &[RuntimeItem]) {
+            for i in items {
+                assert_eq!(
+                    i.state,
+                    RuntimeState::Active,
+                    "{} must be active while its agent lives",
+                    i.display_name
+                );
+                assert!(
+                    i.suspicion.is_none(),
+                    "{} must have no suspicion",
+                    i.display_name
+                );
+                assert_clean(&i.children);
+            }
+        }
+        assert_clean(&items);
+
+        // Tree shape: agent root → mcp (with one Chromium ×3 item), vite, db.
+        assert_eq!(items.len(), 1);
+        let agent = &items[0];
+        assert_eq!(agent.category, Category::Agent);
+        assert_eq!(agent.children.len(), 3);
+        let mcp = &agent.children[0];
+        assert_eq!(mcp.category, Category::Mcp);
+        assert_eq!(mcp.children.len(), 1);
+        assert_eq!(mcp.children[0].category, Category::Browser);
+        assert_eq!(
+            mcp.children[0].process_ids.len(),
+            3,
+            "Chromium ×3 collapses"
+        );
+    }
+
+    /// Agent died: its MCP is reparented to init and reads as a leftover
+    /// with the owning-agent-missing + re-parented reasons.
+    #[test]
+    fn fixture_agent_died_reparents_to_init() {
+        use crate::classify::test_fixtures;
+        let procs = test_fixtures::orphaned_agent_session();
+        let mut items = group(&procs);
+        mark(&mut items, &procs, &Config::default());
+
+        let mcp = items.iter().find(|i| i.category == Category::Mcp).unwrap();
+        assert_eq!(mcp.state, RuntimeState::Suspicious);
+        let s = mcp.suspicion.as_ref().expect("mcp marked");
+        for reason in [
+            SuspicionReason::OwningAgentMissing,
+            SuspicionReason::McpOwnerMissing,
+            SuspicionReason::ParentExited,
+        ] {
+            assert!(s.reasons.contains(&reason), "missing {reason:?} in {s:?}");
+        }
+        assert_eq!(s.score, 100); // 50 + 25 + 40, capped
+
+        // The detached browser rides along inside its leftover MCP.
+        let chrom = &mcp.children[0];
+        assert_eq!(
+            chrom.state,
+            RuntimeState::Active,
+            "browser stays inside the MCP item"
+        );
+        assert!(chrom.suspicion.is_none());
+
+        // Vite reparented to init: ParentExited (and old enough that the
+        // age rule also fires — fixture start times are long past the
+        // 8-hour threshold).
+        let vite = items.iter().find(|i| i.display_name == "vite").unwrap();
+        assert_eq!(vite.state, RuntimeState::Suspicious);
+        let vs = vite.suspicion.as_ref().expect("vite marked");
+        assert!(
+            vs.reasons.contains(&SuspicionReason::ParentExited),
+            "vite: {vs:?}"
+        );
+        assert!(
+            vs.reasons.contains(&SuspicionReason::LongRunningDevServer),
+            "vite: {vs:?}"
+        );
+        assert!(!vs.reasons.contains(&SuspicionReason::OwningAgentMissing));
+
+        // A DB reparented to init is indistinguishable from a service
+        // manager's child: the heuristic exempts it; the recorded-session
+        // store re-flags it via SessionOwnerEnded (collect.rs tests).
+        let pg = items
+            .iter()
+            .find(|i| i.category == Category::Database)
+            .unwrap();
+        assert_eq!(pg.state, RuntimeState::Persistent);
+        assert!(pg.suspicion.is_none());
+    }
 }

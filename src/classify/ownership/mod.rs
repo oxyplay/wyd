@@ -292,4 +292,48 @@ mod tests {
             "session must carry the agent's project so the resolver's project evidence works"
         );
     }
+
+    /// The realistic live-session fixture: every descendant is exactly owned
+    /// by the one session, with the browser group collapsing to one resource.
+    #[test]
+    fn fixture_live_session_owns_every_descendant() {
+        use crate::classify::test_fixtures;
+        let procs = test_fixtures::live_agent_session();
+        let items = group(&procs);
+        let out = derive_ownership(&items, &test_fixtures::identities(&procs), NOW);
+
+        assert_eq!(out.sessions.len(), 1);
+        let session = &out.sessions[0];
+        assert_eq!(session.agent, "omp");
+        assert_eq!(session.started_at, test_fixtures::AGENT_START);
+
+        // MCP, Chromium ×3, Vite, PostgreSQL — everything under the agent.
+        assert_eq!(out.owned.len(), 4);
+        for o in &out.owned {
+            assert_eq!(o.session, session.id);
+        }
+        let kinds: Vec<Category> = out.owned.iter().map(|o| o.kind).collect();
+        for want in [
+            Category::Mcp,
+            Category::Browser,
+            Category::DevServer,
+            Category::Database,
+        ] {
+            assert!(kinds.contains(&want), "missing {want:?} in {kinds:?}");
+        }
+        let chrom = out
+            .owned
+            .iter()
+            .find(|o| o.kind == Category::Browser)
+            .unwrap();
+        assert_eq!(
+            chrom.members.len(),
+            3,
+            "all three Chromium helpers are members"
+        );
+
+        // The MCP root identity is the fixture's MCP process, reproducibly.
+        let mcp_root = ProcessIdentity::from_process(&test_fixtures::boot(), &procs[2]).unwrap();
+        assert!(out.owned.iter().any(|o| o.root == mcp_root));
+    }
 }

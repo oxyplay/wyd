@@ -416,4 +416,38 @@ mod tests {
         assert_eq!(cand.project_support, 10, "family capped: not +18");
         assert_eq!(cand.total, 75 + 10 + 5 + 5);
     }
+
+    /// Integration with the real pipeline: a session id produced by
+    /// `derive_ownership` on the live-session fixture owns its MCP when the
+    /// MCP reappears detached, via persisted previous ownership + cwd.
+    #[test]
+    fn fixture_session_owns_its_detached_mcp() {
+        use crate::classify::{group, ownership::derive_ownership, test_fixtures};
+        let procs = test_fixtures::live_agent_session();
+        let items = group(&procs);
+        let out = derive_ownership(&items, &test_fixtures::identities(&procs), 5000);
+        let session = out.sessions[0].id;
+
+        let mut c = base(session);
+        c.anchor = Some(AnchorKind::PersistedPrevious);
+        c.anchor_score = Some(75);
+        c.exact_cwd = true;
+        c.start_delta_secs = Some(4);
+        let d = resolve(&rules(), vec![c]);
+        assert_eq!(d.verdict, Verdict::Owned);
+        assert_eq!(d.winner, Some(session));
+        let cand = &d.candidates[0];
+        assert_eq!(cand.total, 75 + 10 + 5);
+        assert!(
+            cand.evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::PersistedOwnership),
+            "evidence must record the persisted anchor"
+        );
+        assert!(
+            cand.evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::CwdMatch)
+        );
+    }
 }

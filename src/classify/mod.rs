@@ -5,6 +5,9 @@ mod project;
 mod rules;
 mod tree;
 
+#[cfg(test)]
+pub mod test_fixtures;
+
 pub use group::group;
 pub use leftovers::{leftover_count, leftover_ram, mark};
 pub use project::{ProjectCache, attach, pwd_from_cmd, short_path};

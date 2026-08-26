@@ -132,4 +132,20 @@ mod tests {
         let id = parse_boot_id("6fbe5d5ca1a24b3c9d4e5f6a7b8c9d0e").unwrap();
         assert_eq!(id, 0x6fbe5d5ca1a24b3c9d4e5f6a7b8c9d0e);
     }
+
+    /// NTP regression: `kern.boottime` is clock-derived (clock − uptime), so
+    /// an NTP clock adjustment used to read as a new boot — ending every
+    /// recorded session. The provider must use the stable per-boot
+    /// `kern.bootsessionuuid`; the clock-derived fallback is only a fallback.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_prefers_stable_bootsessionuuid_over_boottime() {
+        let epoch = SystemBoot
+            .current_boot_epoch()
+            .expect("boot epoch readable");
+        assert!(
+            matches!(epoch, BootEpoch::MacosUuid(_)),
+            "macOS must report the stable per-boot UUID, got clock-derived {epoch:?}"
+        );
+    }
 }
