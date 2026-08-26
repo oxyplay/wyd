@@ -6,6 +6,7 @@ mod model;
 mod output;
 mod platform;
 mod scanner;
+mod server;
 mod store;
 mod tui;
 
@@ -57,6 +58,8 @@ enum Subcmd {
     },
     /// Explain which session owns a process (from recorded provenance)
     Why { pid: u32 },
+    /// Serve the local read-only Unix-socket API
+    Serve,
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -117,6 +120,7 @@ fn main() -> io::Result<()> {
         Some(Subcmd::Upgrade) => run_upgrade(),
         Some(Subcmd::Prune { dry_run, yes }) => run_prune(dry_run, yes),
         Some(Subcmd::Why { pid }) => run_why(pid),
+        Some(Subcmd::Serve) => server::serve(),
         None => {
             if cli.json || cli.plain {
                 run_cli(cli)
