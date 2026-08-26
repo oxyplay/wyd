@@ -1,11 +1,14 @@
-use crate::classify::ownership::derive_ownership;
+use crate::classify::ownership::resolver::{AnchorKind, CandidateInput, ResolverRules, resolve};
+use crate::classify::ownership::{ResourceId, derive_ownership};
 use crate::classify::{ProjectCache, attach, group, mark};
 use crate::config::Config;
+use crate::model::Category;
 use crate::model::ProcessInfo;
 use crate::model::RuntimeSnapshot;
 use crate::model::boot::BootId;
 use crate::model::process::ProcessIdentity;
 use crate::model::runtime::RuntimeItem;
+use crate::model::session::RuntimeSessionId;
 use crate::platform::{BootIdentityProvider, SystemBoot};
 use crate::scanner::{ProcessScanner, ports, processes::SysinfoProcessScanner};
 use crate::store::RuntimeStore;
@@ -75,6 +78,11 @@ impl OwnershipTracker {
         let _ = store.apply_ownership(&result, now);
         let live_roots: HashSet<ProcessIdentity> = result.sessions.iter().map(|s| s.root).collect();
         let _ = store.end_absent_sessions(&live_roots, now);
+        // Resolve + persist a decision for resources with recorded provenance
+        // (exact ancestry may already be gone). Heuristic only for gaps.
+        for item in items {
+            attribution_for(item, &identities, store, &boot, now);
+        }
         // GC once per run, using the first scan's real live-process set.
         if self.gc_pending {
             let live: HashSet<ProcessIdentity> = identities.values().copied().collect();
@@ -95,6 +103,69 @@ impl OwnershipTracker {
             session_leftover_one(item, &identities, store, &boot);
         }
     }
+}
+
+/// Resolve and persist an attribution decision for a resource with recorded
+/// provenance (contract §7–8, §16). Persists only the first decision per
+/// resource — decisions are historical (§14), so re-running every scan would
+/// grow the table needlessly.
+fn attribution_for(
+    item: &RuntimeItem,
+    identities: &HashMap<u32, ProcessIdentity>,
+    store: &mut RuntimeStore,
+    boot: &BootId,
+    now: u64,
+) {
+    for child in &item.children {
+        attribution_for(child, identities, store, boot, now);
+    }
+    if item.category == Category::Agent {
+        return;
+    }
+    let Some(root) = item.root_pid.and_then(|p| identities.get(&p).copied()) else {
+        return; // no stable identity → live-only
+    };
+    let resource_id = ResourceId::of_root(&root).as_u64();
+    if store.latest_decision(resource_id).ok().flatten().is_some() {
+        return; // already decided
+    }
+
+    // Anchor (§7): recorded provenance for any process of this resource.
+    let mut pids: Vec<u32> = item.process_ids.clone();
+    if let Some(rp) = item.root_pid {
+        pids.push(rp);
+    }
+    let mut owner: Option<(RuntimeSessionId, u64)> = None; // (session, started_at)
+    for pid in pids {
+        if let Some(id) = identities.get(&pid)
+            && let Ok(Some(exp)) = store.explain_process(boot, id.pid, id.start_time)
+        {
+            owner = Some((exp.owner, exp.session.started_at));
+            break;
+        }
+    }
+    let Some((owner, session_start)) = owner else {
+        return; // no anchor → not a candidate (§7)
+    };
+
+    let predates = root.start_time < session_start;
+    let cand = CandidateInput {
+        session: owner,
+        anchor: Some(AnchorKind::PersistedPrevious),
+        anchor_score: Some(75),
+        propagate_cap: None,
+        exact_cwd: false,
+        same_git_root: false,
+        start_delta_secs: (!predates).then_some(root.start_time.saturating_sub(session_start)),
+        tool_relationship: matches!(
+            item.category,
+            Category::Mcp | Category::Browser | Category::LanguageServer
+        ),
+        predates_session: predates,
+        reaches_other_agent: false,
+    };
+    let decision = resolve(&ResolverRules::v1(), vec![cand]);
+    let _ = store.persist_decision(resource_id, &decision, now);
 }
 
 fn session_leftover_one(
@@ -149,6 +220,20 @@ fn session_leftover_one(
                 reasons: vec![reason],
             });
         }
+    }
+}
+
+/// Apply session-ended leftover marks to live items (shared by the TUI
+/// tracker layer and the CLI one-shot path).
+pub fn apply_session_leftovers(
+    items: &mut [RuntimeItem],
+    processes: &[ProcessInfo],
+    store: &RuntimeStore,
+    boot: &BootId,
+) {
+    let identities = identities(processes, boot);
+    for item in items {
+        session_leftover_one(item, &identities, store, boot);
     }
 }
 
@@ -284,5 +369,82 @@ mod tests {
         session_leftover_one(&mut mcp, &identities(&procs, &boot), &store, &boot);
         assert_eq!(mcp.state, RuntimeState::Persistent);
         assert!(mcp.suspicion.is_none());
+    }
+
+    #[test]
+    fn attribution_persists_a_decision_for_a_detached_resource() {
+        let boot = BootId::from_u128(7);
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(100, Some(1), "omp", &["omp"], 1000),
+            proc(
+                110,
+                Some(100),
+                "node",
+                &["node", "chrome-devtools-mcp"],
+                1004,
+            ),
+        ];
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let out = derive_ownership(&group(&procs), &identities(&procs, &boot), 1000);
+        store.apply_ownership(&out, 1000).unwrap();
+
+        // The MCP now appears detached (agent parent gone) but its provenance
+        // is recorded.
+        let item = mcp_item();
+        attribution_for(&item, &identities(&procs, &boot), &mut store, &boot, 2000);
+
+        let root = ProcessIdentity {
+            boot_id: boot,
+            pid: 110,
+            start_time: 1004,
+        };
+        let decision = store
+            .latest_decision(ResourceId::of_root(&root).as_u64())
+            .unwrap()
+            .expect("a decision must be persisted");
+        assert_eq!(decision.verdict, "Owned");
+        let owner = store.owning_session_for_process(&boot, 110, 1004).unwrap();
+        assert_eq!(
+            decision.winner_session, owner,
+            "resolver re-affirms the recorded owner"
+        );
+    }
+
+    #[test]
+    fn attribution_is_idempotent_per_resource() {
+        let boot = BootId::from_u128(7);
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(100, Some(1), "omp", &["omp"], 1000),
+            proc(
+                110,
+                Some(100),
+                "node",
+                &["node", "chrome-devtools-mcp"],
+                1004,
+            ),
+        ];
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let out = derive_ownership(&group(&procs), &identities(&procs, &boot), 1000);
+        store.apply_ownership(&out, 1000).unwrap();
+
+        let item = mcp_item();
+        let ids = identities(&procs, &boot);
+        attribution_for(&item, &ids, &mut store, &boot, 2000);
+        attribution_for(&item, &ids, &mut store, &boot, 3000); // second scan
+
+        let root = ProcessIdentity {
+            boot_id: boot,
+            pid: 110,
+            start_time: 1004,
+        };
+        let count = store
+            .decision_count(ResourceId::of_root(&root).as_u64())
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "a second identical scan must not add another decision"
+        );
     }
 }

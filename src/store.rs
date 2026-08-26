@@ -642,6 +642,19 @@ impl RuntimeStore {
         }))
     }
 
+    /// How many decisions have been persisted for a resource.
+    pub fn decision_count(&self, resource_id: u64) -> io::Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM attribution_decisions WHERE resource_id = ?1",
+                params![resource_id as i64],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        Ok(n as u64)
+    }
+
     /// The most recent resolver decision for a resource, if any.
     pub fn latest_decision(&self, resource_id: u64) -> io::Result<Option<DecisionRecord>> {
         let head: Option<(i64, i64, String, Option<i64>)> = self

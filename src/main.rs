@@ -347,7 +347,7 @@ fn run_cli(cli: Cli) -> io::Result<()> {
             "filter `project` needs a name: wyd --json project myapp",
         ));
     }
-    let snap = collect::snapshot();
+    let snap = session_aware_snapshot(collect::snapshot());
     let project = cli.name.as_deref();
     let text = if cli.json {
         output::render_json(&snap, filter, project)
@@ -356,6 +356,23 @@ fn run_cli(cli: Cli) -> io::Result<()> {
     };
     println!("{text}");
     Ok(())
+}
+
+/// Layer session-ended leftover marks onto a CLI snapshot (mirrors the TUI
+/// tracker). Falls back to the unmodified snapshot when the store is absent.
+fn session_aware_snapshot(mut snap: model::RuntimeSnapshot) -> model::RuntimeSnapshot {
+    let Ok(mut store) = store::RuntimeStore::open(&store::RuntimeStore::default_path()) else {
+        return snap;
+    };
+    let now = now();
+    let Ok(epoch) = platform::SystemBoot.current_boot_epoch() else {
+        return snap;
+    };
+    let Ok(boot) = store.boot_id_for_epoch(epoch, now) else {
+        return snap;
+    };
+    collect::apply_session_leftovers(&mut snap.logical_items, &snap.processes, &store, &boot);
+    snap
 }
 
 #[cfg(test)]
