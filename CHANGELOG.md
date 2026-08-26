@@ -6,7 +6,8 @@ All notable changes to wyd.
 - Runtime-ownership foundation: agent runtime sessions keyed by `boot_id + pid + start_time`, exact observed ownership over the process tree, durable SQLite provenance that survives process ancestry loss and Wyd restarts, and a deterministic ownership resolver (`wyd why` explains a process's origin session and attribution).
 - `wyd why <pid>`: reconstruct a process's origin session and attribution from recorded provenance.
 - `wyd --json sessions`: list recorded agent sessions.
-- Session-aware leftovers: a resource whose origin session ended (and that is not persistent) is flagged as a leftover in the TUI.
+- Session-aware leftovers: a resource whose origin session ended (and that is not persistent) is flagged as a leftover in both the TUI and CLI (`--json`/`--plain`).
+- The attribution resolver now runs live in the tracker: it persists a per-resource decision (re-affirming the recorded owner) so `wyd why` shows the attribution.
 - New **Workers** category for background watchers/queues: Celery, Sidekiq, Laravel `horizon`/`queue:work`, nodemon, cargo-watch, watchexec, air, and `tsc`/`tailwindcss --watch`. They score as leftovers by age, like dev servers.
 - Detection for agents: Amp, Crush, Goose, Qwen Code, Factory Droid, Kiro, Antigravity (`agy`), Pi.
 - Detection for databases: Elasticsearch, OpenSearch, ClickHouse, CockroachDB, Cassandra, Memcached, Neo4j, Qdrant, Weaviate, Milvus, Meilisearch, Typesense, InfluxDB, SQL Server.
@@ -17,6 +18,7 @@ All notable changes to wyd.
 - Databases are no longer unconditionally `persistent`. A database is persistent only when run as a service (Homebrew/Docker/Valet path, `persistent.commands`, or parented to launchd/systemd/init); an agent- or shell-spawned DB (`postgres -D /tmp/test-db`) is session-scoped and can become a leftover. State is now derived in `mark`, not at group time.
 
 ### Fixed
+- macOS boot identity now uses `kern.bootsessionuuid` (stable per boot) instead of the clock-derived `kern.boottime`, so an NTP clock adjustment no longer reads as a new boot and wipes session provenance.
 - Detached headless Chromium now surfaces as a leftover item instead of silently disappearing.
 - Docker snapshot is Arc-cloned (O(1)) instead of full clone every 2 s.
 - Leftover scoring uses HashMap lookup instead of linear scan for ancestor processes.

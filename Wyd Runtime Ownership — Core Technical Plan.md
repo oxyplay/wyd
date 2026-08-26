@@ -50,6 +50,9 @@ restore
 ↓ only when this works
 
 PHASE 2 CORE  ✅ ALL IMPLEMENTED
+   follow-ups: macOS boot via kern.bootsessionuuid (NTP-stable),
+   live attribution resolver in the tracker, session-aware
+   leftovers in both TUI and CLI
 resolver
 candidate sets
 scores
