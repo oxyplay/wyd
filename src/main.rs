@@ -92,6 +92,7 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
                 total_memory_bytes: total,
                 used_memory_bytes: used,
                 cpu_percent: scanner.cpu_percent(),
+                sessions: tracker.sessions(),
                 version,
             })
         })();

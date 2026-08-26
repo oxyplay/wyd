@@ -74,6 +74,17 @@ impl RuntimeSession {
     }
 }
 
+/// Lightweight, snapshot-friendly view of a session for display.
+/// `active` = not yet ended.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: RuntimeSessionId,
+    pub agent: String,
+    pub project: Option<String>,
+    pub active: bool,
+    pub started_at: u64,
+}
+
 /// FNV-1a 64-bit, stable across builds and runs. Shared by session and
 /// resource id derivation.
 pub(crate) fn fnv1a(parts: &[&[u8]]) -> u64 {

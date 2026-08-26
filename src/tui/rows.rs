@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::classify::{leftover_count, leftover_ram};
+use crate::model::session::SessionInfo;
 use crate::model::{
     Category, DockerResource, ListeningPort, RuntimeItem, RuntimeSnapshot, RuntimeState,
 };
@@ -19,6 +20,7 @@ pub enum Section {
     Ports,
     Projects,
     Docker,
+    Sessions,
 }
 
 impl Section {
@@ -30,6 +32,7 @@ impl Section {
             Self::Ports => "Ports",
             Self::Projects => "Projects",
             Self::Docker => "Docker",
+            Self::Sessions => "Sessions",
         }
     }
 }
@@ -63,6 +66,7 @@ pub enum Row<'a> {
         ram: u64,
         kids: usize,
     },
+    Session(&'a SessionInfo),
 }
 
 pub fn hay_hit(hay: &str, q: &str) -> bool {
@@ -100,7 +104,7 @@ fn section_match(item: &RuntimeItem, section: Section) -> bool {
         Section::All => true,
         Section::Category(c) => item.category == c,
         Section::Leftovers => item.state == RuntimeState::Suspicious,
-        Section::Ports | Section::Projects | Section::Docker => false,
+        Section::Ports | Section::Projects | Section::Docker | Section::Sessions => false,
     }
 }
 
@@ -186,6 +190,12 @@ pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
                 fmt_bytes(snap.docker.reclaimable_bytes)
             )
         },
+    });
+    lines.push(OverviewLine {
+        section: Section::Sessions,
+        label: "Sessions",
+        count: snap.sessions.len() as u32,
+        extra: String::new(),
     });
     lines
 }
@@ -292,9 +302,18 @@ pub fn rows<'a>(
                 });
             }
         }
+        Section::Sessions => collect_sessions(&snap.sessions, q, &mut out),
         other => collect_items(&snap.logical_items, 0, false, other, project, q, &mut out),
     }
     out
+}
+
+fn collect_sessions<'a>(sessions: &'a [SessionInfo], q: &str, out: &mut Vec<Row<'a>>) {
+    for s in sessions {
+        if hay_hit(&format!("{} {}", s.agent, s.id), q) {
+            out.push(Row::Session(s));
+        }
+    }
 }
 
 fn collect_items<'a>(

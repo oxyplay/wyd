@@ -8,7 +8,7 @@ use crate::model::RuntimeSnapshot;
 use crate::model::boot::BootId;
 use crate::model::process::ProcessIdentity;
 use crate::model::runtime::RuntimeItem;
-use crate::model::session::RuntimeSessionId;
+use crate::model::session::{RuntimeSessionId, SessionInfo};
 use crate::platform::{BootIdentityProvider, SystemBoot};
 use crate::scanner::{ProcessScanner, ports, processes::SysinfoProcessScanner};
 use crate::store::RuntimeStore;
@@ -35,6 +35,8 @@ pub fn snapshot() -> RuntimeSnapshot {
         total_memory_bytes: total,
         used_memory_bytes: used,
         cpu_percent: scanner.cpu_percent(),
+        // The one-shot CLI path has no store-backed sessions.
+        sessions: Vec::new(),
         version: 1,
     }
 }
@@ -88,6 +90,26 @@ impl OwnershipTracker {
             let live: HashSet<ProcessIdentity> = identities.values().copied().collect();
             let _ = store.gc(RETENTION_SECS, now, &live);
             self.gc_pending = false;
+        }
+    }
+
+    /// Snapshot-friendly view of known sessions, for the TUI.
+    pub fn sessions(&self) -> Vec<SessionInfo> {
+        let Some(store) = self.store.as_ref() else {
+            return Vec::new();
+        };
+        match store.sessions() {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|s| SessionInfo {
+                    id: s.id,
+                    agent: s.agent,
+                    project: s.project,
+                    active: s.ended_at.is_none(),
+                    started_at: s.started_at,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
         }
     }
 

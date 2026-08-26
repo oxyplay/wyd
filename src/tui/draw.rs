@@ -327,7 +327,7 @@ fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
                 Some(Row::DockerAgg { .. }) => {
                     parts.insert(0, format!("{} prune", keys.prune));
                 }
-                Some(Row::Port { .. }) | Some(Row::Project { .. }) => {}
+                Some(Row::Port { .. }) | Some(Row::Project { .. }) | Some(Row::Session(_)) => {}
                 None => {}
             }
             if app.section == Section::Docker && snap.docker.prunable_stats().0 > 0 {
@@ -455,6 +455,25 @@ fn runtime_lines(
                         "",
                         "",
                         "",
+                    )
+                }
+                Row::Session(s) => {
+                    let project = s
+                        .project
+                        .as_deref()
+                        .map(std::path::Path::new)
+                        .map(short_path)
+                        .unwrap_or_else(|| "—".into());
+                    let state = if s.active { "active" } else { "ended" };
+                    let left = pad_name(&s.agent, "", nw);
+                    cols(
+                        &left,
+                        "session",
+                        &project,
+                        "",
+                        state,
+                        &fmt_age(s.started_at),
+                        &s.id.to_string(),
                     )
                 }
             };
@@ -723,6 +742,37 @@ pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Lin
                 Line::from(""),
                 fact_row("items", &kids.to_string(), nw),
             ]
+        }
+        Some(Row::Session(s)) => {
+            let nw = name_width(width);
+            let project = s
+                .project
+                .as_deref()
+                .map(std::path::Path::new)
+                .map(short_path)
+                .unwrap_or_else(|| "—".into());
+            let mut lines = vec![
+                cols(
+                    &pad_name(&s.agent, "", nw),
+                    "session",
+                    &project,
+                    "",
+                    if s.active { "active" } else { "ended" },
+                    &fmt_age(s.started_at),
+                    &s.id.to_string(),
+                ),
+                Line::from(""),
+            ];
+            lines.push(fact_row("started", &fmt_age(s.started_at), nw));
+            lines.push(fact_row(
+                "state",
+                if s.active { "active" } else { "ended" },
+                nw,
+            ));
+            if let Some(p) = &s.project {
+                lines.push(fact_row("project", p, nw));
+            }
+            lines
         }
         None => vec![Line::from(" no item")],
     }

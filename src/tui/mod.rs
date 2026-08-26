@@ -696,6 +696,7 @@ mod tests {
             total_memory_bytes: 32 << 30,
             used_memory_bytes: 7 << 30,
             cpu_percent: 12.0,
+            sessions: vec![],
             version: 1,
         }
     }
@@ -767,6 +768,27 @@ mod tests {
             .unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("scanning…"), "{rendered}");
+    }
+
+    #[test]
+    fn sessions_section_renders_agent_and_state() {
+        use crate::model::session::{RuntimeSessionId, SessionInfo};
+        let mut snap = fixture_snapshot();
+        snap.sessions = vec![SessionInfo {
+            id: RuntimeSessionId::from_u64(1),
+            agent: "omp".into(),
+            project: Some("/src/queryknight".into()),
+            active: true,
+            started_at: 1000,
+        }];
+        let mut app = App::new();
+        app.section = rows::Section::Sessions;
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("omp"), "{rendered}");
+        assert!(rendered.contains("Sessions"), "{rendered}");
     }
 
     #[test]

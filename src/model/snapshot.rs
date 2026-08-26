@@ -1,3 +1,4 @@
+use crate::model::session::SessionInfo;
 use crate::model::{DockerSnapshot, ProcessInfo, RuntimeItem};
 use std::sync::Arc;
 
@@ -11,6 +12,8 @@ pub struct RuntimeSnapshot {
     pub used_memory_bytes: u64,
     /// Aggregate CPU usage across all cores, percent.
     pub cpu_percent: f32,
+    /// Known agent runtime sessions (from the store).
+    pub sessions: Vec<SessionInfo>,
     /// Bumped on every scan so the TUI can skip redundant redraws.
     pub version: u64,
 }
