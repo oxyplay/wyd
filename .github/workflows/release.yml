@@ -42,3 +42,94 @@ jobs:
           include: LICENSE,README.md
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  publish-crate:
+    name: Publish to crates.io
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `cargo publish` pushes the version in Cargo.toml, which must match the
+      # tag (vX.Y.Z). The crate is not on crates.io yet — the first tagged
+      # release populates it and every later tag is a no-op-safe republish.
+      - run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+  bump-homebrew:
+    name: Bump oxyplay/homebrew-tap
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: oxyplay/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Update Formula/wyd.rb
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - "$TAG" <<'PY'
+          import hashlib, re, sys, urllib.request
+
+          tag = sys.argv[1]          # e.g. v0.6.0
+          ver = tag[1:]
+          targets = [
+              "aarch64-apple-darwin",
+              "x86_64-apple-darwin",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-unknown-linux-gnu",
+          ]
+          path = "tap/Formula/wyd.rb"
+          s = open(path).read()
+
+          def sha256_of(url: str) -> str:
+              data = urllib.request.urlopen(url, timeout=120).read()
+              return hashlib.sha256(data).hexdigest()
+
+          for t in targets:
+              url = f"https://github.com/oxyplay/wyd/releases/download/{tag}/wyd-{t}.tar.gz"
+              h = sha256_of(url)
+              pat = re.compile(
+                  r'url "https://github\.com/oxyplay/wyd/releases/download/[^"/]+'
+                  + re.escape(f'/wyd-{t}.tar.gz"')
+              )
+              s, n = pat.subn(
+                  lambda _: f'url "https://github.com/oxyplay/wyd/releases/download/{tag}/wyd-{t}.tar.gz"',
+                  s,
+                  count=1,
+              )
+              assert n == 1, f"url not found for {t}"
+              sha_pat = re.compile(
+                  re.escape(f'url "https://github.com/oxyplay/wyd/releases/download/{tag}/wyd-{t}.tar.gz"\n')
+                  + r'\s*sha256 "[0-9a-f]{64}"'
+              )
+              s, n = sha_pat.subn(
+                  lambda _: f'url "https://github.com/oxyplay/wyd/releases/download/{tag}/wyd-{t}.tar.gz"\n      sha256 "{h}"',
+                  s,
+                  count=1,
+              )
+              assert n == 1, f"sha256 not found for {t}"
+
+          s, n = re.subn(r'version "[^"]*"', f'version "{ver}"', s, count=1)
+          assert n == 1
+          s, n = re.subn(r'homepage "[^"]*"', 'homepage "https://wyd.sh"', s, count=1)
+          assert n == 1
+
+          open(path, "w").write(s)
+          PY
+      - name: Commit and push
+        env:
+          VER: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/wyd.rb
+          if git diff --cached --quiet; then
+            echo "Formula already current; nothing to push"
+          else
+            git commit -m "wyd ${VER}"
+            git push
+          fi
