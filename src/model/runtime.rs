@@ -8,8 +8,9 @@ pub enum Category {
     DevServer,
     LanguageServer,
     Database,
-    DevService,
+    Worker,
     UnknownDev,
+    DevService,
 }
 
 impl Category {
@@ -22,6 +23,7 @@ impl Category {
             Self::LanguageServer => "Language servers",
             Self::Database => "Databases",
             Self::DevService => "Dev services",
+            Self::Worker => "Workers",
             Self::UnknownDev => "Other",
         }
     }

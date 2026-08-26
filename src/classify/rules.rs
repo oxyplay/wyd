@@ -73,6 +73,14 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         ("aider", "aider"),
         ("cursor-agent", "cursor"),
         ("gemini", "gemini"),
+        ("amp", "amp"),
+        ("crush", "crush"),
+        ("goose", "goose"),
+        ("qwen", "qwen"),
+        ("droid", "droid"),
+        ("kiro-cli", "kiro"),
+        ("agy", "antigravity"),
+        ("pi", "pi"),
     ] {
         if name_eq(&name, &argv0, exact) {
             return Some(Class {
@@ -94,6 +102,20 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
             ("clangd", "clangd"),
             ("lua-language-server", "lua"),
             ("intelephense", "intelephense"),
+            ("vue-language-server", "vue"),
+            ("@vue/language-server", "vue"),
+            ("svelteserver", "svelte"),
+            ("svelte-language-server", "svelte"),
+            ("tailwindcss-language-server", "tailwind"),
+            ("vscode-eslint-language-server", "eslint"),
+            ("eslint_d", "eslint"),
+            ("yaml-language-server", "yaml"),
+            ("bash-language-server", "bash"),
+            ("docker-langserver", "docker"),
+            ("jdtls", "jdtls"),
+            ("ruby-lsp", "ruby"),
+            ("solargraph", "ruby"),
+            ("nixd", "nix"),
         ] {
             if name_eq(&name, &argv0, needle) || hay.contains(needle) {
                 return Some(Class {
@@ -101,6 +123,20 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
                     display_name: display.into(),
                 });
             }
+        }
+        // Substring-risky short names: exact argv0 only, or an explicit
+        // subcommand, so `biome check`/`biome format` are not LSPs.
+        if hay.contains("biome lsp-proxy") {
+            return Some(Class {
+                category: Category::LanguageServer,
+                display_name: "biome".into(),
+            });
+        }
+        if name_eq(&name, &argv0, "nil") {
+            return Some(Class {
+                category: Category::LanguageServer,
+                display_name: "nil".into(),
+            });
         }
         if hay.contains("language-server") || hay.contains("langserver") {
             return Some(Class {
@@ -141,6 +177,78 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
     if hay.contains("webpack-dev-server") || hay.contains("webpack serve") {
         return Some(dev(Category::DevServer, "webpack"));
     }
+    if name_eq(&name, &argv0, "astro") || hay.contains("astro dev") || hay.contains("@astrojs") {
+        return Some(dev(Category::DevServer, "astro"));
+    }
+    if hay.contains("svelte-kit") || hay.contains("@sveltejs/kit") {
+        return Some(dev(Category::DevServer, "svelte-kit"));
+    }
+    if name_eq(&name, &argv0, "remix") || hay.contains("@remix-run") || hay.contains("react-router")
+    {
+        return Some(dev(Category::DevServer, "remix"));
+    }
+    if name_eq(&name, &argv0, "parcel") || hay.contains("parcel-bundler") {
+        return Some(dev(Category::DevServer, "parcel"));
+    }
+    if hay.contains("rsbuild") {
+        return Some(dev(Category::DevServer, "rsbuild"));
+    }
+    if hay.contains("rspack") {
+        return Some(dev(Category::DevServer, "rspack"));
+    }
+    if name_eq(&name, &argv0, "nest")
+        || hay.contains("@nestjs")
+        || hay.contains("nest start")
+        || hay.contains("nest serve")
+    {
+        return Some(dev(Category::DevServer, "nest"));
+    }
+    if hay.contains("puma") {
+        return Some(dev(Category::DevServer, "puma"));
+    }
+    if name_eq(&name, &argv0, "rails") || hay.contains("rails s") {
+        return Some(dev(Category::DevServer, "rails"));
+    }
+    if hay.contains("phx.server") || hay.contains("phoenix") {
+        return Some(dev(Category::DevServer, "phoenix"));
+    }
+
+    // Background workers / watchers — agents start and forget these.
+    if !pkg_manager {
+        if name_eq(&name, &argv0, "celery") || hay.contains("celery") && hay.contains("worker") {
+            return Some(dev(Category::Worker, "celery"));
+        }
+        if name_eq(&name, &argv0, "sidekiq") || hay.contains("sidekiq") {
+            return Some(dev(Category::Worker, "sidekiq"));
+        }
+        if name_eq(&name, &argv0, "horizon") || hay.contains("artisan horizon") {
+            return Some(dev(Category::Worker, "horizon"));
+        }
+        if hay.contains("queue:work") || hay.contains("artisan queue") {
+            return Some(dev(Category::Worker, "laravel queue"));
+        }
+        if name_eq(&name, &argv0, "nodemon") || hay.contains("nodemon") {
+            return Some(dev(Category::Worker, "nodemon"));
+        }
+        if name_eq(&name, &argv0, "cargo-watch")
+            || hay.contains("cargo watch")
+            || hay.contains("cargo-watch")
+        {
+            return Some(dev(Category::Worker, "cargo-watch"));
+        }
+        if name_eq(&name, &argv0, "watchexec") {
+            return Some(dev(Category::Worker, "watchexec"));
+        }
+        if name_eq(&name, &argv0, "air") {
+            return Some(dev(Category::Worker, "air"));
+        }
+        if hay.contains("tsc --watch")
+            || hay.contains("tailwindcss --watch")
+            || hay.contains("tailwind --watch")
+        {
+            return Some(dev(Category::Worker, "watcher"));
+        }
+    }
 
     // Databases.
     for (needle, display) in [
@@ -151,6 +259,20 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         ("mariadbd", "mariadb"),
         ("redis-server", "redis"),
         ("mongod", "mongodb"),
+        ("elasticsearch", "elasticsearch"),
+        ("opensearch", "opensearch"),
+        ("clickhouse-server", "clickhouse"),
+        ("cockroach", "cockroachdb"),
+        ("cassandra", "cassandra"),
+        ("memcached", "memcached"),
+        ("neo4j", "neo4j"),
+        ("qdrant", "qdrant"),
+        ("weaviate", "weaviate"),
+        ("milvus", "milvus"),
+        ("meilisearch", "meilisearch"),
+        ("typesense-server", "typesense"),
+        ("influxd", "influxdb"),
+        ("sqlservr", "sql server"),
     ] {
         if name_eq(&name, &argv0, needle) || hay.contains(needle) {
             return Some(Class {
@@ -428,5 +550,163 @@ mod tests {
             cat(proc("chrome", &["chrome", "--headless"])),
             Some((Category::Browser, "Chromium".into()))
         );
+    }
+
+    #[test]
+    fn new_agents() {
+        for (bin, display) in [
+            ("amp", "amp"),
+            ("crush", "crush"),
+            ("goose", "goose"),
+            ("qwen", "qwen"),
+            ("droid", "droid"),
+            ("kiro-cli", "kiro"),
+            ("agy", "antigravity"),
+            ("pi", "pi"),
+        ] {
+            assert_eq!(
+                cat(proc(bin, &[bin])),
+                Some((Category::Agent, display.into())),
+                "{bin} should be an agent"
+            );
+        }
+        // Not a substring match: `gemini` must not match `gemini-code`.
+        assert_ne!(
+            cat(proc("qwen-code", &["qwen-code"])).map(|(c, _)| c),
+            Some(Category::Agent)
+        );
+    }
+
+    #[test]
+    fn vector_and_search_databases() {
+        for bin in [
+            "qdrant",
+            "weaviate",
+            "milvus",
+            "elasticsearch",
+            "opensearch",
+            "clickhouse-server",
+            "cockroach",
+            "cassandra",
+            "memcached",
+            "neo4j",
+            "meilisearch",
+            "typesense-server",
+            "influxd",
+            "sqlservr",
+        ] {
+            assert_eq!(
+                cat(proc(bin, &[bin])).map(|(c, _)| c),
+                Some(Category::Database),
+                "{bin} should be a database"
+            );
+        }
+    }
+
+    #[test]
+    fn new_language_servers() {
+        for bin in [
+            "vue-language-server",
+            "svelteserver",
+            "tailwindcss-language-server",
+            "vscode-eslint-language-server",
+            "yaml-language-server",
+            "bash-language-server",
+            "docker-langserver",
+            "jdtls",
+            "ruby-lsp",
+            "solargraph",
+            "nixd",
+        ] {
+            assert_eq!(
+                cat(proc(bin, &[bin])).map(|(c, _)| c),
+                Some(Category::LanguageServer),
+                "{bin} should be a language server"
+            );
+        }
+        // biome is only an LSP for its lsp-proxy subcommand, not `check`.
+        assert_eq!(
+            cat(proc("biome", &["biome", "lsp-proxy"])).map(|(c, _)| c),
+            Some(Category::LanguageServer)
+        );
+        assert_ne!(
+            cat(proc("biome", &["biome", "check"])).map(|(c, _)| c),
+            Some(Category::LanguageServer)
+        );
+        // `nil` is exact-only (substring is too risky).
+        assert_eq!(
+            cat(proc("nil", &["nil"])).map(|(c, _)| c),
+            Some(Category::LanguageServer)
+        );
+        assert_ne!(
+            cat(proc("terminal", &["terminal"])).map(|(c, _)| c),
+            Some(Category::LanguageServer)
+        );
+    }
+
+    #[test]
+    fn background_workers() {
+        for (name, cmd, _display) in [
+            ("celery", &["celery", "-A", "proj", "worker"][..], "celery"),
+            ("sidekiq", &["ruby", "bin/sidekiq"][..], "sidekiq"),
+            (
+                "node",
+                &["node", "node_modules/nodemon/bin/nodemon.js"][..],
+                "nodemon",
+            ),
+            (
+                "cargo-watch",
+                &["cargo-watch", "-x", "run"][..],
+                "cargo-watch",
+            ),
+            ("watchexec", &["watchexec", "make"][..], "watchexec"),
+            ("air", &["air"][..], "air"),
+            (
+                "node",
+                &["node", "node_modules/typescript/bin/tsc", "--watch"][..],
+                "watcher",
+            ),
+        ] {
+            assert_eq!(
+                cat(proc(name, cmd)).map(|(c, _)| c),
+                Some(Category::Worker),
+                "{cmd:?} should be a worker"
+            );
+        }
+    }
+
+    #[test]
+    fn new_dev_servers() {
+        for (name, cmd, _display) in [
+            (
+                "node",
+                &["node", "node_modules/.bin/astro", "dev"][..],
+                "astro",
+            ),
+            (
+                "node",
+                &["node", "node_modules/@sveltejs/kit/bin/kit.js"][..],
+                "svelte-kit",
+            ),
+            (
+                "node",
+                &["node", "node_modules/@remix-run/dev/dist/cli.js"][..],
+                "remix",
+            ),
+            (
+                "node",
+                &["node", "node_modules/.bin/nest", "start"][..],
+                "nest",
+            ),
+            ("puma", &["puma"][..], "puma"),
+            ("rails", &["rails", "server"][..], "rails"),
+            ("beam.smp", &["beam.smp", "phx.server"][..], "phoenix"),
+        ] {
+            assert_eq!(
+                cat(proc(name, cmd)).map(|(c, _)| c),
+                Some(Category::DevServer),
+                "{cmd:?} should be a dev server"
+            );
+        }
     }
 }

@@ -121,8 +121,7 @@ impl SignatureConfig {
             "agent" => Some(Category::Agent),
             "mcp" => Some(Category::Mcp),
             "devserver" | "dev-server" => Some(Category::DevServer),
-            "database" => Some(Category::Database),
-            "languageserver" | "lsp" => Some(Category::LanguageServer),
+            "worker" => Some(Category::Worker),
             _ => None,
         }
     }

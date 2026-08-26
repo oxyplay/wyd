@@ -130,12 +130,13 @@ pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
         count: count_items(&snap.logical_items) as u32,
         extra: String::new(),
     }];
-    const ALWAYS: [Category; 5] = [
+    const ALWAYS: [Category; 6] = [
         Category::Agent,
         Category::Mcp,
         Category::Browser,
         Category::DevServer,
         Category::Database,
+        Category::Worker,
     ];
     for c in ALWAYS {
         lines.push(cat_line(c, &counts, &ram, true));

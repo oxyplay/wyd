@@ -131,6 +131,7 @@ fn title_tag(section: Section) -> Option<&'static str> {
         Section::Category(crate::model::Category::DevServer) => Some("srv"),
         Section::Category(crate::model::Category::Database) => Some("db"),
         Section::Category(crate::model::Category::LanguageServer) => Some("lsp"),
+        Section::Category(crate::model::Category::Worker) => Some("wk"),
         Section::Docker => Some("docker"),
         Section::Leftovers => Some("left"),
         _ => None,
@@ -528,6 +529,7 @@ fn role(item: &RuntimeItem) -> String {
             .map(|p| format!("db :{p}"))
             .unwrap_or_else(|| "db".into()),
         crate::model::Category::LanguageServer => "lsp".into(),
+        crate::model::Category::Worker => "worker".into(),
         crate::model::Category::DevService => "svc".into(),
         crate::model::Category::UnknownDev => "dev".into(),
     }

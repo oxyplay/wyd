@@ -40,18 +40,15 @@ fn mark_one(
     let mut reasons = Vec::new();
     let mut score: u16 = 0;
 
-    // `unowned`: no classified Agent/MCP owner. `interactive`: a live
-    // terminal ancestor. A process the user launched by hand from a shell
-    // is unowned but interactive — intentional, not leftover. Only unowned
-    // AND non-interactive processes (truly abandoned) score as leftovers.
     let unowned = parent.is_none()
         && matches!(
             item.category,
             Category::Mcp
                 | Category::Browser
                 | Category::DevServer
-                | Category::UnknownDev
                 | Category::LanguageServer
+                | Category::Database
+                | Category::Worker
         );
     let interactive = root_proc(item, by_pid).is_some_and(|p| has_tty_ancestor(p, by_pid));
 
@@ -59,7 +56,7 @@ fn mark_one(
         let reparented_os = root_proc(item, by_pid).is_some_and(|p| reparented(p, present));
         if matches!(
             item.category,
-            Category::Mcp | Category::Browser | Category::LanguageServer
+            Category::Mcp | Category::Browser | Category::LanguageServer | Category::Database
         ) {
             reasons.push(SuspicionReason::OwningAgentMissing);
             score += 50;
@@ -80,8 +77,9 @@ fn mark_one(
         // `interactive` is false.
     }
 
-    // A dev server is leftover by age regardless of being interactive.
-    if item.category == Category::DevServer
+    // A dev server or background worker is leftover by age regardless of
+    // being interactive.
+    if matches!(item.category, Category::DevServer | Category::Worker)
         && let Some(p) = root_proc(item, by_pid)
     {
         let age_h = now.saturating_sub(p.start_time) / 3600;
@@ -99,7 +97,7 @@ fn mark_one(
 }
 
 fn exempt(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>, cfg: &Config) -> bool {
-    if matches!(item.category, Category::Database | Category::DevService) {
+    if item.category == Category::DevService {
         return true;
     }
     let Some(p) = root_proc(item, by_pid) else {
@@ -114,6 +112,13 @@ fn exempt(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>, cfg: &Config)
             || hay.contains("com.docker")
             || hay.contains("docker desktop"))
     {
+        return true;
+    }
+    // A database is persistent only when launched as a real service, not
+    // when an agent or a shell spawned it (`postgres -D /tmp/test-db`,
+    // `redis-server ./temp.conf`). A service manager (launchd/systemd/init)
+    // is pid 1.
+    if item.category == Category::Database && p.parent_pid == Some(1) {
         return true;
     }
     cfg.persistent
@@ -349,5 +354,33 @@ mod tests {
             RuntimeState::Active,
             "shell-launched MCP must not be a leftover"
         );
+    }
+    #[test]
+    fn agent_spawned_db_is_session_not_persistent() {
+        // An agent's ad-hoc `postgres -D /tmp/test-db` is a session DB, not
+        // a persistent service — it must not be exempted.
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(10, Some(1), "omp", &["omp"], 100),
+            proc(
+                11,
+                Some(10),
+                "postgres",
+                &["postgres", "-D", "/tmp/test-db"],
+                100,
+            ),
+        ];
+        let mut items = group(&procs);
+        mark(&mut items, &procs, &Config::default());
+        assert_eq!(items[0].category, Category::Agent);
+        assert_eq!(items[0].state, RuntimeState::Active);
+        let db = &items[0].children[0];
+        assert_eq!(db.category, Category::Database);
+        assert_eq!(
+            db.state,
+            RuntimeState::Active,
+            "agent-spawned DB must be session-scoped, not persistent"
+        );
+        assert!(db.suspicion.is_none());
     }
 }

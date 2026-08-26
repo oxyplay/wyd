@@ -2,7 +2,15 @@
 
 All notable changes to wyd.
 
-## [Unreleased]
+### Added
+- New **Workers** category for background watchers/queues: Celery, Sidekiq, Laravel `horizon`/`queue:work`, nodemon, cargo-watch, watchexec, air, and `tsc`/`tailwindcss --watch`. They score as leftovers by age, like dev servers.
+- Detection for agents: Amp, Crush, Goose, Qwen Code, Factory Droid, Kiro, Antigravity (`agy`), Pi.
+- Detection for databases: Elasticsearch, OpenSearch, ClickHouse, CockroachDB, Cassandra, Memcached, Neo4j, Qdrant, Weaviate, Milvus, Meilisearch, Typesense, InfluxDB, SQL Server.
+- Detection for language servers: Vue, Svelte, Tailwind, ESLint, YAML, Bash, Docker, jdtls, Ruby (`ruby-lsp`/`solargraph`), nixd, nil, Biome (`lsp-proxy` only).
+- Semantic dev-server labels: Astro, SvelteKit, Remix/React Router, Parcel, Rsbuild/Rspack, Nest, Puma, Rails, Phoenix.
+
+### Changed
+- Databases are no longer unconditionally `persistent`. A database is persistent only when run as a service (Homebrew/Docker/Valet path, `persistent.commands`, or parented to launchd/systemd/init); an agent- or shell-spawned DB (`postgres -D /tmp/test-db`) is session-scoped and can become a leftover. State is now derived in `mark`, not at group time.
 
 ### Fixed
 - Detached headless Chromium now surfaces as a leftover item instead of silently disappearing.

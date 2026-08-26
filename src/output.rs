@@ -204,9 +204,10 @@ fn type_name(item: &RuntimeItem) -> String {
         Category::Mcp => "mcp",
         Category::Browser => "browser",
         Category::DevServer => "dev-server",
-        Category::LanguageServer => "language-server",
         Category::Database => "database",
+        Category::LanguageServer => "language-server",
         Category::DevService => "dev-service",
+        Category::Worker => "worker",
         Category::UnknownDev => "other",
     }
     .into()

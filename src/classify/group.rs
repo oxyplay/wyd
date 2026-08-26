@@ -137,11 +137,8 @@ fn build_item(
         process_ids: vec![pid],
         memory_bytes: p.memory_bytes,
         cpu_percent: p.cpu_percent,
-        state: if c.category == Category::Database {
-            RuntimeState::Persistent
-        } else {
-            RuntimeState::Active
-        },
+        // State is derived in `mark` (leftover scoring), not at group time.
+        state: RuntimeState::Active,
         suspicion: None,
         ports: Vec::new(),
         project: None,
@@ -368,7 +365,11 @@ mod tests {
         assert_eq!(titles(&items), ["vite", "postgres"]);
         assert_eq!(items[0].category, Category::DevServer);
         assert_eq!(items[1].category, Category::Database);
-        assert_eq!(items[1].state, RuntimeState::Persistent);
+        assert_eq!(
+            items[1].state,
+            RuntimeState::Active,
+            "state is derived by `mark`, not at group time"
+        );
     }
 
     #[test]
