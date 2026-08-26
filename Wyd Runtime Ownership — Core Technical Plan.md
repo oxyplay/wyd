@@ -49,7 +49,7 @@ restore
 
 ↓ only when this works
 
-PHASE 2 CORE
+PHASE 2 CORE  ✅ ALL IMPLEMENTED
 resolver
 candidate sets
 scores
