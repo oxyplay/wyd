@@ -99,13 +99,19 @@ pub fn assemble(
     // Running containers on top; stable — keeps kind grouping for the rest.
     resources.sort_by_key(|r| !r.running());
 
-    let disk_bytes = resources.iter().map(|r| r.size_bytes).sum();
+    // Full Docker footprint from the engine when available: layers of all
+    // images (incl. tagged ones not listed individually) + volumes + build
+    // cache. Falls back to the tracked-resource sum when `df` was missing.
+    let disk_bytes = usage
+        .and_then(|u| u.image_usage.as_ref().and_then(|i| i.total_size))
+        .map(|l| l.max(0) as u64)
+        .unwrap_or_else(|| resources.iter().map(|r| r.size_bytes).sum());
     let reclaimable_bytes = resources
         .iter()
         .filter(|r| {
             matches!(r.kind, DockerKind::DanglingImage | DockerKind::BuildCache)
                 || (r.kind == DockerKind::Container && r.detail == "stopped")
-                || (r.kind == DockerKind::Volume && r.detail == "unused")
+                || r.prunable()
         })
         .map(|r| r.size_bytes)
         .sum();

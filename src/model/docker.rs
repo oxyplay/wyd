@@ -81,6 +81,15 @@ impl DockerSnapshot {
 
 impl DockerSnapshot {
     /// (count, bytes) of anonymous unused volumes — what `P` offers to prune.
+    /// Ids of anonymous unused volumes — what `P` / `wyd prune` delete.
+    pub fn prunable_ids(&self) -> Vec<String> {
+        self.resources
+            .iter()
+            .filter(|r| r.prunable())
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
     pub fn prunable_stats(&self) -> (usize, u64) {
         let prunable: Vec<&DockerResource> =
             self.resources.iter().filter(|r| r.prunable()).collect();

@@ -180,8 +180,9 @@ pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
             String::new()
         } else {
             format!(
-                "~{}",
-                fmt_bytes(leftover_ram(&snap.logical_items) + snap.docker.reclaimable_bytes)
+                "{} RAM · {} disk",
+                fmt_bytes(leftover_ram(&snap.logical_items)),
+                fmt_bytes(snap.docker.reclaimable_bytes)
             )
         },
     });

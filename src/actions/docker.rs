@@ -24,23 +24,29 @@ pub fn stop_blocking(res: &DockerResource) -> Result<(), String> {
     })
 }
 
-/// Returns (deleted count, bytes reclaimed).
-pub fn prune_anonymous_volumes_blocking() -> Result<(u32, u64), String> {
+/// Delete exactly the anonymous volumes the UI showed the user, by id.
+/// This is safer than an engine-wide prune: what wyd listed is what gets
+/// removed — no blanket engine call that could differ from the preview.
+pub fn prune_anonymous_volumes_blocking(ids: &[String]) -> Result<(u32, u64), String> {
     runtime()?.block_on(async {
         let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| e.to_string())?;
-        let mut filters = std::collections::HashMap::new();
-        filters.insert("all", vec!["false"]);
-        let opts = bollard::query_parameters::PruneVolumesOptionsBuilder::default()
-            .filters(&filters)
-            .build();
-        let res = docker
-            .prune_volumes(Some(opts))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok((
-            res.volumes_deleted.as_ref().map(|v| v.len()).unwrap_or(0) as u32,
-            res.space_reclaimed.unwrap_or(0).max(0) as u64,
-        ))
+        let mut deleted = 0u32;
+        let mut bytes = 0u64;
+        for id in ids {
+            // remove_volume on an attached volume fails harmlessly (busy).
+            if docker
+                .remove_volume(
+                    id,
+                    Some(bollard::query_parameters::RemoveVolumeOptionsBuilder::default().build()),
+                )
+                .await
+                .is_ok()
+            {
+                deleted += 1;
+                bytes += 0; // size not known per-id here; caller reports count
+            }
+        }
+        Ok((deleted, bytes))
     })
 }
 

@@ -37,7 +37,6 @@ pub enum RuntimeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuspicionReason {
     ParentExited,
-    NoTerminalAncestor,
     OwningAgentMissing,
     McpOwnerMissing,
     HeadlessBrowserDetached,
@@ -48,7 +47,6 @@ impl SuspicionReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ParentExited => "parent exited / re-parented",
-            Self::NoTerminalAncestor => "no terminal ancestor",
             Self::OwningAgentMissing => "owning agent missing",
             Self::McpOwnerMissing => "MCP without owner",
             Self::HeadlessBrowserDetached => "detached headless browser",

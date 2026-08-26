@@ -72,7 +72,7 @@ pub(super) fn hits(area: Rect) -> Hits {
     let [main, _] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let inner = Block::default().borders(Borders::ALL).inner(main);
     let [left, right] =
-        Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(inner);
+        Layout::horizontal([Constraint::Length(46), Constraint::Min(20)]).areas(inner);
     let overview = Block::default().borders(Borders::ALL).inner(left);
     let body = Block::default().borders(Borders::ALL).inner(right);
     let [_, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
@@ -177,7 +177,7 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
         | Mode::ConfirmDocker
         | Mode::ConfirmPrune => {
             let [left, right] =
-                Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(inner);
+                Layout::horizontal([Constraint::Length(46), Constraint::Min(20)]).areas(inner);
             frame.render_widget(
                 Paragraph::new(overview_lines(snap, app))
                     .block(pane("Overview", app.focus == Focus::Overview)),
@@ -369,10 +369,10 @@ fn overview_lines(snap: &RuntimeSnapshot, app: &App) -> Vec<Line<'static>> {
         let extra = if row.extra.is_empty() {
             String::new()
         } else {
-            truncate(&row.extra, 8)
+            truncate(&row.extra, 20)
         };
         let text = format!(
-            "{mark}{:<18} {:>4} {:>8}",
+            "{mark}{:<18} {:>4} {:>20}",
             truncate(row.label, 18),
             row.count,
             extra

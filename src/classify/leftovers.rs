@@ -40,7 +40,11 @@ fn mark_one(
     let mut reasons = Vec::new();
     let mut score: u16 = 0;
 
-    let orphaned = parent.is_none()
+    // `unowned`: no classified Agent/MCP owner. `interactive`: a live
+    // terminal ancestor. A process the user launched by hand from a shell
+    // is unowned but interactive — intentional, not leftover. Only unowned
+    // AND non-interactive processes (truly abandoned) score as leftovers.
+    let unowned = parent.is_none()
         && matches!(
             item.category,
             Category::Mcp
@@ -49,40 +53,41 @@ fn mark_one(
                 | Category::UnknownDev
                 | Category::LanguageServer
         );
+    let interactive = root_proc(item, by_pid).is_some_and(|p| has_tty_ancestor(p, by_pid));
 
-    if orphaned
-        && matches!(
+    if unowned && !interactive {
+        let reparented_os = root_proc(item, by_pid).is_some_and(|p| reparented(p, present));
+        if matches!(
             item.category,
             Category::Mcp | Category::Browser | Category::LanguageServer
-        )
-    {
-        reasons.push(SuspicionReason::OwningAgentMissing);
-        score += 50;
-    }
-    if item.category == Category::Mcp && parent.is_none() {
-        reasons.push(SuspicionReason::McpOwnerMissing);
-        score += 25;
-    }
-    if item.category == Category::Browser && parent.is_none() {
-        reasons.push(SuspicionReason::HeadlessBrowserDetached);
-        score += 30;
-    }
-
-    if let Some(p) = root_proc(item, by_pid) {
-        if reparented(p, present) && orphaned {
+        ) {
+            reasons.push(SuspicionReason::OwningAgentMissing);
+            score += 50;
+        }
+        if item.category == Category::Mcp {
+            reasons.push(SuspicionReason::McpOwnerMissing);
+            score += 25;
+        }
+        if item.category == Category::Browser {
+            reasons.push(SuspicionReason::HeadlessBrowserDetached);
+            score += 30;
+        }
+        if reparented_os {
             reasons.push(SuspicionReason::ParentExited);
             score += 40;
         }
-        if !has_tty_ancestor(p, by_pid) && orphaned {
-            reasons.push(SuspicionReason::NoTerminalAncestor);
-            score += 15;
-        }
-        if item.category == Category::DevServer {
-            let age_h = now.saturating_sub(p.start_time) / 3600;
-            if p.start_time > 0 && age_h >= cfg.leftovers.server_age_hours {
-                reasons.push(SuspicionReason::LongRunningDevServer);
-                score += 20;
-            }
+        // NoTerminalAncestor is implied: this block only runs when
+        // `interactive` is false.
+    }
+
+    // A dev server is leftover by age regardless of being interactive.
+    if item.category == Category::DevServer
+        && let Some(p) = root_proc(item, by_pid)
+    {
+        let age_h = now.saturating_sub(p.start_time) / 3600;
+        if p.start_time > 0 && age_h >= cfg.leftovers.server_age_hours {
+            reasons.push(SuspicionReason::LongRunningDevServer);
+            score += 20;
         }
     }
 
@@ -323,5 +328,26 @@ mod tests {
         let mut items = group(&procs);
         mark(&mut items, &procs, &cfg);
         assert_eq!(items[0].state, RuntimeState::Persistent);
+    }
+    #[test]
+    fn interactive_unowned_is_not_leftover() {
+        // MCP spawned under a live shell: unowned (no agent) but interactive.
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(2, Some(1), "zsh", &["zsh"], 1),
+            proc(10, Some(2), "node", &["node", "chrome-devtools-mcp"], 100),
+        ];
+        let mut procs = procs;
+        procs[2].tty = Some("ttys000".into());
+        procs[1].tty = Some("ttys000".into());
+        let mut items = group(&procs);
+        mark(&mut items, &procs, &Config::default());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "chrome-devtools-mcp");
+        assert_eq!(
+            items[0].state,
+            RuntimeState::Active,
+            "shell-launched MCP must not be a leftover"
+        );
     }
 }

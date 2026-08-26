@@ -23,12 +23,7 @@ use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 
 /// See what your dev sessions left running.
 #[derive(Parser)]
-#[command(
-    name = "wyd",
-    version,
-    about,
-    after_help = "  wyd upgrade    update via brew or cargo\n"
-)]
+#[command(name = "wyd", version, about)]
 struct Cli {
     /// Print JSON and exit (no TUI)
     #[arg(long)]
@@ -40,6 +35,23 @@ struct Cli {
     filter: Option<String>,
     /// Project name when filter is `project`
     name: Option<String>,
+    #[command(subcommand)]
+    command: Option<Subcmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum Subcmd {
+    /// Update wyd via brew or cargo (detected from the binary path)
+    Upgrade,
+    /// Delete unused anonymous volumes
+    Prune {
+        /// List what would be deleted without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -91,26 +103,24 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("upgrade") {
-        return run_upgrade();
-    }
-    if args.get(1).map(String::as_str) == Some("prune") {
-        let dry = args.iter().any(|a| a == "--dry-run");
-        let yes = args.iter().any(|a| a == "--yes");
-        return run_prune(dry, yes);
-    }
     let cli = Cli::parse();
-    if cli.json || cli.plain {
-        return run_cli(cli);
+    match cli.command {
+        Some(Subcmd::Upgrade) => run_upgrade(),
+        Some(Subcmd::Prune { dry_run, yes }) => run_prune(dry_run, yes),
+        None => {
+            if cli.json || cli.plain {
+                run_cli(cli)
+            } else {
+                let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
+                let (force_tx, force_rx) = mpsc::channel::<()>();
+                thread::spawn({
+                    let snapshot = Arc::clone(&snapshot);
+                    move || scanner_loop(snapshot, force_rx)
+                });
+                tui::run_tui(snapshot, force_tx)
+            }
+        }
     }
-    let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
-    let (force_tx, force_rx) = mpsc::channel::<()>();
-    thread::spawn({
-        let snapshot = Arc::clone(&snapshot);
-        move || scanner_loop(snapshot, force_rx)
-    });
-    tui::run_tui(snapshot, force_tx)
 }
 
 fn run_upgrade() -> io::Result<()> {
@@ -150,6 +160,7 @@ fn run_prune(dry_run: bool, yes: bool) -> io::Result<()> {
     let (count, bytes) = snap.docker.prunable_stats();
     if count == 0 {
         println!("nothing to prune");
+        return Ok(());
     }
     println!("{count} anonymous volumes · {}", mb(bytes));
     if dry_run {
@@ -165,9 +176,10 @@ fn run_prune(dry_run: bool, yes: bool) -> io::Result<()> {
             return Ok(());
         }
     }
-    let (deleted, reclaimed) =
-        actions::docker::prune_anonymous_volumes_blocking().map_err(io::Error::other)?;
-    println!("pruned {deleted} volumes · {} reclaimed", mb(reclaimed));
+    let ids = snap.docker.prunable_ids();
+    let (deleted, _) =
+        actions::docker::prune_anonymous_volumes_blocking(&ids).map_err(io::Error::other)?;
+    println!("pruned {deleted} volumes");
     Ok(())
 }
 

@@ -360,7 +360,8 @@ fn handle_key(
                 KeyResult::Continue
             }
             KeyCode::Char('y') => {
-                let _ = crate::actions::docker::prune_anonymous_volumes_blocking();
+                let ids = snap.docker.prunable_ids();
+                let _ = crate::actions::docker::prune_anonymous_volumes_blocking(&ids);
                 app.mode = Mode::List;
                 let _ = force.send(());
                 KeyResult::Continue
