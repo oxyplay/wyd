@@ -114,7 +114,63 @@ fn dispatch(store: &mut RuntimeStore, line: &str) -> String {
                 Err(e) => err_json(&e.to_string()),
             }
         }
+        "session_start" => match session_start(store, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
+        "session_end" => match session_end(store, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
         other => err_json(&format!("unknown command {other:?}")),
+    }
+}
+
+/// Vendor registers an agent session (contract §17). Resolves the pid to a
+/// Wyd session and records the vendor id as an alias.
+fn session_start(store: &mut RuntimeStore, req: &Value) -> std::io::Result<Value> {
+    let agent = req.get("agent").and_then(Value::as_str).unwrap_or("");
+    let vendor = req
+        .get("vendor")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let vendor_sid = req
+        .get("vendor_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let pid = req.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+
+    let boot = store.boot_id_for_epoch(SystemBoot.current_boot_epoch()?, now())?;
+    let mut scanner = SysinfoProcessScanner::new();
+    let processes = scanner
+        .scan()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let Some(proc) = processes.iter().find(|p| p.pid == pid) else {
+        return Ok(json!({ "error": "pid not running" }));
+    };
+    let Some(id) = ProcessIdentity::from_process(&boot, proc) else {
+        return Ok(json!({ "error": "no stable identity" }));
+    };
+    let sid = store.ensure_session(&boot, agent, pid, id.start_time, now())?;
+    if !vendor_sid.is_empty() {
+        store.register_alias(sid, vendor, vendor_sid)?;
+    }
+    Ok(json!({ "session_id": sid.to_string(), "agent": agent }))
+}
+
+/// Vendor ends a session it previously registered.
+fn session_end(store: &mut RuntimeStore, req: &Value) -> std::io::Result<Value> {
+    let vendor = req.get("vendor").and_then(Value::as_str).unwrap_or("");
+    let vendor_sid = req
+        .get("vendor_session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match store.session_id_for_alias(vendor, vendor_sid)? {
+        Some(sid) => {
+            store.end_session(sid, now())?;
+            Ok(json!({ "ended": true, "session_id": sid.to_string() }))
+        }
+        None => Ok(json!({ "ended": false, "note": "unknown alias" })),
     }
 }
 

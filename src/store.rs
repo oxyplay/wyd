@@ -134,6 +134,12 @@ impl RuntimeStore {
                 value TEXT NOT NULL,
                 PRIMARY KEY (decision_id, session_id, kind)
             );
+            CREATE TABLE IF NOT EXISTS session_aliases (
+                vendor TEXT NOT NULL,
+                vendor_session_id TEXT NOT NULL,
+                session_id INTEGER NOT NULL,
+                PRIMARY KEY (vendor, vendor_session_id)
+            );
             COMMIT;",
             )
             .map_err(err)?;
@@ -607,6 +613,92 @@ impl RuntimeStore {
             Some(id) => self.session_record(RuntimeSessionId::from_u64(id as u64)),
             None => Ok(None),
         }
+    }
+
+    /// Ensure a session exists for an explicitly registered agent process
+    /// (vendor `session_start`, contract §17). Inserts if absent and returns
+    /// its Wyd id.
+    pub fn ensure_session(
+        &mut self,
+        boot: &BootId,
+        agent: &str,
+        pid: u32,
+        start_time: u64,
+        now: u64,
+    ) -> io::Result<RuntimeSessionId> {
+        let id = RuntimeSessionId::new(
+            boot,
+            &ProcessIdentity {
+                boot_id: *boot,
+                pid,
+                start_time,
+            },
+            agent,
+        );
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO sessions
+                   (session_id, boot_id, agent, root_pid, root_start_time,
+                    started_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![
+                    id.as_u64() as i64,
+                    boot.to_le_bytes().to_vec(),
+                    agent,
+                    pid as i64,
+                    start_time as i64,
+                    now as i64,
+                ],
+            )
+            .map_err(err)?;
+        Ok(id)
+    }
+
+    /// Map a vendor session id to the Wyd session (metadata, §2 — does not
+    /// redefine Wyd's local identity).
+    pub fn register_alias(
+        &mut self,
+        session_id: RuntimeSessionId,
+        vendor: &str,
+        vendor_session_id: &str,
+    ) -> io::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO session_aliases (vendor, vendor_session_id, session_id)
+                 VALUES (?1, ?2, ?3)",
+                params![vendor, vendor_session_id, session_id.as_u64() as i64],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    pub fn session_id_for_alias(
+        &self,
+        vendor: &str,
+        vendor_session_id: &str,
+    ) -> io::Result<Option<RuntimeSessionId>> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM session_aliases
+                 WHERE vendor = ?1 AND vendor_session_id = ?2",
+                params![vendor, vendor_session_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        Ok(id.map(|i| RuntimeSessionId::from_u64(i as u64)))
+    }
+
+    /// Explicitly end a session (vendor `session_end`, §17).
+    pub fn end_session(&mut self, session_id: RuntimeSessionId, now: u64) -> io::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2 AND ended_at IS NULL",
+                params![now as i64, session_id.as_u64() as i64],
+            )
+            .map_err(err)?;
+        Ok(())
     }
 
     /// Which known resource owns a process invocation, plus that session —
@@ -1192,5 +1284,33 @@ mod tests {
                 .is_some(),
             "ended session still keeps provenance"
         );
+    }
+
+    #[test]
+    fn vendor_registration_maps_alias_and_ends() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let boot = BootId::from_u128(7);
+        let sid = store
+            .ensure_session(&boot, "junie", 100, 500, 1000)
+            .unwrap();
+        store.register_alias(sid, "junie", "junie-48372").unwrap();
+
+        let looked = store
+            .session_id_for_alias("junie", "junie-48372")
+            .unwrap()
+            .expect("alias resolves to the Wyd session");
+        assert_eq!(looked, sid);
+        assert!(store.session_record(sid).unwrap().unwrap().ended_at.is_none());
+
+        store.end_session(sid, 2000).unwrap();
+        assert_eq!(
+            store.session_record(sid).unwrap().unwrap().ended_at,
+            Some(2000),
+            "explicit end marks the session ended"
+        );
+
+        // Same process invocation is idempotent: one session, one alias.
+        let again = store.ensure_session(&boot, "junie", 100, 500, 2000).unwrap();
+        assert_eq!(again, sid);
     }
 }
