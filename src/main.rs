@@ -51,7 +51,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()>) {
     let mut scanner = SysinfoProcessScanner::new();
     let mut projects = ProjectCache::with_roots(config::Config::global().project_roots());
-    let mut docker = model::DockerSnapshot::default();
+    let mut docker = Arc::new(model::DockerSnapshot::default());
     let mut version = 0u64;
     loop {
         let next = (|| -> scanner::Result<RuntimeSnapshot> {
@@ -62,13 +62,13 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
             classify::mark(&mut logical_items, &processes, config::Config::global());
             version += 1;
             if version == 1 || version.is_multiple_of(3) {
-                docker = crate::scanner::docker::scan_blocking();
+                docker = Arc::new(crate::scanner::docker::scan_blocking());
             }
             let (used, total) = scanner.memory();
             Ok(RuntimeSnapshot {
                 logical_items,
                 processes,
-                docker: docker.clone(),
+                docker: Arc::clone(&docker),
                 total_memory_bytes: total,
                 used_memory_bytes: used,
                 cpu_percent: scanner.cpu_percent(),
@@ -143,10 +143,13 @@ fn run_prune(dry_run: bool, yes: bool) -> io::Result<()> {
     use std::io::Write;
 
     let snap = collect::snapshot();
+    if !snap.docker.ok {
+        println!("docker not running");
+        return Ok(());
+    }
     let (count, bytes) = snap.docker.prunable_stats();
     if count == 0 {
         println!("nothing to prune");
-        return Ok(());
     }
     println!("{count} anonymous volumes · {}", mb(bytes));
     if dry_run {

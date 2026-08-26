@@ -37,6 +37,19 @@ impl ProcessInfo {
             .and_then(|s| s.to_str())
             .unwrap_or("?")
     }
+
+    /// Lowercased `name + cmd + exe` for substring matching.
+    pub fn hay(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.name.to_ascii_lowercase(),
+            self.command.join(" ").to_ascii_lowercase(),
+            self.executable
+                .as_ref()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        )
+    }
 }
 
 #[cfg(test)]

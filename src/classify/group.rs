@@ -52,7 +52,10 @@ pub fn group(processes: &[ProcessInfo]) -> Vec<RuntimeItem> {
         let Some(c) = class.get(&pid) else {
             return false;
         };
-        if !is_classified(pid) || wrapper.contains(&pid) || c.category == Category::Browser {
+        if !is_classified(pid)
+            || wrapper.contains(&pid)
+            || (c.category == Category::Browser && has_dev_browser_ancestor(pid, &by_pid, &class))
+        {
             return false;
         }
         // A `node`/`python` with no argv is not a useful item — we cannot
@@ -463,5 +466,45 @@ mod tests {
         assert_eq!(titles(&items), ["omp ×3"]);
         assert_eq!(titles(&items[0].children), ["chrome-devtools-mcp"]);
         assert_eq!(items[0].memory_bytes, 175);
+    }
+
+    #[test]
+    fn orphaned_dev_browser_is_root() {
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(
+                10,
+                Some(1),
+                "Chromium",
+                &["Chromium", "--headless", "--remote-debugging-port=0"],
+                500,
+            ),
+        ];
+        let items = group(&procs);
+        // Without an MCP or Agent ancestor, the browser must surface.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "Chromium");
+        assert_eq!(items[0].category, Category::Browser);
+        assert_eq!(items[0].memory_bytes, 500);
+    }
+    #[test]
+    fn dev_browser_under_mcp_is_hidden() {
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(10, Some(1), "omp", &["omp"], 100),
+            proc(11, Some(10), "node", &["node", "chrome-devtools-mcp"], 10),
+            proc(
+                12,
+                Some(11),
+                "Chromium",
+                &["Chromium", "--headless", "--remote-debugging-port=0"],
+                500,
+            ),
+        ];
+        let items = group(&procs);
+        // Browser still rolls up under the MCP.
+        assert_eq!(titles(&items), ["omp"]);
+        assert_eq!(titles(&items[0].children), ["chrome-devtools-mcp"]);
+        assert_eq!(titles(&items[0].children[0].children), ["Chromium"]);
     }
 }

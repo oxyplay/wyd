@@ -53,7 +53,7 @@ impl Default for KeysConfig {
 
 impl KeysConfig {
     pub fn hit(spec: &str, c: char) -> bool {
-        spec.starts_with(c)
+        spec.len() == 1 && spec.as_bytes()[0] == c as u8
     }
 }
 
@@ -129,6 +129,9 @@ impl SignatureConfig {
 }
 
 fn config_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(dir).join("wyd/config.toml"));
+    }
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".config/wyd/config.toml"))
 }

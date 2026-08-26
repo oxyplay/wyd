@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::classify::{leftover_count, leftover_ram};
 use crate::model::{
@@ -87,7 +87,9 @@ fn project_ok(item: &RuntimeItem, project: Option<&str>) -> bool {
     match project {
         None => true,
         Some(name) => {
-            item.project.as_ref().is_some_and(|p| p.name == name)
+            item.project
+                .as_ref()
+                .is_some_and(|p| p.name.eq_ignore_ascii_case(name))
                 || item.children.iter().any(|c| project_ok(c, project))
         }
     }
@@ -230,11 +232,9 @@ fn count_ports(items: &[RuntimeItem]) -> usize {
 }
 
 fn count_projects(items: &[RuntimeItem]) -> usize {
-    let mut names = Vec::new();
+    let mut names = std::collections::HashSet::new();
     walk_projects(items, &mut |n| {
-        if !names.iter().any(|x| x == n) {
-            names.push(n.to_string());
-        }
+        names.insert(n);
     });
     names.len()
 }
@@ -256,7 +256,13 @@ pub fn rows<'a>(
 ) -> Vec<Row<'a>> {
     let mut out = Vec::new();
     match section {
-        Section::Ports => collect_ports(&snap.logical_items, project, q, &mut out),
+        Section::Ports => collect_ports(
+            &snap.logical_items,
+            project,
+            q,
+            &mut out,
+            &mut HashSet::new(),
+        ),
         Section::Projects => collect_projects(&snap.logical_items, q, &mut out),
         Section::Docker => {
             let mut agg_count = 0u32;
@@ -330,20 +336,22 @@ fn collect_ports<'a>(
     project: Option<&str>,
     q: &str,
     out: &mut Vec<Row<'a>>,
+    seen: &mut HashSet<u16>,
 ) {
     for item in items {
         if project_ok(item, project) {
             for port in &item.ports {
-                if q.is_empty()
-                    || hay_hit(&port.label(), q)
-                    || hay_hit(&item.title(), q)
-                    || item.project.as_ref().is_some_and(|p| hay_hit(&p.name, q))
+                if seen.insert(port.port)
+                    && (q.is_empty()
+                        || hay_hit(&port.label(), q)
+                        || hay_hit(&item.title(), q)
+                        || item.project.as_ref().is_some_and(|p| hay_hit(&p.name, q)))
                 {
                     out.push(Row::Port { port, owner: item });
                 }
             }
         }
-        collect_ports(&item.children, project, q, out);
+        collect_ports(&item.children, project, q, out, seen);
     }
 }
 

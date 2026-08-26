@@ -691,7 +691,7 @@ mod tests {
         RuntimeSnapshot {
             logical_items: group(&processes),
             processes,
-            docker: model::DockerSnapshot::default(),
+            docker: Arc::new(model::DockerSnapshot::default()),
             total_memory_bytes: 32 << 30,
             used_memory_bytes: 7 << 30,
             cpu_percent: 12.0,
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn docker_section_volume_needs_d() {
         let mut snap = fixture_snapshot();
-        snap.docker = model::DockerSnapshot {
+        snap.docker = Arc::new(model::DockerSnapshot {
             ok: true,
             note: String::new(),
             disk_bytes: 1 << 30,
@@ -849,7 +849,7 @@ mod tests {
                 anonymous: false,
                 created: 0,
             }],
-        };
+        });
         let mut app = App::new();
         app.section = Section::Docker;
         let backend = TestBackend::new(100, 24);
@@ -965,7 +965,7 @@ mod tests {
     #[test]
     fn marked_docker_rows_batch_into_confirm() {
         let mut snap = fixture_snapshot();
-        snap.docker = model::DockerSnapshot {
+        snap.docker = Arc::new(model::DockerSnapshot {
             ok: true,
             note: String::new(),
             disk_bytes: 1 << 30,
@@ -994,7 +994,7 @@ mod tests {
                     created: 0,
                 },
             ],
-        };
+        });
         let mut app = App::new();
         app.section = Section::Docker;
         let (tx, _rx) = mpsc::channel();

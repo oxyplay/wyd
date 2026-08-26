@@ -35,7 +35,6 @@ impl ProcessScanner for SysinfoProcessScanner {
             ProcessRefreshKind::nothing()
                 .with_memory()
                 .with_cpu()
-                .with_disk_usage()
                 .with_exe(UpdateKind::OnlyIfNotSet)
                 .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_cwd(UpdateKind::OnlyIfNotSet),

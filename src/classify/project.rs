@@ -154,15 +154,7 @@ fn promote_listeners(item: &mut RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>
             .and_then(|s| s.to_str())
             .unwrap_or(&p.name)
             .to_ascii_lowercase();
-        let hay = format!(
-            "{} {} {}",
-            p.name.to_ascii_lowercase(),
-            p.command.join(" ").to_ascii_lowercase(),
-            p.executable
-                .as_ref()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default()
-        );
+        let hay = p.hay();
         if rules::is_vite(&hay, &p.name.to_ascii_lowercase(), &argv0) {
             item.display_name = "vite".into();
         }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
@@ -9,29 +9,29 @@ pub fn mark(items: &mut [RuntimeItem], processes: &[ProcessInfo], cfg: &Config) 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let by_pid: HashMap<u32, &ProcessInfo> = processes.iter().map(|p| (p.pid, p)).collect();
     let present: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
     for item in items {
-        mark_one(item, None, processes, &present, cfg, now);
+        mark_one(item, None, &by_pid, &present, cfg, now);
     }
 }
-
 fn mark_one(
     item: &mut RuntimeItem,
     parent: Option<Category>,
-    processes: &[ProcessInfo],
+    by_pid: &HashMap<u32, &ProcessInfo>,
     present: &HashSet<u32>,
     cfg: &Config,
     now: u64,
 ) {
     for child in &mut item.children {
-        mark_one(child, Some(item.category), processes, present, cfg, now);
+        mark_one(child, Some(item.category), by_pid, present, cfg, now);
     }
 
     if item.category == Category::Agent {
         item.suspicion = None;
         return;
     }
-    if exempt(item, processes, cfg) {
+    if exempt(item, by_pid, cfg) {
         item.state = RuntimeState::Persistent;
         item.suspicion = None;
         return;
@@ -68,12 +68,12 @@ fn mark_one(
         score += 30;
     }
 
-    if let Some(p) = root_proc(item, processes) {
+    if let Some(p) = root_proc(item, by_pid) {
         if reparented(p, present) && orphaned {
             reasons.push(SuspicionReason::ParentExited);
             score += 40;
         }
-        if !has_tty_ancestor(p, processes) && orphaned {
+        if !has_tty_ancestor(p, by_pid) && orphaned {
             reasons.push(SuspicionReason::NoTerminalAncestor);
             score += 15;
         }
@@ -93,22 +93,14 @@ fn mark_one(
     }
 }
 
-fn exempt(item: &RuntimeItem, processes: &[ProcessInfo], cfg: &Config) -> bool {
+fn exempt(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>, cfg: &Config) -> bool {
     if matches!(item.category, Category::Database | Category::DevService) {
         return true;
     }
-    let Some(p) = root_proc(item, processes) else {
+    let Some(p) = root_proc(item, by_pid) else {
         return false;
     };
-    let hay = format!(
-        "{} {} {}",
-        p.name.to_ascii_lowercase(),
-        p.command.join(" ").to_ascii_lowercase(),
-        p.executable
-            .as_ref()
-            .map(|e| e.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default()
-    );
+    let hay = p.hay();
     // Homebrew in the *node* path is not a persistent service — leftover
     // LSPs launched via brew-installed node must still score as leftovers.
     if !matches!(item.category, Category::LanguageServer)
@@ -125,25 +117,20 @@ fn exempt(item: &RuntimeItem, processes: &[ProcessInfo], cfg: &Config) -> bool {
         .any(|c| hay.contains(&c.to_ascii_lowercase()))
 }
 
-fn root_proc<'a>(item: &RuntimeItem, processes: &'a [ProcessInfo]) -> Option<&'a ProcessInfo> {
+fn root_proc<'a>(
+    item: &RuntimeItem,
+    by_pid: &'a HashMap<u32, &'a ProcessInfo>,
+) -> Option<&'a ProcessInfo> {
     let pid = item.root_pid?;
-    processes.iter().find(|p| p.pid == pid)
+    by_pid.get(&pid).copied()
 }
 
-fn reparented(p: &ProcessInfo, present: &HashSet<u32>) -> bool {
-    match p.parent_pid {
-        None => true,
-        Some(1) => true,
-        Some(ppid) => !present.contains(&ppid),
-    }
-}
-
-fn has_tty_ancestor(start: &ProcessInfo, processes: &[ProcessInfo]) -> bool {
+fn has_tty_ancestor(start: &ProcessInfo, by_pid: &HashMap<u32, &ProcessInfo>) -> bool {
     let mut pid = start.pid;
     let mut guard = 0;
     while guard < 64 {
         guard += 1;
-        let Some(p) = processes.iter().find(|x| x.pid == pid) else {
+        let Some(p) = by_pid.get(&pid) else {
             break;
         };
         if p.tty.is_some() {
@@ -155,6 +142,13 @@ fn has_tty_ancestor(start: &ProcessInfo, processes: &[ProcessInfo]) -> bool {
         };
     }
     false
+}
+fn reparented(p: &ProcessInfo, present: &HashSet<u32>) -> bool {
+    match p.parent_pid {
+        None => true,
+        Some(1) => true,
+        Some(ppid) => !present.contains(&ppid),
+    }
 }
 
 pub fn leftover_ram(items: &[RuntimeItem]) -> u64 {

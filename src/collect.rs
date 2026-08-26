@@ -2,6 +2,7 @@ use crate::classify::{ProjectCache, attach, group, mark};
 use crate::config::Config;
 use crate::model::RuntimeSnapshot;
 use crate::scanner::{ProcessScanner, ports, processes::SysinfoProcessScanner};
+use std::sync::Arc;
 
 /// One scan of processes, ports, Docker, and leftover scores.
 /// Shared by the TUI loop and `--json` / `--plain`.
@@ -14,7 +15,7 @@ pub fn snapshot() -> RuntimeSnapshot {
     let mut logical_items = group(&processes);
     attach(&mut logical_items, &processes, &ports, &mut projects);
     mark(&mut logical_items, &processes, cfg);
-    let docker = crate::scanner::docker::scan_blocking();
+    let docker = Arc::new(crate::scanner::docker::scan_blocking());
     let (used, total) = scanner.memory();
     RuntimeSnapshot {
         logical_items,

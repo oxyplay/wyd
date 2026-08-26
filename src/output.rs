@@ -224,7 +224,7 @@ fn status(item: &RuntimeItem) -> String {
 fn docker_is_leftover(r: &DockerResource) -> bool {
     matches!(r.kind, DockerKind::DanglingImage | DockerKind::BuildCache)
         || r.detail == "stopped"
-        || r.detail == "unused"
+        || (r.detail == "unused" && r.anonymous)
 }
 
 fn project_ok(item: &RuntimeItem, project: Option<&str>) -> bool {
