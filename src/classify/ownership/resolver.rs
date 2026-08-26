@@ -8,8 +8,7 @@
 
 use crate::model::session::RuntimeSessionId;
 
-use super::rules::RESOLVER_VERSION;
-pub use super::rules::ResolverRules;
+pub use super::rules::{RESOLVER_VERSION, ResolverRules};
 
 /// Why a session is a candidate owner. Never project/timing alone.
 // ponytail: live attribution only produces `PersistedPrevious`; the other

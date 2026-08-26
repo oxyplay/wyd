@@ -1,4 +1,6 @@
-use crate::classify::ownership::resolver::{AnchorKind, CandidateInput, ResolverRules, resolve};
+use crate::classify::ownership::resolver::{
+    AnchorKind, CandidateInput, RESOLVER_VERSION, ResolverRules, resolve,
+};
 use crate::classify::ownership::{ResourceId, derive_ownership};
 use crate::classify::{ProjectCache, attach, group, mark};
 use crate::config::Config;
@@ -148,8 +150,12 @@ fn attribution_for(
         return; // no stable identity → live-only
     };
     let resource_id = ResourceId::of_root(&root).as_u64();
-    if store.latest_decision(resource_id).ok().flatten().is_some() {
-        return; // already decided
+    // Re-evaluate only when there is no decision, or the resolver rules
+    // changed (a new resolver version must re-score existing resources).
+    if let Ok(Some(latest)) = store.latest_decision(resource_id)
+        && latest.resolver_version == RESOLVER_VERSION
+    {
+        return;
     }
 
     // Anchor (§7): recorded provenance for any process of this resource.

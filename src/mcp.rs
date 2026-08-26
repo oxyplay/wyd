@@ -7,11 +7,23 @@
 //! directly: initialize, notifications/initialized, tools/list, tools/call,
 //! ping.
 
+use crate::server;
 use crate::store::RuntimeStore;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
+use std::thread;
+
+/// The MCP protocol version this server speaks. We implement the legacy
+/// (2025) initialize-based protocol, not the 2026 `server/discover` era, so
+/// this is pinned and never echoed back to a client (a client asking for a
+/// newer version gets this and must fall back).
+const PROTOCOL_VERSION: &str = "2025-11-25";
 
 pub fn serve_stdio() -> std::io::Result<()> {
+    // Keep the store fresh while serving, even with no `wyd serve`/TUI open
+    // (item 10): a background collector refreshes provenance.
+    thread::spawn(server::collect_loop);
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = std::io::BufReader::new(stdin.lock());
@@ -20,7 +32,7 @@ pub fn serve_stdio() -> std::io::Result<()> {
         line.clear();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
-            return Ok(()); // client closed
+            return Ok(()); // client closed (kills the collect thread with the process)
         }
         let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -36,28 +48,24 @@ pub fn serve_stdio() -> std::io::Result<()> {
 }
 
 /// Process one JSON-RPC message. Returns `Some(response)` for requests,
-/// `None` for notifications.
+/// `None` for notifications (JSON-RPC: a notification has no id and must
+/// never be answered).
 fn handle(msg: &Value) -> Option<String> {
+    let id = msg.get("id")?.clone(); // no id → notification → no response
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let id = msg.get("id");
     match method {
-        "initialize" => {
-            let params = msg.get("params").cloned().unwrap_or(json!({}));
-            let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2024-11-05");
-            Some(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": requested,
-                        "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "wyd", "version": env!("CARGO_PKG_VERSION") }
-                    }
-                })
-                .to_string(),
-            )
-        }
-        "notifications/initialized" => None,
+        "initialize" => Some(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "wyd", "version": env!("CARGO_PKG_VERSION") }
+                }
+            })
+            .to_string(),
+        ),
         "ping" => Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} }).to_string()),
         "tools/list" => Some(
             json!({
@@ -68,19 +76,18 @@ fn handle(msg: &Value) -> Option<String> {
             .to_string(),
         ),
         "tools/call" => {
-            let id = id.cloned().unwrap_or(Value::Null);
             let params = msg.get("params").cloned().unwrap_or(json!({}));
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             Some(call_tool(&id, name, &args))
         }
-        // Anything else (sampling, prompts, roots) is out of scope: respond
-        // with an error so clients know it's unsupported rather than hang.
+        // Unknown request method: a proper JSON-RPC error, not a tool-style
+        // isError result.
         _ => Some(
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "content": [{"type":"text","text":"unsupported method"}], "isError": true }
+                "error": { "code": -32601, "message": "Method not found" }
             })
             .to_string(),
         ),
@@ -167,11 +174,13 @@ mod tests {
 
     #[test]
     fn initialize_returns_capabilities() {
-        let resp = handle_msg(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#)
-            .unwrap();
+        let resp = handle_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], 1);
-        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(v["result"]["serverInfo"]["name"], "wyd");
     }
 
@@ -191,13 +200,28 @@ mod tests {
 
     #[test]
     fn notifications_get_no_response() {
+        // A notification has no id and must never be answered — even for an
+        // unknown method.
         assert!(handle_msg(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+        assert!(handle_msg(r#"{"jsonrpc":"2.0","method":"prompts/list"}"#).is_none());
     }
 
     #[test]
-    fn unknown_method_is_an_error() {
+    fn unknown_request_method_gets_json_rpc_error() {
         let resp = handle_msg(r#"{"jsonrpc":"2.0","id":3,"method":"prompts/list"}"#).unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["result"]["isError"], true);
+        assert_eq!(v["error"]["code"], -32601, "Method not found");
+    }
+
+    #[test]
+    fn initialize_pins_version_not_echoes() {
+        // A client asking for a future version must get our supported version,
+        // not an echo of the request.
+        let resp = handle_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
     }
 }

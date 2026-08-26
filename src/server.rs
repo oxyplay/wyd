@@ -1,8 +1,7 @@
-//! `wyd serve`: a local, read-only Unix-socket API over the ownership store
+//! `wyd serve`: a local Unix-socket API over the ownership store
 //! (contract §15–16). Keeps the store fresh by running the collector on a
-//! loop, and serves line-delimited JSON requests to local clients.
-//!
-//! Phase 3 slice 1: daemon + read-only IPC. No MCP, no vendor protocol yet.
+//! loop, and serves line-delimited JSON requests (read + vendor registration)
+//! to local clients.
 
 use crate::collect::{self, OwnershipTracker};
 use crate::model::process::ProcessIdentity;
@@ -11,6 +10,7 @@ use crate::scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 use crate::store::RuntimeStore;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::thread;
@@ -31,11 +31,29 @@ fn now() -> u64 {
 }
 
 /// Run the daemon: a background collector loop plus a Unix-socket acceptor.
+/// Single-instance: refuses to start if another `wyd serve` is already
+/// listening on the socket, instead of silently replacing it.
 pub fn serve() -> std::io::Result<()> {
     let path = socket_path();
-    let _ = std::fs::remove_file(&path); // clear a stale socket from a dead run
+    if std::path::Path::new(&path).exists() {
+        match UnixStream::connect(&path) {
+            Ok(_) => {
+                eprintln!("wyd serve already running ({})", path.display());
+                return Ok(());
+            }
+            Err(_) => {
+                // Stale socket from a dead run: clear it and take over.
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    let pid_path = RuntimeStore::default_path().with_file_name("wyd.pid");
+    std::fs::write(&pid_path, std::process::id().to_string())?;
+
     let listener = UnixListener::bind(&path)?;
-    eprintln!("wyd serve on {} (read-only)", path.display());
+    // Restrict the socket to this user regardless of umask.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    eprintln!("wyd serve on {} (local runtime API)", path.display());
 
     thread::spawn(collect_loop);
 
@@ -51,7 +69,8 @@ pub fn serve() -> std::io::Result<()> {
 }
 
 /// Collect + persist on a loop so the API stays fresh even with no TUI open.
-fn collect_loop() {
+/// Shared by `wyd serve` and `wyd mcp`.
+pub fn collect_loop() {
     let mut tracker = OwnershipTracker::new();
     loop {
         let mut snap = collect::snapshot();
@@ -127,18 +146,22 @@ fn dispatch(store: &mut RuntimeStore, line: &str) -> String {
 }
 
 /// Vendor registers an agent session (contract §17). Resolves the pid to a
-/// Wyd session and records the vendor id as an alias.
+/// Wyd session and records the vendor id as an alias. Errors (not `ok` JSON)
+/// so the client gets `{"ok":false,"error":...}`.
 fn session_start(store: &mut RuntimeStore, req: &Value) -> std::io::Result<Value> {
     let agent = req.get("agent").and_then(Value::as_str).unwrap_or("");
-    let vendor = req
-        .get("vendor")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let vendor = req.get("vendor").and_then(Value::as_str).unwrap_or("");
     let vendor_sid = req
         .get("vendor_session_id")
         .and_then(Value::as_str)
         .unwrap_or("");
     let pid = req.get("pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+
+    if pid == 0 || agent.is_empty() || vendor.is_empty() || vendor_sid.is_empty() {
+        return Err(std::io::Error::other(
+            "session_start needs pid > 0, agent, vendor, vendor_session_id",
+        ));
+    }
 
     let boot = store.boot_id_for_epoch(SystemBoot.current_boot_epoch()?, now())?;
     let mut scanner = SysinfoProcessScanner::new();
@@ -146,19 +169,19 @@ fn session_start(store: &mut RuntimeStore, req: &Value) -> std::io::Result<Value
         .scan()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let Some(proc) = processes.iter().find(|p| p.pid == pid) else {
-        return Ok(json!({ "error": "pid not running" }));
+        return Err(std::io::Error::other("pid not running"));
     };
     let Some(id) = ProcessIdentity::from_process(&boot, proc) else {
-        return Ok(json!({ "error": "no stable identity" }));
+        return Err(std::io::Error::other("pid has no stable identity"));
     };
-    let sid = store.ensure_session(&boot, agent, pid, id.start_time, now())?;
-    if !vendor_sid.is_empty() {
-        store.register_alias(sid, vendor, vendor_sid)?;
-    }
+    let now = now();
+    let sid = store.ensure_session(&boot, agent, pid, id.start_time, now)?;
+    store.register_alias(sid, vendor, vendor_sid, now)?;
     Ok(json!({ "session_id": sid.to_string(), "agent": agent }))
 }
 
-/// Vendor ends a session it previously registered.
+/// Vendor ends a session it previously registered. This is metadata on the
+/// alias — it does not end the Wyd runtime session (process may still run).
 fn session_end(store: &mut RuntimeStore, req: &Value) -> std::io::Result<Value> {
     let vendor = req.get("vendor").and_then(Value::as_str).unwrap_or("");
     let vendor_sid = req
@@ -167,7 +190,7 @@ fn session_end(store: &mut RuntimeStore, req: &Value) -> std::io::Result<Value> 
         .unwrap_or("");
     match store.session_id_for_alias(vendor, vendor_sid)? {
         Some(sid) => {
-            store.end_session(sid, now())?;
+            store.end_vendor_alias(vendor, vendor_sid, now())?;
             Ok(json!({ "ended": true, "session_id": sid.to_string() }))
         }
         None => Ok(json!({ "ended": false, "note": "unknown alias" })),

@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -31,6 +32,11 @@ impl RuntimeStore {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path).map_err(err)?;
+        conn.busy_timeout(Duration::from_secs(2)).map_err(err)?;
+        // WAL: concurrent readers (TUI/CLI/MCP) don't block the writer, and
+        // the writer (serve/tracker) doesn't block readers.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .map_err(err)?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -40,6 +46,7 @@ impl RuntimeStore {
     #[cfg(test)]
     pub fn open_in_memory() -> io::Result<Self> {
         let conn = Connection::open_in_memory().map_err(err)?;
+        conn.busy_timeout(Duration::from_secs(2)).map_err(err)?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -138,11 +145,26 @@ impl RuntimeStore {
                 vendor TEXT NOT NULL,
                 vendor_session_id TEXT NOT NULL,
                 session_id INTEGER NOT NULL,
+                vendor_started_at INTEGER,
+                vendor_ended_at INTEGER,
                 PRIMARY KEY (vendor, vendor_session_id)
             );
             COMMIT;",
             )
             .map_err(err)?;
+
+        // Idempotent migrations for tables created before a column existed.
+        // Keep existing DBs usable without a full re-create.
+        self.add_column_if_missing(
+            "session_aliases",
+            "vendor_started_at",
+            "vendor_started_at INTEGER",
+        )?;
+        self.add_column_if_missing(
+            "session_aliases",
+            "vendor_ended_at",
+            "vendor_ended_at INTEGER",
+        )?;
 
         match self.meta("schema_version")? {
             Some(v) if v != SCHEMA_VERSION.to_string() => Err(io::Error::new(
@@ -157,6 +179,26 @@ impl RuntimeStore {
                 Ok(())
             }
         }
+    }
+
+    /// Add `column` to `table` if it does not already exist (idempotent
+    /// migration for DBs created before the column).
+    fn add_column_if_missing(&self, table: &str, column: &str, ddl: &str) -> io::Result<()> {
+        let sql = format!("PRAGMA table_info({table})");
+        let mut stmt = self.conn.prepare(&sql).map_err(err)?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?;
+        drop(stmt);
+        if cols.iter().any(|c| c == column) {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))
+            .map_err(err)?;
+        Ok(())
     }
 
     fn meta(&self, key: &str) -> io::Result<Option<String>> {
@@ -230,7 +272,8 @@ impl RuntimeStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(session_id) DO UPDATE SET
                     last_seen_at = excluded.last_seen_at,
-                    ended_at = excluded.ended_at",
+                    ended_at = excluded.ended_at,
+                    project = COALESCE(excluded.project, sessions.project)",
                 params![
                     s.id.as_u64() as i64,
                     s.root.boot_id.to_le_bytes().to_vec(),
@@ -661,12 +704,39 @@ impl RuntimeStore {
         session_id: RuntimeSessionId,
         vendor: &str,
         vendor_session_id: &str,
+        now: u64,
     ) -> io::Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO session_aliases (vendor, vendor_session_id, session_id)
-                 VALUES (?1, ?2, ?3)",
-                params![vendor, vendor_session_id, session_id.as_u64() as i64],
+                "INSERT OR REPLACE INTO session_aliases
+                   (vendor, vendor_session_id, session_id, vendor_started_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    vendor,
+                    vendor_session_id,
+                    session_id.as_u64() as i64,
+                    now as i64
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Record a vendor session as ended. This is **metadata** on the alias —
+    /// it does not end the Wyd runtime session (which ends only on process
+    /// death). A vendor session can be one chat/task within a longer-lived
+    /// agent process (§17).
+    pub fn end_vendor_alias(
+        &mut self,
+        vendor: &str,
+        vendor_session_id: &str,
+        now: u64,
+    ) -> io::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE session_aliases SET vendor_ended_at = ?1
+                 WHERE vendor = ?2 AND vendor_session_id = ?3",
+                params![now as i64, vendor, vendor_session_id],
             )
             .map_err(err)?;
         Ok(())
@@ -688,17 +758,6 @@ impl RuntimeStore {
             .optional()
             .map_err(err)?;
         Ok(id.map(|i| RuntimeSessionId::from_u64(i as u64)))
-    }
-
-    /// Explicitly end a session (vendor `session_end`, §17).
-    pub fn end_session(&mut self, session_id: RuntimeSessionId, now: u64) -> io::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2 AND ended_at IS NULL",
-                params![now as i64, session_id.as_u64() as i64],
-            )
-            .map_err(err)?;
-        Ok(())
     }
 
     /// Which known resource owns a process invocation, plus that session —
@@ -1293,7 +1352,9 @@ mod tests {
         let sid = store
             .ensure_session(&boot, "junie", 100, 500, 1000)
             .unwrap();
-        store.register_alias(sid, "junie", "junie-48372").unwrap();
+        store
+            .register_alias(sid, "junie", "junie-48372", 1000)
+            .unwrap();
 
         let looked = store
             .session_id_for_alias("junie", "junie-48372")
@@ -1309,11 +1370,15 @@ mod tests {
                 .is_none()
         );
 
-        store.end_session(sid, 2000).unwrap();
+        // Vendor session end is metadata — it must NOT end the runtime session
+        // (the agent process may still be alive).
+        store
+            .end_vendor_alias("junie", "junie-48372", 2000)
+            .unwrap();
         assert_eq!(
             store.session_record(sid).unwrap().unwrap().ended_at,
-            Some(2000),
-            "explicit end marks the session ended"
+            None,
+            "vendor session_end must not end the runtime session"
         );
 
         // Same process invocation is idempotent: one session, one alias.

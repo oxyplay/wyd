@@ -59,7 +59,7 @@ enum Subcmd {
     },
     /// Explain which session owns a process (from recorded provenance)
     Why { pid: u32 },
-    /// Serve the local read-only Unix-socket API
+    /// Serve the local runtime API (read + vendor registration)
     Serve,
     /// Run an MCP server over stdio (for coding agents)
     Mcp,
