@@ -1300,7 +1300,14 @@ mod tests {
             .unwrap()
             .expect("alias resolves to the Wyd session");
         assert_eq!(looked, sid);
-        assert!(store.session_record(sid).unwrap().unwrap().ended_at.is_none());
+        assert!(
+            store
+                .session_record(sid)
+                .unwrap()
+                .unwrap()
+                .ended_at
+                .is_none()
+        );
 
         store.end_session(sid, 2000).unwrap();
         assert_eq!(
@@ -1310,7 +1317,9 @@ mod tests {
         );
 
         // Same process invocation is idempotent: one session, one alias.
-        let again = store.ensure_session(&boot, "junie", 100, 500, 2000).unwrap();
+        let again = store
+            .ensure_session(&boot, "junie", 100, 500, 2000)
+            .unwrap();
         assert_eq!(again, sid);
     }
 }
