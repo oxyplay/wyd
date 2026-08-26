@@ -53,8 +53,6 @@ impl ProcessInfo {
     }
 }
 
-// ponytail: consumed by steps 3–4 (sessions/exact ownership); dead until wired.
-#[allow(dead_code)]
 /// Stable identity of one observed process, valid only when `start_time != 0`.
 ///
 /// Never identity a process by `pid` alone: PIDs are reused. `boot_id` +
@@ -66,7 +64,6 @@ pub struct ProcessIdentity {
     pub start_time: u64,
 }
 
-#[allow(dead_code)]
 impl ProcessIdentity {
     /// Construct from a live process. Returns `None` when `start_time == 0`
     /// (identity unavailable → live-only attribution, never persisted).

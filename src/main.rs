@@ -285,17 +285,21 @@ fn print_session_owner(store: &store::RuntimeStore, exp: &store::Explanation) {
             "attribution:    {} (resolver v{})",
             d.verdict, d.resolver_version
         );
+        if let Some(w) = d.winner_session {
+            println!("winner:         session {w}");
+        }
         for c in &d.candidates {
             if c.rejected_reason.is_some() {
                 continue;
             }
             println!(
-                "  candidate {}: anchor {} {}{}{} = {}",
+                "  candidate {}: anchor {} {}{}{}{} = {}",
                 c.session,
                 c.anchor_kind,
                 c.anchor_score,
                 sign(c.project_support),
                 sign(c.temporal_support),
+                sign(c.relationship_support),
                 c.total,
             );
         }

@@ -1,7 +1,3 @@
-// ponytail: foundation types consumed by steps 6–7 of the ownership plan;
-// dead until wired into the collector.
-#![allow(dead_code)]
-
 //! Exact, observed resource ownership over the existing `RuntimeItem` forest.
 //!
 //! `group()` remains the source of logical resources; this module only reads

@@ -1,6 +1,3 @@
-// ponytail: phase-2 seam; dead until wired into the collector.
-#![allow(dead_code)]
-
 //! Deterministic resolver rule table (v1).
 //!
 //! These are deterministic v1 heuristic weights, **not** statistically

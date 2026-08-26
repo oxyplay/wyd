@@ -1,7 +1,3 @@
-// ponytail: foundation types consumed by steps 4–7 of the ownership plan;
-// dead until wired into the collector.
-#![allow(dead_code)]
-
 //! Runtime session identity and model.
 //!
 //! A Wyd session is **one observed invocation of an agent runtime process** —
@@ -56,6 +52,9 @@ pub struct RuntimeSession {
     pub root: ProcessIdentity,
     pub project: Option<Project>,
     pub started_at: u64,
+    /// ponytail: not yet read by live code; persisted via `now` in
+    /// `apply_ownership`. Kept for the future session view.
+    #[allow(dead_code)]
     pub last_seen_at: u64,
     pub ended_at: Option<u64>,
 }
@@ -72,10 +71,6 @@ impl RuntimeSession {
             last_seen_at: now,
             ended_at: None,
         }
-    }
-
-    pub fn ended(&self) -> bool {
-        self.ended_at.is_some()
     }
 }
 
@@ -160,7 +155,6 @@ mod tests {
         let s = RuntimeSession::new("claude", root(boot(1), 100, 1000), None, 5000);
         assert_eq!(s.started_at, 1000, "started_at = process start_time");
         assert_eq!(s.last_seen_at, 5000);
-        assert!(!s.ended());
         assert_eq!(s.ended_at, None);
     }
 }

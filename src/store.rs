@@ -1,7 +1,3 @@
-// ponytail: consumed by step 8 (restore) and the collector wiring; dead until
-// then.
-#![allow(dead_code)]
-
 //! Durable runtime ownership store (SQLite, local).
 //!
 //! Persists exactly what Wyd observed: sessions, owned resources, their
@@ -26,7 +22,6 @@ const SCHEMA_VERSION: i64 = 1;
 /// Local SQLite store for runtime ownership provenance.
 pub struct RuntimeStore {
     conn: Connection,
-    path: PathBuf,
 }
 
 impl RuntimeStore {
@@ -36,21 +31,16 @@ impl RuntimeStore {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path).map_err(err)?;
-        let store = Self {
-            conn,
-            path: path.to_path_buf(),
-        };
+        let store = Self { conn };
         store.init()?;
         Ok(store)
     }
 
     /// In-memory store, for tests.
+    #[cfg(test)]
     pub fn open_in_memory() -> io::Result<Self> {
         let conn = Connection::open_in_memory().map_err(err)?;
-        let store = Self {
-            conn,
-            path: PathBuf::from(":memory:"),
-        };
+        let store = Self { conn };
         store.init()?;
         Ok(store)
     }
@@ -609,29 +599,29 @@ impl RuntimeStore {
         pid: u32,
         start_time: u64,
     ) -> io::Result<Option<Explanation>> {
+        let Some(owner) = self.owning_session_for_process(boot_id, pid, start_time)? else {
+            return Ok(None);
+        };
         let boot = boot_id.to_le_bytes().to_vec();
-        let row: Option<(i64, i64)> = self
+        let resource_id: Option<i64> = self
             .conn
             .query_row(
-                "SELECT resource_id, session_id FROM (
-                    SELECT m.resource_id, o.session_id FROM resource_members m
-                    JOIN exact_ownership o ON o.resource_id = m.resource_id
+                "SELECT resource_id FROM (
+                    SELECT m.resource_id FROM resource_members m
                     WHERE m.boot_id = ?1 AND m.pid = ?2 AND m.start_time = ?3
                     UNION
-                    SELECT r.resource_id, o.session_id FROM resources r
-                    JOIN exact_ownership o ON o.resource_id = r.resource_id
+                    SELECT r.resource_id FROM resources r
                     WHERE r.root_boot_id = ?1 AND r.root_pid = ?2
                       AND r.root_start_time = ?3
                 )",
                 params![boot, pid as i64, start_time as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .optional()
             .map_err(err)?;
-        let Some((resource_id, session_id)) = row else {
+        let Some(resource_id) = resource_id else {
             return Ok(None);
         };
-        let owner = RuntimeSessionId::from_u64(session_id as u64);
         let session = self
             .session_record(owner)?
             .ok_or_else(|| io::Error::other("ownership references a missing session row"))?;
@@ -643,6 +633,7 @@ impl RuntimeStore {
     }
 
     /// How many decisions have been persisted for a resource.
+    #[cfg(test)]
     pub fn decision_count(&self, resource_id: u64) -> io::Result<u64> {
         let n: i64 = self
             .conn

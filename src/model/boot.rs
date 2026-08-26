@@ -1,7 +1,3 @@
-// ponytail: foundation types consumed by steps 2–4 of the ownership plan;
-// dead until wired into the collector.
-#![allow(dead_code)]
-
 //! Boot identity and the platform boot fingerprint it resolves from.
 //!
 //! A `ProcessIdentity` is only meaningful while the machine boot it belongs
@@ -62,6 +58,9 @@ impl fmt::Display for BootId {
 /// directly; macOS's `kern.bootsessionuuid` is likewise stable per boot.
 /// `kern.boottime` is a clock-derived timestamp that can drift under NTP and
 /// must be mapped to a persisted UUID — kept only as a fallback.
+// ponytail: cross-platform type — each build constructs only its platform's
+// variant, so the others are legitimately absent from any single target.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BootEpoch {
     /// Linux `/proc/sys/kernel/random/boot_id`, as an unsigned 128-bit int.

@@ -1,7 +1,3 @@
-// ponytail: phase-2 seam; dead until wired into the collector (attribution
-// pass + store persistence).
-#![allow(dead_code)]
-
 //! Deterministic ownership resolver for resources whose exact ancestry is
 //! unavailable — re-parented, detached, or never directly observed.
 //!
@@ -16,6 +12,10 @@ use super::rules::RESOLVER_VERSION;
 pub use super::rules::ResolverRules;
 
 /// Why a session is a candidate owner. Never project/timing alone.
+// ponytail: live attribution only produces `PersistedPrevious`; the other
+// anchors are contract-defined and arrive with explicit registration /
+// propagation wiring.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorKind {
     /// Future vendor registration. Strongest.
@@ -119,11 +119,12 @@ pub fn resolve(rules: &ResolverRules, inputs: Vec<CandidateInput>) -> Attributio
 
         let project_support = project_support(rules, &input);
         let temporal_support = temporal_support(rules, input.start_delta_secs);
-        let relationship_support = if input.tool_relationship {
+        let relationship_support = (if input.tool_relationship {
             rules.relationship_support
         } else {
             0
-        };
+        })
+        .min(rules.relationship_cap);
 
         let total = anchor_score
             .saturating_add(project_support)
