@@ -511,10 +511,250 @@ impl RuntimeStore {
         tx.commit().map_err(err)?;
         Ok(())
     }
+
+    /// All known sessions (including ended, pending GC).
+    pub fn sessions(&self) -> io::Result<Vec<SessionRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, agent, project, started_at, last_seen_at, ended_at
+                 FROM sessions",
+            )
+            .map_err(err)?;
+        let rows: rusqlite::Result<Vec<_>> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .map_err(err)?
+            .collect();
+        drop(stmt);
+        rows.map(|v| {
+            v.into_iter()
+                .map(
+                    |(id, agent, project, started, last_seen, ended)| SessionRecord {
+                        id: RuntimeSessionId::from_u64(id as u64),
+                        agent,
+                        project,
+                        started_at: started as u64,
+                        last_seen_at: last_seen as u64,
+                        ended_at: ended.map(|e| e as u64),
+                    },
+                )
+                .collect()
+        })
+        .map_err(err)
+    }
+
+    /// One session's durable record, or `None`.
+    pub fn session_record(&self, id: RuntimeSessionId) -> io::Result<Option<SessionRecord>> {
+        let row: Option<SessionRow> = self
+            .conn
+            .query_row(
+                "SELECT agent, project, started_at, last_seen_at, ended_at
+                 FROM sessions WHERE session_id = ?1",
+                params![id.as_u64() as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        Ok(row.map(
+            |(agent, project, started, last_seen, ended)| SessionRecord {
+                id,
+                agent,
+                project,
+                started_at: started as u64,
+                last_seen_at: last_seen as u64,
+                ended_at: ended.map(|e| e as u64),
+            },
+        ))
+    }
+
+    /// The session whose root is exactly this process invocation, if any.
+    /// Used by `wyd why` for an agent-root pid.
+    pub fn session_for_root(
+        &self,
+        boot_id: &BootId,
+        pid: u32,
+        start_time: u64,
+    ) -> io::Result<Option<SessionRecord>> {
+        let boot = boot_id.to_le_bytes().to_vec();
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM sessions
+                 WHERE boot_id = ?1 AND root_pid = ?2 AND root_start_time = ?3",
+                params![boot, pid as i64, start_time as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        match id {
+            Some(id) => self.session_record(RuntimeSessionId::from_u64(id as u64)),
+            None => Ok(None),
+        }
+    }
+
+    /// Which known resource owns a process invocation, plus that session —
+    /// the restore/`wyd why` primitive.
+    pub fn explain_process(
+        &self,
+        boot_id: &BootId,
+        pid: u32,
+        start_time: u64,
+    ) -> io::Result<Option<Explanation>> {
+        let boot = boot_id.to_le_bytes().to_vec();
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT resource_id, session_id FROM (
+                    SELECT m.resource_id, o.session_id FROM resource_members m
+                    JOIN exact_ownership o ON o.resource_id = m.resource_id
+                    WHERE m.boot_id = ?1 AND m.pid = ?2 AND m.start_time = ?3
+                    UNION
+                    SELECT r.resource_id, o.session_id FROM resources r
+                    JOIN exact_ownership o ON o.resource_id = r.resource_id
+                    WHERE r.root_boot_id = ?1 AND r.root_pid = ?2
+                      AND r.root_start_time = ?3
+                )",
+                params![boot, pid as i64, start_time as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        let Some((resource_id, session_id)) = row else {
+            return Ok(None);
+        };
+        let owner = RuntimeSessionId::from_u64(session_id as u64);
+        let session = self
+            .session_record(owner)?
+            .ok_or_else(|| io::Error::other("ownership references a missing session row"))?;
+        Ok(Some(Explanation {
+            resource_id: resource_id as u64,
+            owner,
+            session,
+        }))
+    }
+
+    /// The most recent resolver decision for a resource, if any.
+    pub fn latest_decision(&self, resource_id: u64) -> io::Result<Option<DecisionRecord>> {
+        let head: Option<(i64, i64, String, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT decision_id, resolver_version, verdict, winner_session_id
+                 FROM attribution_decisions WHERE resource_id = ?1
+                 ORDER BY observed_at DESC, decision_id DESC LIMIT 1",
+                params![resource_id as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        let Some((decision_id, version, verdict, winner)) = head else {
+            return Ok(None);
+        };
+        let candidates = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT session_id, anchor_kind, anchor_score, project_score,
+                            temporal_score, relationship_score, total_score,
+                            rejected_reason
+                     FROM attribution_candidates WHERE decision_id = ?1
+                     ORDER BY total_score DESC",
+                )
+                .map_err(err)?;
+            let rows: rusqlite::Result<Vec<_>> = stmt
+                .query_map(params![decision_id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                    ))
+                })
+                .map_err(err)?
+                .collect();
+            drop(stmt);
+            rows.map_err(err)?
+                .into_iter()
+                .map(
+                    |(sid, anchor, a, p, t, rel, total, rejected)| CandidateRecord {
+                        session: RuntimeSessionId::from_u64(sid as u64),
+                        anchor_kind: anchor,
+                        anchor_score: a as u8,
+                        project_support: p as u8,
+                        temporal_support: t as u8,
+                        relationship_support: rel as u8,
+                        total: total as u8,
+                        rejected_reason: rejected,
+                    },
+                )
+                .collect()
+        };
+        Ok(Some(DecisionRecord {
+            resolver_version: version as u32,
+            verdict,
+            winner_session: winner.map(|w| RuntimeSessionId::from_u64(w as u64)),
+            candidates,
+        }))
+    }
+}
+
+/// One session's durable record.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub id: RuntimeSessionId,
+    pub agent: String,
+    pub project: Option<String>,
+    pub started_at: u64,
+    pub last_seen_at: u64,
+    pub ended_at: Option<u64>,
+}
+
+/// Which resource owns a process invocation, and that session.
+#[derive(Debug, Clone)]
+pub struct Explanation {
+    pub resource_id: u64,
+    pub owner: RuntimeSessionId,
+    pub session: SessionRecord,
+}
+
+/// One resolver decision with its full candidate set (§16).
+#[derive(Debug, Clone)]
+pub struct DecisionRecord {
+    pub resolver_version: u32,
+    pub verdict: String,
+    pub winner_session: Option<RuntimeSessionId>,
+    pub candidates: Vec<CandidateRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidateRecord {
+    pub session: RuntimeSessionId,
+    pub anchor_kind: String,
+    pub anchor_score: u8,
+    pub project_support: u8,
+    pub temporal_support: u8,
+    pub relationship_support: u8,
+    pub total: u8,
+    pub rejected_reason: Option<String>,
 }
 
 /// `(resource_id, boot_id/root_boot_id, pid, start_time)` rows.
 type Quad = (i64, Vec<u8>, i64, i64);
+
+/// `(agent, project, started_at, last_seen_at, ended_at)` row.
+type SessionRow = (String, Option<String>, i64, i64, Option<i64>);
 
 fn quads(conn: &Connection, sql: &str, arg: Option<&i64>) -> io::Result<Vec<Quad>> {
     query_rows(conn, sql, arg, |r| {

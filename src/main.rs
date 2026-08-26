@@ -19,7 +19,9 @@ use std::time::Duration;
 use clap::Parser;
 use classify::{ProjectCache, attach, group};
 use model::RuntimeSnapshot;
+use model::process::ProcessIdentity;
 use parking_lot::RwLock;
+use platform::BootIdentityProvider;
 use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 
 /// See what your dev sessions left running.
@@ -53,6 +55,8 @@ enum Subcmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Explain which session owns a process (from recorded provenance)
+    Why { pid: u32 },
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -110,6 +114,7 @@ fn main() -> io::Result<()> {
     match cli.command {
         Some(Subcmd::Upgrade) => run_upgrade(),
         Some(Subcmd::Prune { dry_run, yes }) => run_prune(dry_run, yes),
+        Some(Subcmd::Why { pid }) => run_why(pid),
         None => {
             if cli.json || cli.plain {
                 run_cli(cli)
@@ -194,11 +199,143 @@ fn mb(bytes: u64) -> String {
     }
 }
 
+/// `wyd --json sessions`: list recorded sessions from the store.
+fn run_sessions_json() -> io::Result<()> {
+    let store = store::RuntimeStore::open(&store::RuntimeStore::default_path())?;
+    let sessions = store.sessions()?;
+    let arr: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id.to_string(),
+                "agent": s.agent,
+                "project": s.project,
+                "state": if s.ended_at.is_some() { "ended" } else { "active" },
+                "started_at": s.started_at,
+                "last_seen_at": s.last_seen_at,
+                "ended_at": s.ended_at,
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&arr).unwrap());
+    Ok(())
+}
+
+/// `wyd why <pid>`: reconstruct a process's origin session and attribution
+/// from durable provenance (contract §15).
+fn run_why(pid: u32) -> io::Result<()> {
+    let mut store = store::RuntimeStore::open(&store::RuntimeStore::default_path())?;
+    let now = now();
+    let boot = store.boot_id_for_epoch(platform::SystemBoot.current_boot_epoch()?, now)?;
+
+    // Resolve start_time from the live process.
+    let mut scanner = SysinfoProcessScanner::new();
+    let processes = scanner
+        .scan()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let Some(proc) = processes.iter().find(|p| p.pid == pid) else {
+        return Err(io::Error::other(format!("pid {pid} is not running")));
+    };
+    let Some(identity) = ProcessIdentity::from_process(&boot, proc) else {
+        return Err(io::Error::other(format!(
+            "pid {pid} has no stable identity (start_time unavailable)"
+        )));
+    };
+
+    println!("{} pid {pid}", proc.label());
+    match store.explain_process(&boot, pid, identity.start_time)? {
+        Some(exp) => {
+            print_session_owner(&store, &exp);
+        }
+        None => {
+            // Maybe the pid IS a session root.
+            match store.session_for_root(&boot, pid, identity.start_time)? {
+                Some(s) => println!(
+                    "session root of: {} {} ({} since {})",
+                    s.agent,
+                    s.id,
+                    if s.ended_at.is_some() {
+                        "ended"
+                    } else {
+                        "active"
+                    },
+                    s.started_at
+                ),
+                None => println!("pid {pid}: no recorded owner"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_session_owner(store: &store::RuntimeStore, exp: &store::Explanation) {
+    let s = &exp.session;
+    println!("origin session: {} {}", s.agent, s.id);
+    if let Some(p) = &s.project {
+        println!("project:        {p}");
+    }
+    match s.ended_at {
+        Some(e) => println!("session:        ended at {e}"),
+        None => println!("session:        active (since {})", s.started_at),
+    }
+
+    if let Ok(Some(d)) = store.latest_decision(exp.resource_id) {
+        println!(
+            "attribution:    {} (resolver v{})",
+            d.verdict, d.resolver_version
+        );
+        for c in &d.candidates {
+            if c.rejected_reason.is_some() {
+                continue;
+            }
+            println!(
+                "  candidate {}: anchor {} {}{}{} = {}",
+                c.session,
+                c.anchor_kind,
+                c.anchor_score,
+                sign(c.project_support),
+                sign(c.temporal_support),
+                c.total,
+            );
+        }
+    }
+}
+
+fn sign(v: u8) -> String {
+    if v == 0 {
+        String::new()
+    } else {
+        format!(" +{v}")
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn run_cli(cli: Cli) -> io::Result<()> {
     if cli.json && cli.plain {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "use only one of --json or --plain",
+        ));
+    }
+    if cli
+        .filter
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+        == Some("sessions")
+    {
+        if cli.json {
+            return run_sessions_json();
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "`sessions` requires --json",
         ));
     }
     let filter = output::Filter::parse(cli.filter.as_deref())
