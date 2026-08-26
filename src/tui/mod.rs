@@ -741,6 +741,43 @@ mod tests {
         );
     }
 
+    /// The status column must explicitly separate the three runtime classes:
+    /// leftover / persistent / owned by a live session.
+    #[test]
+    fn status_column_separates_leftover_persistent_owned() {
+        let mut snap = fixture_snapshot();
+        // MCP under the live agent: owned, then flipped to persistent.
+        snap.logical_items[0].children[0].state = model::RuntimeState::Persistent;
+        // A detached MCP with no owner: leftover.
+        snap.logical_items.push(model::RuntimeItem {
+            category: model::Category::Mcp,
+            display_name: "playwright-mcp".into(),
+            root_pid: Some(900),
+            process_ids: vec![900],
+            memory_bytes: 1 << 20,
+            cpu_percent: 0.0,
+            state: model::RuntimeState::Suspicious,
+            suspicion: Some(model::Suspicion {
+                score: 75,
+                reasons: vec![model::SuspicionReason::OwningAgentMissing],
+            }),
+            ports: vec![],
+            project: None,
+            children: vec![],
+        });
+        let backend = TestBackend::new(180, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        for status in ["owned", "persistent", "leftover"] {
+            assert!(rendered.contains(status), "missing {status:?}:\n{rendered}");
+        }
+        // Leftover keeps its warn marker; the owned Chromium is still there.
+        assert!(rendered.contains("⚠ playwright-mcp"), "{rendered}");
+        assert!(rendered.contains("Chromium"), "{rendered}");
+    }
+
     #[test]
     fn details_show_url_for_real_socket() {
         let mut snap = fixture_snapshot();

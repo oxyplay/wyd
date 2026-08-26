@@ -415,9 +415,12 @@ fn runtime_lines(
         .enumerate()
         .map(|(idx, row)| {
             let line = match row {
-                Row::Item { item, depth, last } => {
-                    item_line(item, *depth, *last, &by_pid, &app.marked, idx, nw)
-                }
+                Row::Item {
+                    item,
+                    depth,
+                    last,
+                    owned,
+                } => item_line(item, *depth, *last, *owned, &by_pid, &app.marked, idx, nw),
                 Row::Docker(res) => docker_line(res, &app.marked, idx, nw),
                 Row::DockerAgg {
                     count,
@@ -605,10 +608,14 @@ fn pwd_along(
     None
 }
 
+// ponytail: 8 render-context args beat a context struct for one call site
+// family; clippy's 7-arg default is a heuristic, not a smell here.
+#[allow(clippy::too_many_arguments)]
 fn item_line(
     item: &RuntimeItem,
     depth: usize,
     last: bool,
+    owned: bool,
     by_pid: &HashMap<u32, &ProcessInfo>,
     marked: &HashSet<usize>,
     idx: usize,
@@ -616,8 +623,11 @@ fn item_line(
 ) -> Line<'static> {
     let indent = "  ".repeat(depth);
     let leftover = item.state == RuntimeState::Suspicious;
+    let persistent = item.state == RuntimeState::Persistent;
     let marker = if leftover && depth == 0 {
         "⚠ "
+    } else if persistent && depth == 0 {
+        "◆ "
     } else if depth == 0 {
         "● "
     } else if last {
@@ -633,19 +643,54 @@ fn item_line(
     let prefix = format!("{indent}{star}{marker}");
     let left = pad_name(&format!("{prefix}{}", item.display_name), "", nw);
     let cpu = format!("{:.1}%", item.cpu_percent);
+    // Explicit status classes: leftover / persistent / owned by a live
+    // session. Plain running items carry no status word.
+    let status = if leftover {
+        "leftover"
+    } else if persistent {
+        "persistent"
+    } else if owned {
+        "owned"
+    } else {
+        ""
+    };
     let mut line = cols(
         &left,
         &role(item),
         &origin(item, by_pid),
         &fmt_bytes(item.memory_bytes),
         &cpu,
-        "",
+        status,
         &age,
     );
     if leftover && let Some(span) = line.spans.get_mut(0) {
         span.style = warn();
     }
+    if owned
+        && !leftover
+        && !persistent
+        && let Some(span) = line.spans.get_mut(0)
+    {
+        span.style = Style::new().fg(Color::Green);
+    }
     line
+}
+
+/// True when `target` is nested under a live agent item — a running session
+/// provably spawned it. The list threads this through the row walk; the
+/// details popup re-derives it from the tree.
+fn under_live_agent(roots: &[RuntimeItem], target: &RuntimeItem) -> bool {
+    fn walk(items: &[RuntimeItem], target: &RuntimeItem, under: bool) -> bool {
+        items.iter().any(|i| {
+            (under && std::ptr::eq(i, target))
+                || walk(
+                    &i.children,
+                    target,
+                    under || i.category == crate::model::Category::Agent,
+                )
+        })
+    }
+    walk(roots, target, false)
 }
 
 fn docker_line(
@@ -782,9 +827,10 @@ fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot, width: usize) -> Vec
     let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
     let proc = item.root_pid.and_then(|pid| by_pid.get(&pid).copied());
     let nw = name_width(width);
+    let owned = under_live_agent(&snap.logical_items, item);
     let mut lines = vec![
         col_header(width),
-        item_line(item, 0, true, &by_pid, &HashSet::new(), 0, nw),
+        item_line(item, 0, true, owned, &by_pid, &HashSet::new(), 0, nw),
         Line::from(""),
     ];
     for p in &item.ports {
@@ -969,6 +1015,18 @@ pub fn help_lines() -> Vec<Line<'static>> {
             .map(Line::from),
         )
         .chain([
+            Line::from(format!(
+                "{} / {}       terminate / force kill (y confirms)",
+                k.kill, k.force_kill
+            )),
+            Line::from(format!(
+                "{}            stop running docker container",
+                k.stop
+            )),
+            Line::from(format!(
+                "{}            clean docker (volumes need D)",
+                k.clean
+            )),
             Line::from(format!("{}            prune anonymous volumes", k.prune)),
             Line::from(format!("{}            open server URL from details", "o")),
             Line::from(format!("{}            refresh", k.refresh)),

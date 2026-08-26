@@ -49,6 +49,9 @@ pub enum Row<'a> {
         item: &'a RuntimeItem,
         depth: usize,
         last: bool,
+        /// Directly under a live agent in the runtime tree (a session is
+        /// running that spawned this resource).
+        owned: bool,
     },
     Docker(&'a DockerResource),
     /// One summary row for all anonymous unused volumes.
@@ -303,7 +306,16 @@ pub fn rows<'a>(
             }
         }
         Section::Sessions => collect_sessions(&snap.sessions, q, &mut out),
-        other => collect_items(&snap.logical_items, 0, false, other, project, q, &mut out),
+        other => collect_items(
+            &snap.logical_items,
+            0,
+            false,
+            false,
+            other,
+            project,
+            q,
+            &mut out,
+        ),
     }
     out
 }
@@ -316,10 +328,14 @@ fn collect_sessions<'a>(sessions: &'a [SessionInfo], q: &str, out: &mut Vec<Row<
     }
 }
 
+// ponytail: filter context + tree walk state; a struct would touch every
+// recursive call for no gain.
+#[allow(clippy::too_many_arguments)]
 fn collect_items<'a>(
     items: &'a [RuntimeItem],
     depth: usize,
     inside: bool,
+    under_agent: bool,
     section: Section,
     project: Option<&str>,
     q: &str,
@@ -339,11 +355,13 @@ fn collect_items<'a>(
             item,
             depth,
             last: i == last,
+            owned: under_agent,
         });
         collect_items(
             &item.children,
             depth + 1,
             inside || section_match(item, section),
+            under_agent || item.category == Category::Agent,
             section,
             project,
             q,
