@@ -360,7 +360,7 @@ mod tests {
                 Some(1),
                 "node",
                 vec![
-                    format!("npm exec @github/copilot-language-server@^1.408.0 --stdio"),
+                    "npm exec @github/copilot-language-server@^1.408.0 --stdio".to_string(),
                     format!("PWD={}", root.display()),
                 ],
             ),

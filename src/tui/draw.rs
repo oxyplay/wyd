@@ -303,8 +303,8 @@ fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
                 "enter".into(),
                 "/ filter".into(),
                 "p projects".into(),
-                format!("? help"),
-                format!("q quit"),
+                "? help".into(),
+                "q quit".into(),
             ];
             match app.rows(snap).get(app.selected) {
                 Some(Row::Item { .. }) => {

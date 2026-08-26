@@ -260,7 +260,7 @@ fn temporal_support(rules: &ResolverRules, delta: Option<u64>) -> u8 {
 fn select(rules: &ResolverRules, candidates: Vec<AttributionCandidate>) -> AttributionDecision {
     let mut eligible: Vec<&AttributionCandidate> =
         candidates.iter().filter(|c| c.rejected.is_none()).collect();
-    eligible.sort_by(|a, b| b.total.cmp(&a.total));
+    eligible.sort_by_key(|a| std::cmp::Reverse(a.total));
 
     let verdict = match eligible.first() {
         None => Verdict::Unknown,
