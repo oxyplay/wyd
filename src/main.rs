@@ -79,6 +79,7 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
             attach(&mut logical_items, &processes, &ports, &mut projects);
             classify::mark(&mut logical_items, &processes, config::Config::global());
             tracker.record(&processes, &logical_items);
+            tracker.layer_session_leftovers(&mut logical_items, &processes);
             version += 1;
             if version == 1 || version.is_multiple_of(3) {
                 docker = Arc::new(crate::scanner::docker::scan_blocking());

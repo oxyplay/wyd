@@ -44,6 +44,7 @@ pub enum SuspicionReason {
     HeadlessBrowserDetached,
     LongRunningDevServer,
     LongRunningWorker,
+    SessionOwnerEnded,
 }
 
 impl SuspicionReason {
@@ -55,6 +56,7 @@ impl SuspicionReason {
             Self::HeadlessBrowserDetached => "detached headless browser",
             Self::LongRunningDevServer => "dev server older than threshold",
             Self::LongRunningWorker => "background worker older than threshold",
+            Self::SessionOwnerEnded => "owning session ended",
         }
     }
 }
