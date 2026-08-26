@@ -8,7 +8,7 @@
 //! the produced tree and records which session each resource provably
 //! originated from. No heuristic scoring — only directly observed ancestry.
 
-mod resolver;
+pub mod resolver;
 mod rules;
 
 use crate::model::process::ProcessIdentity;

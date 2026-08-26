@@ -12,6 +12,7 @@
 //! process identity is `boot_id + pid + start_time`, not PID alone.
 
 use crate::classify::ownership::OwnershipResult;
+use crate::classify::ownership::resolver::AttributionDecision;
 use crate::model::boot::{BootEpoch, BootId};
 use crate::model::process::ProcessIdentity;
 use crate::model::session::RuntimeSessionId;
@@ -115,6 +116,26 @@ impl RuntimeStore {
             CREATE TABLE IF NOT EXISTS exact_ownership (
                 resource_id INTEGER PRIMARY KEY,
                 session_id INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS attribution_decisions (
+                decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_id INTEGER NOT NULL,
+                observed_at INTEGER NOT NULL,
+                resolver_version INTEGER NOT NULL,
+                verdict TEXT NOT NULL,
+                winner_session_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS attribution_candidates (
+                decision_id INTEGER NOT NULL,
+                session_id INTEGER NOT NULL,
+                anchor_kind TEXT NOT NULL,
+                anchor_score INTEGER NOT NULL,
+                project_score INTEGER NOT NULL,
+                temporal_score INTEGER NOT NULL,
+                relationship_score INTEGER NOT NULL,
+                total_score INTEGER NOT NULL,
+                rejected_reason TEXT,
+                PRIMARY KEY (decision_id, session_id)
             );
             COMMIT;",
             )
@@ -440,6 +461,56 @@ impl RuntimeStore {
         tx.commit().map_err(err)?;
         Ok(())
     }
+
+    /// Persist one resolver decision with its full candidate set (§16).
+    ///
+    /// This is the durable layer: verdict + candidate scores + resolver
+    /// version never expire. Raw evidence (best-effort) is not stored here.
+    pub fn persist_decision(
+        &mut self,
+        resource_id: u64,
+        d: &AttributionDecision,
+        now: u64,
+    ) -> io::Result<()> {
+        let tx = self.conn.transaction().map_err(err)?;
+        tx.execute(
+            "INSERT INTO attribution_decisions
+               (resource_id, observed_at, resolver_version, verdict, winner_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                resource_id as i64,
+                now as i64,
+                d.resolver_version as i64,
+                format!("{:?}", d.verdict),
+                d.winner.map(|w| w.as_u64() as i64),
+            ],
+        )
+        .map_err(err)?;
+        let decision_id = tx.last_insert_rowid();
+        for c in &d.candidates {
+            tx.execute(
+                "INSERT INTO attribution_candidates
+                   (decision_id, session_id, anchor_kind, anchor_score,
+                    project_score, temporal_score, relationship_score,
+                    total_score, rejected_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    decision_id,
+                    c.session.as_u64() as i64,
+                    format!("{:?}", c.anchor),
+                    c.anchor_score as i64,
+                    c.project_support as i64,
+                    c.temporal_support as i64,
+                    c.relationship_support as i64,
+                    c.total as i64,
+                    c.rejected.map(|r| format!("{:?}", r)),
+                ],
+            )
+            .map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+        Ok(())
+    }
 }
 
 /// `(resource_id, boot_id/root_boot_id, pid, start_time)` rows.
@@ -714,6 +785,67 @@ mod tests {
                 .is_none(),
             "fully-dead provenance must be collected"
         );
+    }
+
+    #[test]
+    fn persists_resolver_decision_and_candidates() {
+        use crate::classify::ownership::resolver::{
+            AnchorKind, CandidateInput, ResolverRules, resolve,
+        };
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+
+        let sid = RuntimeSessionId::from_u64(1);
+        let c = CandidateInput {
+            session: sid,
+            anchor: Some(AnchorKind::Descendant),
+            anchor_score: None,
+            propagate_cap: None,
+            exact_cwd: true,
+            same_git_root: false,
+            start_delta_secs: Some(7),
+            tool_relationship: true,
+            predates_session: false,
+            reaches_other_agent: false,
+        };
+        let decision = resolve(&ResolverRules::v1(), vec![c]);
+        assert_eq!(
+            decision.verdict,
+            crate::classify::ownership::resolver::Verdict::Owned
+        );
+
+        store.persist_decision(42, &decision, 5000).unwrap();
+
+        let verdict: String = store
+            .conn
+            .query_row(
+                "SELECT verdict FROM attribution_decisions WHERE resource_id = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict, "Owned");
+        let (winner, version): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT winner_session_id, resolver_version
+                 FROM attribution_decisions WHERE resource_id = 42",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(winner, 1);
+        assert_eq!(version, 1);
+        let (total, project): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT total_score, project_score FROM attribution_candidates
+                 WHERE session_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(total, 95, "worked example total must round-trip");
+        assert_eq!(project, 10);
     }
 
     #[test]
