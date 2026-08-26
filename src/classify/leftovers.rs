@@ -84,7 +84,12 @@ fn mark_one(
     {
         let age_h = now.saturating_sub(p.start_time) / 3600;
         if p.start_time > 0 && age_h >= cfg.leftovers.server_age_hours {
-            reasons.push(SuspicionReason::LongRunningDevServer);
+            let reason = if item.category == Category::Worker {
+                SuspicionReason::LongRunningWorker
+            } else {
+                SuspicionReason::LongRunningDevServer
+            };
+            reasons.push(reason);
             score += 20;
         }
     }
@@ -104,9 +109,13 @@ fn exempt(item: &RuntimeItem, by_pid: &HashMap<u32, &ProcessInfo>, cfg: &Config)
         return false;
     };
     let hay = p.hay();
-    // Homebrew in the *node* path is not a persistent service — leftover
-    // LSPs launched via brew-installed node must still score as leftovers.
-    if !matches!(item.category, Category::LanguageServer)
+    // Installed-by-Homebrew is not running-as-a-Homebrew-service: a binary
+    // under `/opt/homebrew/bin` proves nothing about persistence. An agent's
+    // ad-hoc `postgres -D /tmp/foo` must stay a session DB even though its
+    // binary lives in Homebrew. Same for `valet`/docker paths. Service
+    // persistence for databases is decided from ancestry below (launchd/
+    // systemd/init is pid 1) plus config, not from the executable path.
+    if !matches!(item.category, Category::LanguageServer | Category::Database)
         && (hay.contains("homebrew")
             || hay.contains("valet")
             || hay.contains("com.docker")
@@ -358,8 +367,9 @@ mod tests {
     #[test]
     fn agent_spawned_db_is_session_not_persistent() {
         // An agent's ad-hoc `postgres -D /tmp/test-db` is a session DB, not
-        // a persistent service — it must not be exempted.
-        let procs = vec![
+        // a persistent service — it must not be exempted even when its
+        // binary is installed via Homebrew (`/opt/homebrew/bin/postgres`).
+        let mut procs = vec![
             proc(1, None, "launchd", &["launchd"], 1),
             proc(10, Some(1), "omp", &["omp"], 100),
             proc(
@@ -370,6 +380,7 @@ mod tests {
                 100,
             ),
         ];
+        procs[2].executable = Some("/opt/homebrew/bin/postgres".into());
         let mut items = group(&procs);
         mark(&mut items, &procs, &Config::default());
         assert_eq!(items[0].category, Category::Agent);

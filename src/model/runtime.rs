@@ -43,6 +43,7 @@ pub enum SuspicionReason {
     McpOwnerMissing,
     HeadlessBrowserDetached,
     LongRunningDevServer,
+    LongRunningWorker,
 }
 
 impl SuspicionReason {
@@ -53,6 +54,7 @@ impl SuspicionReason {
             Self::McpOwnerMissing => "MCP without owner",
             Self::HeadlessBrowserDetached => "detached headless browser",
             Self::LongRunningDevServer => "dev server older than threshold",
+            Self::LongRunningWorker => "background worker older than threshold",
         }
     }
 }

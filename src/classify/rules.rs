@@ -183,7 +183,9 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
     if hay.contains("svelte-kit") || hay.contains("@sveltejs/kit") {
         return Some(dev(Category::DevServer, "svelte-kit"));
     }
-    if name_eq(&name, &argv0, "remix") || hay.contains("@remix-run") || hay.contains("react-router")
+    if name_eq(&name, &argv0, "remix")
+        || name_eq(&name, &argv0, "react-router")
+        || hay.contains("@remix-run")
     {
         return Some(dev(Category::DevServer, "remix"));
     }
@@ -203,22 +205,27 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
     {
         return Some(dev(Category::DevServer, "nest"));
     }
-    if hay.contains("puma") {
+    if Match::Token("puma").hit(&name, &argv0, &cmd, &exe, &hay) {
         return Some(dev(Category::DevServer, "puma"));
     }
     if name_eq(&name, &argv0, "rails") || hay.contains("rails s") {
         return Some(dev(Category::DevServer, "rails"));
     }
-    if hay.contains("phx.server") || hay.contains("phoenix") {
+    if Match::Contains("phx.server").hit(&name, &argv0, &cmd, &exe, &hay) {
         return Some(dev(Category::DevServer, "phoenix"));
     }
 
     // Background workers / watchers — agents start and forget these.
     if !pkg_manager {
-        if name_eq(&name, &argv0, "celery") || hay.contains("celery") && hay.contains("worker") {
+        if name_eq(&name, &argv0, "celery")
+            || Match::Token("celery").hit(&name, &argv0, &cmd, &exe, &hay)
+                && Match::Token("worker").hit(&name, &argv0, &cmd, &exe, &hay)
+        {
             return Some(dev(Category::Worker, "celery"));
         }
-        if name_eq(&name, &argv0, "sidekiq") || hay.contains("sidekiq") {
+        if name_eq(&name, &argv0, "sidekiq")
+            || Match::Token("sidekiq").hit(&name, &argv0, &cmd, &exe, &hay)
+        {
             return Some(dev(Category::Worker, "sidekiq"));
         }
         if name_eq(&name, &argv0, "horizon") || hay.contains("artisan horizon") {
@@ -227,7 +234,9 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         if hay.contains("queue:work") || hay.contains("artisan queue") {
             return Some(dev(Category::Worker, "laravel queue"));
         }
-        if name_eq(&name, &argv0, "nodemon") || hay.contains("nodemon") {
+        if name_eq(&name, &argv0, "nodemon")
+            || Match::Contains("node_modules/nodemon").hit(&name, &argv0, &cmd, &exe, &hay)
+        {
             return Some(dev(Category::Worker, "nodemon"));
         }
         if name_eq(&name, &argv0, "cargo-watch")
@@ -250,31 +259,33 @@ pub fn classify(p: &ProcessInfo) -> Option<Class> {
         }
     }
 
-    // Databases.
-    for (needle, display) in [
-        ("postgres", "postgres"),
-        ("postgresql", "postgres"),
-        ("postmaster", "postgres"),
-        ("mysqld", "mysql"),
-        ("mariadbd", "mariadb"),
-        ("redis-server", "redis"),
-        ("mongod", "mongodb"),
-        ("elasticsearch", "elasticsearch"),
-        ("opensearch", "opensearch"),
-        ("clickhouse-server", "clickhouse"),
-        ("cockroach", "cockroachdb"),
-        ("cassandra", "cassandra"),
-        ("memcached", "memcached"),
-        ("neo4j", "neo4j"),
-        ("qdrant", "qdrant"),
-        ("weaviate", "weaviate"),
-        ("milvus", "milvus"),
-        ("meilisearch", "meilisearch"),
-        ("typesense-server", "typesense"),
-        ("influxd", "influxdb"),
-        ("sqlservr", "sql server"),
+    // Databases — matched by exact binary name only. A substring match over
+    // the whole cmd+exe would misfire: `node ~/Work/qdrant-dashboard/
+    // server.js` contains "qdrant" and must not become a Qdrant database.
+    for (m, display) in [
+        (Match::Exact("postgres"), "postgres"),
+        (Match::Exact("postgresql"), "postgres"),
+        (Match::Exact("postmaster"), "postgres"),
+        (Match::Exact("mysqld"), "mysql"),
+        (Match::Exact("mariadbd"), "mariadb"),
+        (Match::Exact("redis-server"), "redis"),
+        (Match::Exact("mongod"), "mongodb"),
+        (Match::Exact("elasticsearch"), "elasticsearch"),
+        (Match::Exact("opensearch"), "opensearch"),
+        (Match::Exact("clickhouse-server"), "clickhouse"),
+        (Match::Exact("cockroach"), "cockroachdb"),
+        (Match::Exact("cassandra"), "cassandra"),
+        (Match::Exact("memcached"), "memcached"),
+        (Match::Exact("neo4j"), "neo4j"),
+        (Match::Exact("qdrant"), "qdrant"),
+        (Match::Exact("weaviate"), "weaviate"),
+        (Match::Exact("milvus"), "milvus"),
+        (Match::Exact("meilisearch"), "meilisearch"),
+        (Match::Exact("typesense-server"), "typesense"),
+        (Match::Exact("influxd"), "influxdb"),
+        (Match::Exact("sqlservr"), "sql server"),
     ] {
-        if name_eq(&name, &argv0, needle) || hay.contains(needle) {
+        if m.hit(&name, &argv0, &cmd, &exe, &hay) {
             return Some(Class {
                 category: Category::Database,
                 display_name: display.into(),
@@ -353,6 +364,35 @@ fn dev(category: Category, display_name: &str) -> Class {
 
 fn name_eq(name: &str, argv0: &str, exact: &str) -> bool {
     name == exact || argv0 == exact
+}
+
+/// How a signature matches a process. Substring matching over the joined
+/// cmd+exe is only safe for long, unambiguous needles: a stray path like
+/// `node ~/Work/qdrant-dashboard/server.js` contains "qdrant" and would
+/// otherwise be miscalled a Qdrant database. Short or common names must be
+/// matched as the exact binary name or a path/whitespace-delimited token.
+#[derive(Clone, Copy)]
+enum Match {
+    /// `name` or `argv0` equals the needle — the process *is* that binary.
+    Exact(&'static str),
+    /// The needle is a whole path/whitespace-delimited token in the command
+    /// or executable (e.g. `bundle exec sidekiq`).
+    Token(&'static str),
+    /// A long, unambiguous substring of the full command or executable.
+    Contains(&'static str),
+}
+
+impl Match {
+    fn hit(self, name: &str, argv0: &str, cmd: &str, exe: &str, hay: &str) -> bool {
+        match self {
+            Match::Exact(n) => name_eq(name, argv0, n),
+            Match::Token(n) => {
+                let is_token = |s: &str| s.split([' ', '\t', '/', '\\']).any(|t| t == n);
+                is_token(cmd) || is_token(exe)
+            }
+            Match::Contains(n) => hay.contains(n),
+        }
+    }
 }
 
 fn argv0_base(p: &ProcessInfo) -> String {
@@ -708,5 +748,68 @@ mod tests {
                 "{cmd:?} should be a dev server"
             );
         }
+    }
+
+    #[test]
+    fn stray_path_does_not_miscall_database_or_worker() {
+        // A node app whose *directory* happens to contain a DB/worker name
+        // must not be classified as that software — exact/token matching,
+        // not substring. It stays an honest UnknownDev, never a wrong call.
+        assert_ne!(
+            cat(proc(
+                "node",
+                &["node", "/Users/x/Work/qdrant-dashboard/server.js"],
+            ))
+            .map(|(c, _)| c),
+            Some(Category::Database),
+            "qdrant-dashboard path must not become a Qdrant database"
+        );
+        assert_ne!(
+            cat(proc("node", &["node", "/Users/x/puma-dashboard/server.js"])).map(|(c, _)| c),
+            Some(Category::DevServer),
+            "puma-dashboard path must not become a puma dev server"
+        );
+        assert_ne!(
+            cat(proc(
+                "node",
+                &["node", "/Users/x/sidekiq-dashboard/server.js"],
+            ))
+            .map(|(c, _)| c),
+            Some(Category::Worker),
+            "sidekiq-dashboard path must not become a sidekiq worker"
+        );
+        assert_ne!(
+            cat(proc("node", &["node", "/Users/x/nodemon-app/server.js"])).map(|(c, _)| c),
+            Some(Category::Worker),
+            "nodemon-app path must not become a nodemon worker"
+        );
+        assert_ne!(
+            cat(proc(
+                "node",
+                &["node", "/Users/x/phoenix-dashboard/server.js"],
+            ))
+            .map(|(c, _)| c),
+            Some(Category::DevServer),
+            "phoenix-dashboard path must not become a phoenix dev server"
+        );
+    }
+
+    #[test]
+    fn wrapper_invocation_is_token_matched() {
+        // `bundle exec sidekiq` has argv0 = bundle; the worker name is a
+        // token on the command line, not a substring of a path.
+        assert_eq!(
+            cat(proc("ruby", &["bundle", "exec", "sidekiq"])),
+            Some((Category::Worker, "sidekiq".into()))
+        );
+        assert_eq!(
+            cat(proc("celery", &["celery", "-A", "proj", "worker"])),
+            Some((Category::Worker, "celery".into()))
+        );
+        // Remix v2 ships its dev server as the `react-router` binary.
+        assert_eq!(
+            cat(proc("react-router", &["react-router", "dev"])),
+            Some((Category::DevServer, "remix".into()))
+        );
     }
 }
