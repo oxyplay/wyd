@@ -8,11 +8,11 @@ All notable changes to wyd.
 - **Explicit status classes in the TUI**: the status column now separates `leftover` (warn + `⚠`), `persistent` (`◆`), and `owned` (green, for resources under a live agent), instead of only highlighting leftovers.
 - **`wyd mcp` conformance test**: drives the real binary through the full stdio initialize-based handshake as a client, guarding the wire protocol against drift.
 - **Fixture-based tests** for classify / ownership / resolver, leftover reasons (agent alive, agent died, reparent-to-init), and a macOS regression that the boot id prefers the stable `kern.bootsessionuuid` over clock-derived `kern.boottime` (an NTP adjustment never reads as a new boot).
-- The `?` help screen now lists the kill / force-kill / stop / clean keys (previously omitted).
+- **Published to the MCP Registry** as `io.github.oxyplay/wyd` — the cargo package `wyd` invoked via `wyd mcp` over stdio.
 
 ### Changed
 - **Canonical homepage `https://wyd.sh`** in Cargo metadata and the Homebrew formula; `repository` stays GitHub. The README links it right after the description.
-- **Automated release pipeline**: a `v*` tag now builds the four binaries, publishes the crate to crates.io, and bumps `Formula/wyd.rb` in `oxyplay/homebrew-tap` (all platform URLs + sha256s) with no manual step — so `wyd upgrade` stays current.
+- **Automated release pipeline**: a `v*` tag now builds the four binaries, publishes the crate to crates.io, bumps `Formula/wyd.rb` in `oxyplay/homebrew-tap` (all platform URLs + sha256s), and publishes `server.json` to the MCP Registry via GitHub OIDC — no manual step, so `wyd upgrade` stays current.
 
 ## [0.5.0] - 2026-08-26
 
