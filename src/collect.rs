@@ -135,18 +135,27 @@ fn attribution_for(
     if let Some(rp) = item.root_pid {
         pids.push(rp);
     }
-    let mut owner: Option<(RuntimeSessionId, u64)> = None; // (session, started_at)
+    // (session, started_at, session project root)
+    let mut owner: Option<(RuntimeSessionId, u64, Option<String>)> = None;
     for pid in pids {
         if let Some(id) = identities.get(&pid)
             && let Ok(Some(exp)) = store.explain_process(boot, id.pid, id.start_time)
         {
-            owner = Some((exp.owner, exp.session.started_at));
+            owner = Some((exp.owner, exp.session.started_at, exp.session.project));
             break;
         }
     }
-    let Some((owner, session_start)) = owner else {
+    let Some((owner, session_start, session_project)) = owner else {
         return; // no anchor → not a candidate (§7)
     };
+
+    // Project family (§8): a cwd match with the owning session's project
+    // corroborates attribution.
+    let resource_project = item
+        .project
+        .as_ref()
+        .map(|p| p.root.to_string_lossy().to_string());
+    let exact_cwd = resource_project.is_some() && resource_project == session_project;
 
     let predates = root.start_time < session_start;
     let cand = CandidateInput {
@@ -154,7 +163,7 @@ fn attribution_for(
         anchor: Some(AnchorKind::PersistedPrevious),
         anchor_score: Some(75),
         propagate_cap: None,
-        exact_cwd: false,
+        exact_cwd,
         same_git_root: false,
         start_delta_secs: (!predates).then_some(root.start_time.saturating_sub(session_start)),
         tool_relationship: matches!(

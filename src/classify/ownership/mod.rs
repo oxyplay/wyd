@@ -86,7 +86,7 @@ fn walk(
     if item.category == Category::Agent
         && let Some(root) = root
     {
-        let s = RuntimeSession::new(&item.display_name, root, None, now);
+        let s = RuntimeSession::new(&item.display_name, root, item.project.clone(), now);
         let id = s.id;
         out.sessions.push(s);
         session = Some(id);
@@ -121,8 +121,8 @@ fn walk(
 mod tests {
     use super::*;
     use crate::classify::group;
-    use crate::model::ProcessInfo;
     use crate::model::boot::BootId;
+    use crate::model::{ProcessInfo, Project, RuntimeState};
 
     const NOW: u64 = 5000;
 
@@ -255,5 +255,41 @@ mod tests {
         let a = ProcessIdentity::from_process(&boot(), &procs[2]).unwrap();
         let b = ProcessIdentity::from_process(&boot(), &procs[3]).unwrap();
         assert_ne!(ResourceId::of_root(&a), ResourceId::of_root(&b));
+    }
+
+    #[test]
+    fn session_carries_the_agent_project() {
+        let item = RuntimeItem {
+            category: Category::Agent,
+            display_name: "omp".into(),
+            root_pid: Some(100),
+            process_ids: vec![100],
+            memory_bytes: 0,
+            cpu_percent: 0.0,
+            state: RuntimeState::Active,
+            suspicion: None,
+            ports: vec![],
+            project: Some(Project {
+                name: "queryknight".into(),
+                root: "/src/queryknight".into(),
+            }),
+            children: vec![],
+        };
+        let mut identities = HashMap::new();
+        identities.insert(
+            100,
+            ProcessIdentity {
+                boot_id: boot(),
+                pid: 100,
+                start_time: 1000,
+            },
+        );
+        let out = derive_ownership(std::slice::from_ref(&item), &identities, NOW);
+        assert_eq!(out.sessions.len(), 1);
+        assert_eq!(
+            out.sessions[0].project.as_ref().unwrap().name,
+            "queryknight",
+            "session must carry the agent's project so the resolver's project evidence works"
+        );
     }
 }
