@@ -18,6 +18,10 @@ All notable changes to wyd.
 - Semantic dev-server labels: Astro, SvelteKit, Remix/React Router, Parcel, Rsbuild/Rspack, Nest, Puma, Rails, Phoenix.
 
 ### Changed
+- Runtime store uses WAL + `synchronous=NORMAL` + a 2 s busy timeout, so concurrent readers (TUI/CLI/MCP) don't block the `wyd serve` writer.
+- `wyd serve` is single-instance (refuses to start if another is running), writes a PID file, and restricts the socket to the owner (`0600`).
+- Vendor `session_end` is metadata on the session alias, not a runtime-session end; a runtime session ends only when its process exits.
+- `wyd mcp` pins the MCP protocol version (2025-11-25) and returns a proper JSON-RPC error for unknown methods.
 - Databases are no longer unconditionally `persistent`. A database is persistent only when run as a service (Homebrew/Docker/Valet path, `persistent.commands`, or parented to launchd/systemd/init); an agent- or shell-spawned DB (`postgres -D /tmp/test-db`) is session-scoped and can become a leftover. State is now derived in `mark`, not at group time.
 
 ### Fixed
