@@ -88,3 +88,51 @@ impl DockerSnapshot {
         (prunable.len(), bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vol(name: &str, anonymous: bool, attached: bool) -> DockerResource {
+        DockerResource {
+            kind: DockerKind::Volume,
+            id: name.into(),
+            name: name.into(),
+            detail: if attached { "attached" } else { "unused" }.into(),
+            size_bytes: 100,
+            compose: None,
+            persistent: true,
+            anonymous,
+            created: 0,
+        }
+    }
+
+    #[test]
+    fn prunable_stats_counts_only_anonymous_unused_volumes() {
+        let snap = DockerSnapshot {
+            ok: true,
+            note: String::new(),
+            disk_bytes: 0,
+            reclaimable_bytes: 0,
+            resources: vec![
+                vol("anon_unused", true, false),
+                vol("anon_attached", true, true),
+                vol("named_unused", false, false),
+                DockerResource {
+                    kind: DockerKind::Container,
+                    id: "c".into(),
+                    name: "c".into(),
+                    detail: "running".into(),
+                    size_bytes: 5,
+                    compose: None,
+                    persistent: false,
+                    anonymous: false,
+                    created: 0,
+                },
+            ],
+        };
+        let (count, bytes) = snap.prunable_stats();
+        assert_eq!(count, 1);
+        assert_eq!(bytes, 100);
+    }
+}

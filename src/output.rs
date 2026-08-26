@@ -64,6 +64,15 @@ pub struct JsonDocker {
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose: Option<String>,
+    /// True only for volumes Docker created as anonymous.
+    pub anonymous: bool,
+    /// Unix seconds created; 0 = unknown.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub created: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 pub fn render_json(snap: &RuntimeSnapshot, filter: Filter, project: Option<&str>) -> String {
@@ -181,6 +190,8 @@ fn json_docker(r: &DockerResource) -> JsonDocker {
         status: r.detail.clone(),
         size_bytes: r.size_bytes,
         compose: r.compose.clone(),
+        anonymous: r.anonymous,
+        created: r.created,
     }
 }
 

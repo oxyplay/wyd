@@ -229,35 +229,69 @@ fn handle_key(
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.clean, c) => {
                     open_docker_confirm(snap, app)
                 }
+                KeyCode::Tab => {
+                    app.focus = if app.focus == Focus::Overview {
+                        Focus::Runtime
+                    } else {
+                        Focus::Overview
+                    };
+                    KeyResult::Continue
+                }
+                KeyCode::Backspace => back(app),
+                KeyCode::Char('j') => {
+                    move_sel(app, snap, 1);
+                    KeyResult::Continue
+                }
+                KeyCode::Char('k') => {
+                    move_sel(app, snap, -1);
+                    KeyResult::Continue
+                }
+                KeyCode::Char('h') => {
+                    app.focus = Focus::Overview;
+                    KeyResult::Continue
+                }
+                KeyCode::Char('l') => {
+                    apply_overview(snap, app);
+                    KeyResult::Continue
+                }
                 _ => KeyResult::Continue,
             }
         }
         Mode::Help => match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Backspace => {
                 app.mode = Mode::List;
                 KeyResult::Continue
             }
             _ => KeyResult::Continue,
         },
-        Mode::Details => match code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                app.mode = Mode::List;
-                KeyResult::Continue
+        Mode::Details => {
+            let keys = &config::Config::global().keys;
+            match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Backspace => {
+                    app.mode = Mode::List;
+                    KeyResult::Continue
+                }
+                KeyCode::Char(c) if config::KeysConfig::hit(&keys.kill, c) => {
+                    open_kill_confirm(snap, app, false)
+                }
+                KeyCode::Char(c) if config::KeysConfig::hit(&keys.force_kill, c) => {
+                    open_kill_confirm(snap, app, true)
+                }
+                KeyCode::Char(c) if config::KeysConfig::hit(&keys.stop, c) => {
+                    stop_docker(snap, app, force)
+                }
+                KeyCode::Char(c) if config::KeysConfig::hit(&keys.clean, c) => {
+                    open_docker_confirm(snap, app)
+                }
+                KeyCode::Char('o') => {
+                    open_selected_url(snap, app, 0);
+                    KeyResult::Continue
+                }
+                _ => KeyResult::Continue,
             }
-            KeyCode::Char('k') => open_kill_confirm(snap, app, false),
-            KeyCode::Char('K') => open_kill_confirm(snap, app, true),
-            KeyCode::Char(c) if config::KeysConfig::hit(&config::Config::global().keys.stop, c) => {
-                stop_docker(snap, app, force)
-            }
-            KeyCode::Char('o') => {
-                open_selected_url(snap, app, 0);
-                KeyResult::Continue
-            }
-            KeyCode::Char('x') => open_docker_confirm(snap, app),
-            _ => KeyResult::Continue,
-        },
+        }
         Mode::ConfirmKill { force: kill_force } => match code {
-            KeyCode::Esc | KeyCode::Char('n') => {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Backspace => {
                 app.mode = Mode::List;
                 KeyResult::Continue
             }
@@ -277,7 +311,7 @@ fn handle_key(
             _ => KeyResult::Continue,
         },
         Mode::ConfirmDocker => match code {
-            KeyCode::Esc | KeyCode::Char('n') => {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Backspace => {
                 app.mode = Mode::List;
                 app.frozen_docker.clear();
                 KeyResult::Continue
@@ -321,7 +355,7 @@ fn handle_key(
             _ => KeyResult::Continue,
         },
         Mode::ConfirmPrune => match code {
-            KeyCode::Esc | KeyCode::Char('n') => {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Backspace => {
                 app.mode = Mode::List;
                 KeyResult::Continue
             }
@@ -430,6 +464,21 @@ fn clear_or_quit(app: &mut App) -> KeyResult {
         return KeyResult::Continue;
     }
     KeyResult::Quit
+}
+
+/// Backspace: same unwind as esc (filter → project → section) but never quits.
+fn back(app: &mut App) -> KeyResult {
+    if !app.query.is_empty() {
+        app.query.clear();
+        app.reset_runtime();
+    } else if app.project.take().is_some() {
+        app.reset_runtime();
+    } else if app.section != Section::All {
+        app.section = Section::All;
+        app.ov_sel = 0;
+        app.reset_runtime();
+    }
+    KeyResult::Continue
 }
 
 fn move_sel(app: &mut App, snap: &RuntimeSnapshot, delta: i32) {
@@ -761,7 +810,7 @@ mod tests {
         let mut app = App::new();
         open_kill_confirm(&snap, &mut app, false);
         assert!(!app.frozen.is_empty());
-        let text: String = confirm_lines(&app, false, 80)
+        let text: String = confirm_lines(&app, false)
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -810,7 +859,7 @@ mod tests {
         assert!(rendered.contains("old_pg"), "{rendered}");
 
         open_docker_confirm(&snap, &mut app);
-        let text: String = docker_confirm_lines(&app, 80)
+        let text: String = docker_confirm_lines(&app)
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -954,7 +1003,7 @@ mod tests {
         handle_key(KeyCode::Char(' '), &snap, &mut app, &tx);
         open_docker_confirm(&snap, &mut app);
         assert_eq!(app.frozen_docker.len(), 2);
-        let text: String = docker_confirm_lines(&app, 80)
+        let text: String = docker_confirm_lines(&app)
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()

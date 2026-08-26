@@ -48,6 +48,12 @@ pub enum Row<'a> {
         last: bool,
     },
     Docker(&'a DockerResource),
+    /// One summary row for all anonymous unused volumes.
+    DockerAgg {
+        count: u32,
+        bytes: u64,
+        oldest: i64,
+    },
     Port {
         port: &'a ListeningPort,
         owner: &'a RuntimeItem,
@@ -253,10 +259,29 @@ pub fn rows<'a>(
         Section::Ports => collect_ports(&snap.logical_items, project, q, &mut out),
         Section::Projects => collect_projects(&snap.logical_items, q, &mut out),
         Section::Docker => {
+            let mut agg_count = 0u32;
+            let mut agg_bytes = 0u64;
+            let mut agg_oldest = i64::MAX;
             for res in &snap.docker.resources {
-                if docker_hit(res, q, project) {
+                if res.prunable() {
+                    agg_count += 1;
+                    agg_bytes += res.size_bytes;
+                    agg_oldest = agg_oldest.min(res.created);
+                } else if docker_hit(res, q, project) {
                     out.push(Row::Docker(res));
                 }
+            }
+            if agg_count > 0 {
+                let oldest = if agg_oldest == i64::MAX {
+                    0
+                } else {
+                    agg_oldest
+                };
+                out.push(Row::DockerAgg {
+                    count: agg_count,
+                    bytes: agg_bytes,
+                    oldest,
+                });
             }
         }
         other => collect_items(&snap.logical_items, 0, false, other, project, q, &mut out),

@@ -91,8 +91,14 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
 }
 
 fn main() -> io::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("upgrade") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("upgrade") {
         return run_upgrade();
+    }
+    if args.get(1).map(String::as_str) == Some("prune") {
+        let dry = args.iter().any(|a| a == "--dry-run");
+        let yes = args.iter().any(|a| a == "--yes");
+        return run_prune(dry, yes);
     }
     let cli = Cli::parse();
     if cli.json || cli.plain {
@@ -130,6 +136,43 @@ fn updater_for(exe: &Path) -> Option<(&'static str, &'static [&'static str])> {
         Some(("cargo", &["install", "wyd"]))
     } else {
         None
+    }
+}
+
+fn run_prune(dry_run: bool, yes: bool) -> io::Result<()> {
+    use std::io::Write;
+
+    let snap = collect::snapshot();
+    let (count, bytes) = snap.docker.prunable_stats();
+    if count == 0 {
+        println!("nothing to prune");
+        return Ok(());
+    }
+    println!("{count} anonymous volumes · {}", mb(bytes));
+    if dry_run {
+        return Ok(());
+    }
+    if !yes {
+        print!("delete? [y/N] ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+    let (deleted, reclaimed) =
+        actions::docker::prune_anonymous_volumes_blocking().map_err(io::Error::other)?;
+    println!("pruned {deleted} volumes · {} reclaimed", mb(reclaimed));
+    Ok(())
+}
+
+fn mb(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1}G", bytes as f64 / (1 << 30) as f64)
+    } else {
+        format!("{}M", bytes / (1 << 20))
     }
 }
 

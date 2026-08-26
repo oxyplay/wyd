@@ -40,9 +40,9 @@ impl Default for KeysConfig {
     fn default() -> Self {
         Self {
             quit: "q".into(),
-            kill: "k".into(),
+            kill: "x".into(),
             force_kill: "K".into(),
-            clean: "x".into(),
+            clean: "c".into(),
             stop: "s".into(),
             prune: "P".into(),
             help: "?".into(),

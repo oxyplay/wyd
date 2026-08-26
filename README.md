@@ -41,13 +41,15 @@ Built for people who run coding agents all day and then ask *what did that sessi
 
 | Key | Action |
 |---|---|
-| `←` `→` | overview / list |
-| `↑` `↓` | move |
+| `←` `→` / `h` `l` | overview / list |
+| `↑` `↓` / `j` `k` | move |
+| `Tab` | focus overview / list |
+| `backspace` | go back (clear filter / project / section, never quits) |
 | `enter` | details popup; on a project, pin that project |
 | `space` | mark several |
-| `k` / `K` | terminate / force kill (`y` confirms) |
+| `x` / `K` | terminate / force kill (`y` confirms) |
 | `s` | stop running Docker container (running ones sort first) |
-| `x` | Docker clean (`y`; volumes need `D`) |
+| `c` | Docker clean (`y`; volumes need `D`) |
 | `P` | prune unused anonymous volumes (confirm; named data kept) |
 | `o` | open server URL from details (`http://…` shown only for a live socket) |
 | `p` | projects |
@@ -57,7 +59,7 @@ Built for people who run coding agents all day and then ask *what did that sessi
 | `esc` | close popup, then clear filter / project, then quit |
 | `q` | quit |
 
-Kill only signals the item’s own PIDs (re-checked by PID + start time). An unused Docker volume is never treated as garbage.
+Kill only signals the item’s own PIDs (re-checked by PID + start time). A named volume is never treated as garbage — only anonymous, unattached ones (`P`) are offered for pruning, with confirmation. The bottom hint line is context-aware: it shows the actions that apply to the currently selected row.
 
 ## Scripts
 
@@ -67,6 +69,8 @@ Same snapshot as the TUI — useful after an agent finishes a task:
 wyd --json leftovers
 wyd --plain mcp
 wyd --json project myapp
+wyd prune --dry-run     # list anonymous volumes that would be deleted
+wyd prune               # confirm, then delete them
 ```
 
 Filters: `leftovers`, `mcp`, `agents`, `docker`, `project`.
@@ -96,8 +100,9 @@ roots = ["~/Work"]
 
 [keys]
 quit = "q"
-kill = "k"
+kill = "x"
 force_kill = "K"
+clean = "c"
 stop = "s"
 prune = "P"
 help = "?"

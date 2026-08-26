@@ -212,7 +212,7 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
                     } else {
                         ("terminate", warn())
                     };
-                    draw_popup(frame, inner, title, accent, confirm_lines(app, force, pw));
+                    draw_popup(frame, inner, title, accent, confirm_lines(app, force));
                 }
                 Mode::ConfirmDocker => {
                     draw_popup(
@@ -224,11 +224,11 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
                         } else {
                             chrome()
                         },
-                        docker_confirm_lines(app, pw),
+                        docker_confirm_lines(app),
                     );
                 }
                 Mode::ConfirmPrune => {
-                    draw_popup(frame, inner, "volume prune", warn(), prune_lines(snap, pw));
+                    draw_popup(frame, inner, "volume prune", warn(), prune_lines(snap));
                 }
                 _ => {}
             }
@@ -238,7 +238,7 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
         }
     }
 
-    frame.render_widget(Paragraph::new(hint(app)).style(dim()), footer);
+    frame.render_widget(Paragraph::new(hint(app, snap)).style(chrome()), footer);
 }
 
 pub(super) fn follow_selected(app: &mut App, view_h: u16) {
@@ -287,18 +287,60 @@ fn select_bar(line: Line<'static>, on: bool) -> Line<'static> {
     Line::from(text).style(Style::new().fg(Color::Black).bg(CYAN))
 }
 
-fn hint(app: &App) -> String {
+fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
     let keys = &config::Config::global().keys;
     match app.mode {
         Mode::List if app.filtering || !app.query.is_empty() => {
             let caret = if app.filtering { "█" } else { "" };
             format!(" /{}{caret}   enter apply  esc clear", app.query)
         }
-        Mode::List => format!(
-            " ←→ pane  ↑↓  space mark  enter  {} kill  {} stop  {} clean  p projects  / filter  {} help  {} quit",
-            keys.kill, keys.stop, keys.clean, keys.help, keys.quit
-        ),
-        Mode::Details => " k kill  s stop  o open  x clean  esc back".into(),
+        Mode::List => {
+            let mut parts = vec![
+                "←→ pane".into(),
+                "↑↓ move".into(),
+                "space mark".into(),
+                "enter".into(),
+                "/ filter".into(),
+                "p projects".into(),
+                format!("? help"),
+                format!("q quit"),
+            ];
+            match app.rows(snap).get(app.selected) {
+                Some(Row::Item { .. }) => {
+                    parts.insert(0, format!("{} kill", keys.kill));
+                    parts.insert(1, format!("{} force", keys.force_kill));
+                }
+                Some(Row::Docker(res)) => {
+                    let clean = if res.kind == crate::model::DockerKind::Volume {
+                        format!("{} clean(D)", keys.clean)
+                    } else {
+                        format!("{} clean", keys.clean)
+                    };
+                    if res.running() {
+                        parts.insert(0, format!("{} stop", keys.stop));
+                        parts.insert(1, clean);
+                    } else {
+                        parts.insert(0, clean);
+                    }
+                }
+                Some(Row::DockerAgg { .. }) => {
+                    parts.insert(0, format!("{} prune", keys.prune));
+                }
+                Some(Row::Port { .. }) | Some(Row::Project { .. }) => {}
+                None => {}
+            }
+            if app.section == Section::Docker && snap.docker.prunable_stats().0 > 0 {
+                parts.push(format!("{} prune", keys.prune));
+            }
+            format!(" {}", parts.join("  "))
+        }
+        Mode::Details => {
+            let keys = &config::Config::global().keys;
+            format!(
+                " {} kill  {} stop  o open  {} clean  esc back",
+                keys.kill, keys.stop, keys.clean
+            )
+        }
         Mode::Help => " esc back".into(),
         Mode::ConfirmKill { force: true } => " y force kill  n/esc cancel".into(),
         Mode::ConfirmKill { force: false } => " y terminate  n/esc cancel".into(),
@@ -376,6 +418,23 @@ fn runtime_lines(
                     item_line(item, *depth, *last, &by_pid, &app.marked, idx, nw)
                 }
                 Row::Docker(res) => docker_line(res, &app.marked, idx, nw),
+                Row::DockerAgg {
+                    count,
+                    bytes,
+                    oldest,
+                } => {
+                    let star = if app.marked.contains(&idx) { "*" } else { " " };
+                    let left = pad_name(&format!(" {star}○ anonymous volumes ×{count}"), "", nw);
+                    cols(
+                        &left,
+                        "volume",
+                        "—",
+                        &fmt_bytes(*bytes),
+                        "",
+                        "unused",
+                        &fmt_age((*oldest).max(0) as u64),
+                    )
+                }
                 Row::Port { port, owner } => {
                     let from = owner
                         .project
@@ -595,6 +654,31 @@ pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Lin
     match rs.get(app.selected) {
         Some(Row::Item { item, .. }) => item_details(item, snap, width),
         Some(Row::Docker(res)) => docker_details(res, width),
+        Some(Row::DockerAgg {
+            count,
+            bytes,
+            oldest,
+        }) => {
+            let nw = name_width(width);
+            let mut lines = vec![
+                col_header(width),
+                cols(
+                    &pad_name(&format!("anonymous volumes ×{count}"), "", nw),
+                    "volume",
+                    "—",
+                    &fmt_bytes(*bytes),
+                    "",
+                    "unused",
+                    &fmt_age((*oldest).max(0) as u64),
+                ),
+                Line::from(""),
+                fact_row("safe", "prune with P — named volumes kept", nw),
+            ];
+            if *oldest > 0 {
+                lines.push(fact_row("oldest", &fmt_age(*oldest as u64), nw));
+            }
+            lines
+        }
         Some(Row::Port { port, owner }) => {
             let nw = name_width(width);
             let mut lines = vec![col_header(width)];
@@ -714,42 +798,26 @@ fn fact_row(label: &str, value: &str, nw: usize) -> Line<'static> {
     cols(&pad_name(label, "", nw), "", value, "", "", "", "")
 }
 
-pub fn confirm_lines(app: &App, force: bool, width: usize) -> Vec<Line<'static>> {
-    let nw = name_width(width);
-    let what = if force { "kill" } else { "term" };
+pub fn confirm_lines(app: &App, force: bool) -> Vec<Line<'static>> {
     let action = if force { "force kill" } else { "terminate" };
     let accent = if force { hot() } else { warn() };
-    let mut lines = vec![
-        col_header(width),
-        cols(
-            &pad_name(&app.frozen_title, "", nw),
-            what,
-            "",
-            "",
-            "",
-            "",
-            &format!("{}x", app.frozen.len()),
-        ),
+    let n = app.frozen.len();
+    let pids: Vec<String> = app.frozen.iter().map(|id| id.pid.to_string()).collect();
+    vec![
+        Line::from(""),
+        Line::from(format!(" {} ", app.frozen_title)).style(chrome().add_modifier(Modifier::BOLD)),
+        Line::from(format!(
+            " {n} process{} · PID + start time rechecked",
+            if n == 1 { "" } else { "es" }
+        ))
+        .style(dim()),
+        Line::from(format!(" pids {}", pids.join(" "))).style(dim()),
+        Line::from(""),
         // Top-anchored: the popup clips bottom-up on short terminals.
         Line::from(format!(" y {action}  ·  n/esc cancel"))
             .style(accent.add_modifier(Modifier::BOLD)),
         Line::from(""),
-    ];
-    for id in app.frozen.iter().take(12) {
-        lines.push(fact_row(
-            &format!("pid {}", id.pid),
-            &format!("start {}", id.start_time),
-            nw,
-        ));
-    }
-    if app.frozen.len() > 12 {
-        lines.push(fact_row(
-            "…",
-            &format!("{} more", app.frozen.len() - 12),
-            nw,
-        ));
-    }
-    lines
+    ]
 }
 
 pub fn docker_details(res: &DockerResource, width: usize) -> Vec<Line<'static>> {
@@ -775,28 +843,31 @@ pub fn docker_details(res: &DockerResource, width: usize) -> Vec<Line<'static>> 
     lines
 }
 
-pub fn prune_lines(snap: &RuntimeSnapshot, width: usize) -> Vec<Line<'static>> {
-    let nw = name_width(width);
+pub fn prune_lines(snap: &RuntimeSnapshot) -> Vec<Line<'static>> {
     let (count, bytes) = snap.docker.prunable_stats();
     vec![
-        col_header(width),
-        fact_row("what", "anonymous volumes, unused", nw),
-        fact_row("count", &count.to_string(), nw),
-        fact_row("space", &fmt_bytes(bytes), nw),
         Line::from(""),
-        fact_row("safe", "named volumes & data are kept", nw),
-        // Top-anchored: the popup clips bottom-up on short terminals.
+        Line::from(" Prune anonymous volumes").style(chrome().add_modifier(Modifier::BOLD)),
+        Line::from(format!(" {count} volumes · {}", fmt_bytes(bytes))).style(dim()),
+        Line::from(" named volumes & data are kept").style(dim()),
+        Line::from(""),
         Line::from(" y prune  ·  n/esc cancel").style(warn().add_modifier(Modifier::BOLD)),
+        Line::from(""),
     ]
 }
 
-pub fn docker_confirm_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+pub fn docker_confirm_lines(app: &App) -> Vec<Line<'static>> {
     if app.frozen_docker.is_empty() {
         return vec![Line::from(" no docker target")];
     }
-    let nw = name_width(width);
     let any_p = app.frozen_docker.iter().any(|r| r.persistent);
     let any_s = app.frozen_docker.iter().any(|r| !r.persistent);
+    let n = app.frozen_docker.len();
+    let names: Vec<String> = app
+        .frozen_docker
+        .iter()
+        .map(|r| truncate(&r.name, 24))
+        .collect();
     let mut keys = Vec::new();
     if any_s {
         keys.push("y remove");
@@ -805,31 +876,24 @@ pub fn docker_confirm_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         keys.push("D delete volume");
     }
     keys.push("n/esc cancel");
-    // Top-anchored: the popup clips bottom-up on short terminals.
     let mut lines = vec![
-        col_header(width),
-        Line::from(format!(" {} ", keys.join("  ·  "))).style(warn().add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from(format!(
+            " Remove {} resource{}?",
+            n,
+            if n == 1 { "" } else { "s" }
+        ))
+        .style(chrome().add_modifier(Modifier::BOLD)),
+        Line::from(format!(" {}", names.join(" · "))).style(dim()),
     ];
-    for res in &app.frozen_docker {
-        let what = if res.persistent {
-            "volume"
-        } else {
-            res.kind.label()
-        };
-        lines.push(cols(
-            &pad_name(&res.name, "", nw),
-            what,
-            res.compose.as_deref().unwrap_or("—"),
-            &fmt_bytes(res.size_bytes),
-            "",
-            &res.detail,
-            &fmt_age(res.created.max(0) as u64),
-        ));
-    }
     if any_p {
-        lines.push(Line::from(""));
-        lines.push(fact_row("warn", "PERSISTENT DATA", nw).style(warn()));
+        lines.push(Line::from(" PERSISTENT DATA — D required").style(warn()));
     }
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from(format!(" {} ", keys.join("  ·  "))).style(warn().add_modifier(Modifier::BOLD)),
+    );
+    lines.push(Line::from(""));
     lines
 }
 
@@ -839,8 +903,10 @@ pub fn help_lines() -> Vec<Line<'static>> {
         .chain(
             [
                 "",
-                "← →          overview / runtime",
-                "↑↓           move selection",
+                "← → / h l    overview / runtime",
+                "↑↓ / j k     move selection",
+                "Tab          focus overview / list",
+                "backspace    go back (never quits)",
                 "space        mark / unmark",
                 "/            filter list",
                 "p            projects; enter pins a project filter",
@@ -851,24 +917,12 @@ pub fn help_lines() -> Vec<Line<'static>> {
             .map(Line::from),
         )
         .chain([
-            Line::from(format!("{}            terminate (confirm with y)", k.kill)),
-            Line::from(format!(
-                "{}            force kill (confirm with y)",
-                k.force_kill
-            )),
-            Line::from(format!("{}            stop running container", k.stop)),
-            Line::from(format!(
-                "{}            docker clean (y, or D for volumes)",
-                k.clean
-            )),
+            Line::from(format!("{}            prune anonymous volumes", k.prune)),
+            Line::from(format!("{}            open server URL from details", "o")),
             Line::from(format!("{}            refresh", k.refresh)),
             Line::from(format!("{}            this help", k.help)),
-            Line::from(format!(
-                "{}            docker clean (y, or D for volumes)",
-                k.clean
-            )),
-            Line::from(format!("{}            prune anonymous volumes", k.prune)),
-            Line::from("y            confirm terminate / docker remove"),
+            Line::from(format!("{}            quit", k.quit)),
+            Line::from("y            confirm terminate / docker remove / prune"),
             Line::from("D            confirm volume delete"),
             Line::from(""),
             Line::from("Keys: ~/.config/wyd/config.toml  [keys]"),
