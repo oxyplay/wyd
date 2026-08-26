@@ -69,7 +69,8 @@ exact ancestry is gone.
 
 Provenance lives in SQLite (`~/Library/Application Support/wyd/state.db` on
 macOS, `$XDG_DATA_HOME/wyd/state.db` on Linux), kept fresh by the TUI,
-`wyd serve`, or `wyd mcp` (whichever is running; never more than one writer).
+`wyd serve`, or `wyd mcp`. The WAL-backed local store supports concurrent
+access, so several processes can write at once.
 
 ## Keys
 
