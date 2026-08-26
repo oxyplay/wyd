@@ -6,6 +6,7 @@ mod model;
 mod output;
 mod platform;
 mod scanner;
+mod store;
 mod tui;
 
 use std::io;
@@ -65,6 +66,7 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
     let mut projects = ProjectCache::with_roots(config::Config::global().project_roots());
     let mut docker = Arc::new(model::DockerSnapshot::default());
     let mut version = 0u64;
+    let mut tracker = collect::OwnershipTracker::new();
     loop {
         let next = (|| -> scanner::Result<RuntimeSnapshot> {
             let processes = scanner.scan()?;
@@ -72,6 +74,7 @@ fn scanner_loop(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Receiver<()
             let mut logical_items = group(&processes);
             attach(&mut logical_items, &processes, &ports, &mut projects);
             classify::mark(&mut logical_items, &processes, config::Config::global());
+            tracker.record(&processes, &logical_items);
             version += 1;
             if version == 1 || version.is_multiple_of(3) {
                 docker = Arc::new(crate::scanner::docker::scan_blocking());

@@ -1,5 +1,6 @@
 mod group;
 mod leftovers;
+pub mod ownership;
 mod project;
 mod rules;
 mod tree;

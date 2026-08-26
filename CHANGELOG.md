@@ -3,6 +3,7 @@
 All notable changes to wyd.
 
 ### Added
+- Runtime-ownership foundation (internal, not yet surfaced in the UI): agent runtime sessions keyed by `boot_id + pid + start_time`, exact observed ownership over the process tree, and durable SQLite provenance that survives process ancestry loss and Wyd restarts.
 - New **Workers** category for background watchers/queues: Celery, Sidekiq, Laravel `horizon`/`queue:work`, nodemon, cargo-watch, watchexec, air, and `tsc`/`tailwindcss --watch`. They score as leftovers by age, like dev servers.
 - Detection for agents: Amp, Crush, Goose, Qwen Code, Factory Droid, Kiro, Antigravity (`agy`), Pi.
 - Detection for databases: Elasticsearch, OpenSearch, ClickHouse, CockroachDB, Cassandra, Memcached, Neo4j, Qdrant, Weaviate, Milvus, Meilisearch, Typesense, InfluxDB, SQL Server.

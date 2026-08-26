@@ -1,8 +1,10 @@
+pub mod boot;
 pub mod docker;
 pub mod port;
 pub mod process;
 pub mod project;
 pub mod runtime;
+pub mod session;
 pub mod snapshot;
 
 pub use docker::{DockerKind, DockerResource, DockerSnapshot};

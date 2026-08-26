@@ -1,0 +1,489 @@
+// ponytail: consumed by step 8 (restore) and the collector wiring; dead until
+// then.
+#![allow(dead_code)]
+
+//! Durable runtime ownership store (SQLite, local).
+//!
+//! Persists exactly what Wyd observed: sessions, owned resources, their
+//! member processes, and the exact ownership edges. No resolver candidates,
+//! scores or heuristic evidence yet — those arrive with PHASE 2.
+//!
+//! Provenance survives both process ancestry loss and Wyd restarts because
+//! process identity is `boot_id + pid + start_time`, not PID alone.
+
+use crate::classify::ownership::OwnershipResult;
+use crate::model::boot::{BootEpoch, BootId};
+use crate::model::session::RuntimeSessionId;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::io;
+use std::path::{Path, PathBuf};
+
+const SCHEMA_VERSION: i64 = 1;
+
+/// Local SQLite store for runtime ownership provenance.
+pub struct RuntimeStore {
+    conn: Connection,
+    path: PathBuf,
+}
+
+impl RuntimeStore {
+    /// Open (creating) the store at `path`.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let conn = Connection::open(path).map_err(err)?;
+        let store = Self {
+            conn,
+            path: path.to_path_buf(),
+        };
+        store.init()?;
+        Ok(store)
+    }
+
+    /// In-memory store, for tests.
+    pub fn open_in_memory() -> io::Result<Self> {
+        let conn = Connection::open_in_memory().map_err(err)?;
+        let store = Self {
+            conn,
+            path: PathBuf::from(":memory:"),
+        };
+        store.init()?;
+        Ok(store)
+    }
+
+    /// The default platform state location:
+    /// `$XDG_DATA_HOME/wyd/state.db`, or `~/Library/Application Support/wyd`
+    /// on macOS.
+    pub fn default_path() -> PathBuf {
+        if cfg!(target_os = "macos") {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home).join("Library/Application Support/wyd/state.db")
+        } else {
+            let xdg = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}/.local/share")
+            });
+            PathBuf::from(xdg).join("wyd/state.db")
+        }
+    }
+
+    fn init(&self) -> io::Result<()> {
+        self.conn
+            .execute_batch(
+                "BEGIN;
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS boots (
+                boot_id BLOB PRIMARY KEY,
+                platform_epoch BLOB NOT NULL,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id INTEGER PRIMARY KEY,
+                boot_id BLOB NOT NULL,
+                agent TEXT NOT NULL,
+                root_pid INTEGER NOT NULL,
+                root_start_time INTEGER NOT NULL,
+                project TEXT,
+                started_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                ended_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS resources (
+                resource_id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                root_boot_id BLOB NOT NULL,
+                root_pid INTEGER NOT NULL,
+                root_start_time INTEGER NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                stopped_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS resource_members (
+                resource_id INTEGER NOT NULL,
+                boot_id BLOB NOT NULL,
+                pid INTEGER NOT NULL,
+                start_time INTEGER NOT NULL,
+                PRIMARY KEY (resource_id, boot_id, pid, start_time)
+            );
+            CREATE TABLE IF NOT EXISTS exact_ownership (
+                resource_id INTEGER PRIMARY KEY,
+                session_id INTEGER NOT NULL
+            );
+            COMMIT;",
+            )
+            .map_err(err)?;
+
+        match self.meta("schema_version")? {
+            Some(v) if v != SCHEMA_VERSION.to_string() => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "state.db schema version {v} != supported {SCHEMA_VERSION}; \
+                     remove or migrate the file"
+                ),
+            )),
+            _ => {
+                self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
+                Ok(())
+            }
+        }
+    }
+
+    fn meta(&self, key: &str) -> io::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM meta WHERE key = ?1")
+            .map_err(err)?;
+        let mut rows = stmt.query_map(params![key], |r| r.get(0)).map_err(err)?;
+        rows.next().transpose().map_err(err).map(|o| o.flatten())
+    }
+
+    fn set_meta(&self, key: &str, value: &str) -> io::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Resolve a platform boot epoch to a stable `BootId`, persisting the
+    /// macOS epoch→UUID mapping. Linux uses the boot UUID directly.
+    pub fn boot_id_for_epoch(&mut self, epoch: BootEpoch, now: u64) -> io::Result<BootId> {
+        epoch.to_boot_id(|e| {
+            self.resolve_macos_epoch(e, now)
+                .map_err(|e| io::Error::other(e.to_string()))
+        })
+    }
+
+    fn resolve_macos_epoch(&mut self, epoch: BootEpoch, now: u64) -> rusqlite::Result<BootId> {
+        let bytes = epoch.to_bytes();
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT boot_id FROM boots WHERE platform_epoch = ?1",
+                params![bytes],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        if let Some(b) = existing {
+            self.conn.execute(
+                "UPDATE boots SET last_seen = ?1 WHERE boot_id = ?2",
+                params![now as i64, b],
+            )?;
+            return Ok(bytes_to_boot(&b));
+        }
+        let id = BootId::random();
+        let ib = id.to_le_bytes().to_vec();
+        self.conn.execute(
+            "INSERT INTO boots (boot_id, platform_epoch, first_seen, last_seen)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![ib, bytes, now as i64],
+        )?;
+        Ok(id)
+    }
+
+    /// Persist the exact-observed sessions and owned resources of one pass.
+    pub fn apply_ownership(&mut self, result: &OwnershipResult, now: u64) -> io::Result<()> {
+        let tx = self.conn.transaction().map_err(err)?;
+        for s in &result.sessions {
+            let project = s
+                .project
+                .as_ref()
+                .map(|p| p.root.to_string_lossy().to_string());
+            tx.execute(
+                "INSERT INTO sessions
+                   (session_id, boot_id, agent, root_pid, root_start_time,
+                    project, started_at, last_seen_at, ended_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at,
+                    ended_at = excluded.ended_at",
+                params![
+                    s.id.as_u64() as i64,
+                    s.root.boot_id.to_le_bytes().to_vec(),
+                    s.agent,
+                    s.root.pid as i64,
+                    s.root.start_time as i64,
+                    project,
+                    s.started_at as i64,
+                    now as i64,
+                    s.ended_at.map(|e| e as i64),
+                ],
+            )
+            .map_err(err)?;
+        }
+
+        for o in &result.owned {
+            tx.execute(
+                "INSERT INTO resources
+                   (resource_id, kind, root_boot_id, root_pid, root_start_time,
+                    first_seen_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(resource_id) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at",
+                params![
+                    o.resource.as_u64() as i64,
+                    format!("{:?}", o.kind),
+                    o.root.boot_id.to_le_bytes().to_vec(),
+                    o.root.pid as i64,
+                    o.root.start_time as i64,
+                    now as i64,
+                ],
+            )
+            .map_err(err)?;
+
+            tx.execute(
+                "DELETE FROM resource_members WHERE resource_id = ?1",
+                params![o.resource.as_u64() as i64],
+            )
+            .map_err(err)?;
+            for m in &o.members {
+                tx.execute(
+                    "INSERT INTO resource_members (resource_id, boot_id, pid, start_time)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        o.resource.as_u64() as i64,
+                        m.boot_id.to_le_bytes().to_vec(),
+                        m.pid as i64,
+                        m.start_time as i64,
+                    ],
+                )
+                .map_err(err)?;
+            }
+
+            tx.execute(
+                "INSERT INTO exact_ownership (resource_id, session_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(resource_id) DO UPDATE SET session_id = excluded.session_id",
+                params![o.resource.as_u64() as i64, o.session.as_u64() as i64],
+            )
+            .map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+        Ok(())
+    }
+
+    /// Strict `boot_id + pid + start_time` lookup: the session that owns the
+    /// resource containing exactly this process invocation, if any.
+    /// A start_time mismatch never matches — it is a different process.
+    pub fn owning_session_for_process(
+        &self,
+        boot_id: &BootId,
+        pid: u32,
+        start_time: u64,
+    ) -> io::Result<Option<RuntimeSessionId>> {
+        let boot = boot_id.to_le_bytes().to_vec();
+        let session: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT o.session_id
+                 FROM resource_members m
+                 JOIN exact_ownership o ON o.resource_id = m.resource_id
+                 WHERE m.boot_id = ?1 AND m.pid = ?2 AND m.start_time = ?3
+                 UNION
+                 SELECT o.session_id
+                 FROM resources r
+                 JOIN exact_ownership o ON o.resource_id = r.resource_id
+                 WHERE r.root_boot_id = ?1 AND r.root_pid = ?2
+                   AND r.root_start_time = ?3",
+                params![boot, pid as i64, start_time as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        Ok(session.map(|s| RuntimeSessionId::from_u64(s as u64)))
+    }
+}
+
+fn bytes_to_boot(b: &[u8]) -> BootId {
+    let mut arr = [0u8; 16];
+    let n = b.len().min(16);
+    arr[..n].copy_from_slice(&b[..n]);
+    BootId::from_le_bytes(arr)
+}
+
+fn err<E: std::fmt::Display>(e: E) -> io::Error {
+    io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classify::group;
+    use crate::classify::ownership::derive_ownership;
+    use crate::model::ProcessInfo;
+    use crate::model::process::ProcessIdentity;
+
+    fn proc(pid: u32, ppid: Option<u32>, name: &str, cmd: &[&str], start: u64) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent_pid: ppid,
+            name: name.into(),
+            command: cmd.iter().map(|s| (*s).to_string()).collect(),
+            executable: None,
+            cwd: None,
+            cpu_percent: 0.0,
+            memory_bytes: 40 << 20,
+            start_time: start,
+            tty: None,
+        }
+    }
+
+    fn identities(
+        procs: &[ProcessInfo],
+        boot: &BootId,
+    ) -> std::collections::HashMap<u32, ProcessIdentity> {
+        procs
+            .iter()
+            .filter_map(|p| ProcessIdentity::from_process(boot, p).map(|id| (p.pid, id)))
+            .collect()
+    }
+
+    fn apply_chain(store: &mut RuntimeStore, now: u64) {
+        let procs = vec![
+            proc(1, None, "launchd", &["launchd"], 1),
+            proc(100, Some(1), "omp", &["omp"], 1000),
+            proc(
+                110,
+                Some(100),
+                "node",
+                &["node", "chrome-devtools-mcp"],
+                1004,
+            ),
+            proc(120, Some(110), "Chromium", &["Chromium"], 1007),
+        ];
+        let boot = BootId::from_u128(7);
+        let items = group(&procs);
+        let out = derive_ownership(&items, &identities(&procs, &boot), now);
+        store.apply_ownership(&out, now).unwrap();
+    }
+
+    #[test]
+    fn persists_sessions_and_ownership() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        apply_chain(&mut store, 5000);
+
+        let boot = BootId::from_u128(7);
+        // Chromium (a member, not the root) is matched by strict identity.
+        let owner = store
+            .owning_session_for_process(&boot, 120, 1007)
+            .unwrap()
+            .expect("Chromium should be owned");
+        let _ = owner;
+        // The MCP root process is also owned.
+        let owner_root = store
+            .owning_session_for_process(&boot, 110, 1004)
+            .unwrap()
+            .expect("MCP root should be owned");
+        assert_eq!(owner, owner_root);
+    }
+
+    #[test]
+    fn start_time_mismatch_never_matches() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        apply_chain(&mut store, 5000);
+
+        let boot = BootId::from_u128(7);
+        // Same PID, different start_time = a different process invocation.
+        assert!(
+            store
+                .owning_session_for_process(&boot, 120, 9999)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn different_boot_never_matches() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        apply_chain(&mut store, 5000);
+
+        // Same pid/start_time but a different boot.
+        let other = BootId::from_u128(99);
+        assert!(
+            store
+                .owning_session_for_process(&other, 120, 1007)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn macos_epoch_maps_to_stable_uuid() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let epoch = BootEpoch::Macos { sec: 1000, usec: 5 };
+        let a = store.boot_id_for_epoch(epoch, 5000).unwrap();
+        let b = store.boot_id_for_epoch(epoch, 6000).unwrap();
+        assert_eq!(a, b, "same boot epoch → same persisted BootId");
+
+        let other = BootEpoch::Macos { sec: 2000, usec: 0 };
+        let c = store.boot_id_for_epoch(other, 7000).unwrap();
+        assert_ne!(a, c, "different epoch → new BootId");
+    }
+
+    #[test]
+    fn linux_epoch_uses_uuid_directly() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let epoch = BootEpoch::Linux(0x1234);
+        let id = store.boot_id_for_epoch(epoch, 5000).unwrap();
+        assert_eq!(id, BootId::from_u128(0x1234));
+    }
+
+    #[test]
+    fn schema_version_mismatch_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("wyd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let store = RuntimeStore::open(&path).unwrap();
+            store.set_meta("schema_version", "999").unwrap();
+        }
+        let reopened = RuntimeStore::open(&path);
+        assert!(
+            reopened.is_err(),
+            "future schema must be rejected, not silently read"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provenance_survives_wyd_restart() {
+        // Run 1: Wyd observes Claude → Playwright → Chromium and persists it,
+        // then exits (store dropped).
+        let dir = std::env::temp_dir().join(format!("wyd-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let boot = BootId::from_u128(7);
+        {
+            let mut store = RuntimeStore::open(&path).unwrap();
+            apply_chain(&mut store, 5000);
+        }
+
+        // Run 2: Claude and Playwright are gone; only Chromium survives,
+        // re-parented under launchd. OS ancestry cannot recover Claude, but
+        // the store matches the surviving process by strict identity.
+        let store = RuntimeStore::open(&path).unwrap();
+        let owner = store
+            .owning_session_for_process(&boot, 120, 1007)
+            .expect("store query succeeds")
+            .expect("Chromium's origin session must survive a Wyd restart");
+        let _ = owner;
+
+        // A different process invocation (PID reuse) is not bridged.
+        assert!(
+            store
+                .owning_session_for_process(&boot, 120, 9999)
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
