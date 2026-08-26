@@ -197,6 +197,12 @@ fn explain(store: &mut RuntimeStore, pid: u32) -> std::io::Result<Value> {
     }
 }
 
+/// Standalone explain (opens its own store) — shared by the MCP tool.
+pub fn explain_pid(pid: u32) -> std::io::Result<Value> {
+    let mut store = RuntimeStore::open(&RuntimeStore::default_path())?;
+    explain(&mut store, pid)
+}
+
 fn session_json(s: &crate::store::SessionRecord) -> Value {
     json!({
         "id": s.id.to_string(),

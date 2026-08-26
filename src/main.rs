@@ -2,6 +2,7 @@ mod actions;
 mod classify;
 mod collect;
 mod config;
+mod mcp;
 mod model;
 mod output;
 mod platform;
@@ -60,6 +61,8 @@ enum Subcmd {
     Why { pid: u32 },
     /// Serve the local read-only Unix-socket API
     Serve,
+    /// Run an MCP server over stdio (for coding agents)
+    Mcp,
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -121,6 +124,7 @@ fn main() -> io::Result<()> {
         Some(Subcmd::Prune { dry_run, yes }) => run_prune(dry_run, yes),
         Some(Subcmd::Why { pid }) => run_why(pid),
         Some(Subcmd::Serve) => server::serve(),
+        Some(Subcmd::Mcp) => mcp::serve_stdio(),
         None => {
             if cli.json || cli.plain {
                 run_cli(cli)
