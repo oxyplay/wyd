@@ -91,6 +91,7 @@ pub fn assemble(
                 size_bytes: size,
                 compose: None,
                 persistent: false,
+                anonymous: false,
                 created: 0,
             });
         }
@@ -147,6 +148,7 @@ fn container_row(c: &ContainerSummary) -> DockerResource {
         size_bytes: c.size_rw.unwrap_or(0).max(0) as u64,
         compose,
         persistent: false,
+        anonymous: false,
         created: c.created.unwrap_or(0),
     }
 }
@@ -160,6 +162,7 @@ fn dangling_row(img: &ImageSummary) -> DockerResource {
         size_bytes: img.size.max(0) as u64,
         compose: None,
         persistent: false,
+        anonymous: false,
         created: img.created.max(0),
     }
 }
@@ -178,6 +181,7 @@ fn volume_row(vol: &Volume, attached: bool) -> DockerResource {
         size_bytes: size,
         compose: vol.labels.get(COMPOSE_PROJECT).cloned(),
         persistent: true,
+        anonymous: vol.labels.contains_key("com.docker.volume.anonymous"),
         created: vol.created_at.as_deref().map_or(0, parse_rfc3339),
     }
 }

@@ -9,8 +9,23 @@ pub struct DockerResource {
     pub compose: Option<String>,
     /// Volumes always; UI requires `D` to delete.
     pub persistent: bool,
+    /// Anonymous volume (hash-named, no compose project). Volumes only.
+    pub anonymous: bool,
     /// Unix seconds when created; 0 = unknown.
     pub created: i64,
+}
+
+impl DockerResource {
+    /// Running container — the only resource wyd can stop.
+    pub fn running(&self) -> bool {
+        self.kind == DockerKind::Container && self.detail == "running"
+    }
+
+    /// Anonymous volume not attached to any container — `y` on the prune
+    /// popup deletes exactly these.
+    pub fn prunable(&self) -> bool {
+        self.kind == DockerKind::Volume && self.anonymous && self.detail == "unused"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,13 +34,6 @@ pub enum DockerKind {
     DanglingImage,
     Volume,
     BuildCache,
-}
-
-impl DockerResource {
-    /// Running container — the only resource wyd can stop.
-    pub fn running(&self) -> bool {
-        self.kind == DockerKind::Container && self.detail == "running"
-    }
 }
 
 impl DockerKind {
@@ -68,5 +76,15 @@ impl DockerSnapshot {
             note: note.into(),
             ..Self::default()
         }
+    }
+}
+
+impl DockerSnapshot {
+    /// (count, bytes) of anonymous unused volumes — what `P` offers to prune.
+    pub fn prunable_stats(&self) -> (usize, u64) {
+        let prunable: Vec<&DockerResource> =
+            self.resources.iter().filter(|r| r.prunable()).collect();
+        let bytes = prunable.iter().map(|r| r.size_bytes).sum();
+        (prunable.len(), bytes)
     }
 }

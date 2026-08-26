@@ -31,6 +31,7 @@ pub struct KeysConfig {
     pub force_kill: String,
     pub clean: String,
     pub stop: String,
+    pub prune: String,
     pub help: String,
     pub refresh: String,
 }
@@ -43,6 +44,7 @@ impl Default for KeysConfig {
             force_kill: "K".into(),
             clean: "x".into(),
             stop: "s".into(),
+            prune: "P".into(),
             help: "?".into(),
             refresh: "r".into(),
         }

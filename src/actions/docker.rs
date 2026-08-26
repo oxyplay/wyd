@@ -24,6 +24,26 @@ pub fn stop_blocking(res: &DockerResource) -> Result<(), String> {
     })
 }
 
+/// Returns (deleted count, bytes reclaimed).
+pub fn prune_anonymous_volumes_blocking() -> Result<(u32, u64), String> {
+    runtime()?.block_on(async {
+        let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| e.to_string())?;
+        let mut filters = std::collections::HashMap::new();
+        filters.insert("all", vec!["false"]);
+        let opts = bollard::query_parameters::PruneVolumesOptionsBuilder::default()
+            .filters(&filters)
+            .build();
+        let res = docker
+            .prune_volumes(Some(opts))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((
+            res.volumes_deleted.as_ref().map(|v| v.len()).unwrap_or(0) as u32,
+            res.space_reclaimed.unwrap_or(0).max(0) as u64,
+        ))
+    })
+}
+
 async fn remove(res: &DockerResource) -> Result<(), String> {
     let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| e.to_string())?;
     match res.kind {
