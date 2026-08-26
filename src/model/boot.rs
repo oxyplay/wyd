@@ -59,13 +59,17 @@ impl fmt::Display for BootId {
 /// Platform boot fingerprint for the current boot.
 ///
 /// Not itself a stable `BootId`: Linux's UUID is stable per boot and used
-/// directly; macOS's `kern.boottime` is a timestamp that can collide and must
-/// be mapped to a persisted UUID.
+/// directly; macOS's `kern.bootsessionuuid` is likewise stable per boot.
+/// `kern.boottime` is a clock-derived timestamp that can drift under NTP and
+/// must be mapped to a persisted UUID — kept only as a fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BootEpoch {
     /// Linux `/proc/sys/kernel/random/boot_id`, as an unsigned 128-bit int.
     Linux(u128),
-    /// macOS `kern.boottime`: seconds and microseconds since the Unix epoch.
+    /// macOS `kern.bootsessionuuid` — a stable per-boot UUID.
+    MacosUuid(u128),
+    /// macOS `kern.boottime`: seconds and microseconds since the Unix epoch
+    /// (fallback only; clock-derived).
     Macos { sec: i64, usec: i32 },
 }
 
@@ -80,7 +84,8 @@ impl BootEpoch {
         mut resolve: impl FnMut(BootEpoch) -> io::Result<BootId>,
     ) -> io::Result<BootId> {
         match self {
-            BootEpoch::Linux(id) => Ok(BootId::from_u128(id)),
+            BootEpoch::Linux(id) | BootEpoch::MacosUuid(id) => Ok(BootId::from_u128(id)),
+            // kern.boottime (clock-derived) needs a persisted UUID mapping.
             BootEpoch::Macos { .. } => resolve(self),
         }
     }
@@ -89,7 +94,7 @@ impl BootEpoch {
     pub fn to_bytes(self) -> Vec<u8> {
         let mut v = Vec::with_capacity(17);
         match self {
-            BootEpoch::Linux(id) => {
+            BootEpoch::Linux(id) | BootEpoch::MacosUuid(id) => {
                 v.push(0);
                 v.extend_from_slice(&id.to_le_bytes());
             }
@@ -120,6 +125,21 @@ mod tests {
             .unwrap();
         assert!(!resolved, "Linux must not consult the resolver");
         assert_eq!(id, BootId::from_u128(0x0123456789abcdef0123456789abcdef));
+    }
+
+    #[test]
+    fn macos_uuid_epoch_is_used_directly() {
+        // kern.bootsessionuuid is stable per boot, so no persisted mapping.
+        let epoch = BootEpoch::MacosUuid(0x6e95b7f6c88045e9957eedda2ae7e074);
+        let mut resolved = false;
+        let id = epoch
+            .to_boot_id(|_| {
+                resolved = true;
+                Ok(BootId::random())
+            })
+            .unwrap();
+        assert!(!resolved, "bootsessionuuid must not consult the resolver");
+        assert_eq!(id, BootId::from_u128(0x6e95b7f6c88045e9957eedda2ae7e074));
     }
 
     #[test]
