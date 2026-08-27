@@ -370,6 +370,25 @@ impl RuntimeStore {
         Ok(session.map(|s| RuntimeSessionId::from_u64(s as u64)))
     }
 
+    /// Map a resource's root pid to its owning session id, without needing the
+    /// boot epoch. Used by the web layer to attach `session_id` to each item
+    /// so the dashboard can filter resources by the selected session.
+    pub fn session_for_root_pid(&self, pid: u32) -> io::Result<Option<RuntimeSessionId>> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT o.session_id
+                 FROM resources r
+                 JOIN exact_ownership o ON o.resource_id = r.resource_id
+                 WHERE r.root_pid = ?1",
+                params![pid as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        Ok(id.map(|s| RuntimeSessionId::from_u64(s as u64)))
+    }
+
     /// Mark any active session whose root process is no longer live as ended.
     /// `live_roots` are the exact root identities observed in the current
     /// scan. A session whose root is absent has ended; `ended_at` is the first

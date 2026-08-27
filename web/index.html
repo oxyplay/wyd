@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>wyd — runtime provenance</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/" aria-label="wyd — refresh">wyd</a>
+  <span class="topbar-sub">runtime provenance</span>
+  <input id="search" class="search" type="search" placeholder="Search…" autocomplete="off">
+  <span class="topbar-meta" id="topbar-meta">v0 · local</span>
+  <button id="theme-toggle" class="theme-toggle" title="Toggle dark theme" aria-label="Toggle dark theme">◐</button>
+</header>
+
+<main class="layout" id="layout">
+  <aside class="panel overview" id="panel-overview">
+    <header class="panel-head"><h2>Overview</h2></header>
+    <nav id="overview-list" class="overview-list"></nav>
+    <div id="proposal" class="proposal">
+      <div class="proposal-title">Cleanup proposal</div>
+      <div id="proposal-summary" class="proposal-summary"></div>
+      <div id="proposal-body"></div>
+      <div class="proposal-actions" id="proposal-actions" hidden>
+        <button id="proposal-confirm" class="btn-primary" disabled>Confirm cleanup</button>
+      </div>
+    </div>
+  </aside>
+
+  <section class="panel runtime" id="panel-runtime">
+    <header class="panel-head">
+      <h2>Runtime</h2>
+      <span class="panel-hint" id="runtime-hint"></span>
+    </header>
+    <div class="runtime-table">
+      <div class="rt-head">
+        <span class="c-name">Name</span>
+        <span class="c-what">What</span>
+        <span class="c-from">From</span>
+        <span class="c-ram">RAM</span>
+        <span class="c-cpu">CPU</span>
+        <span class="c-status">Status</span>
+        <span class="c-age">Age</span>
+      </div>
+      <div id="runtime-rows" class="rt-body"></div>
+    </div>
+  </section>
+</main>
+
+<div id="details-drawer" class="details-drawer" hidden>
+  <div class="drawer-panel">
+    <header class="pop-head">
+      <h2>Details</h2>
+      <button id="details-close" class="btn-ghost-sm" aria-label="Close">&times;</button>
+    </header>
+    <div id="details-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="/assets/app.js" defer></script>
+</body>
+</html>

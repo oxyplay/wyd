@@ -10,7 +10,7 @@ mod scanner;
 mod server;
 mod store;
 mod tui;
-
+mod web;
 use std::io;
 use std::path::Path;
 use std::process::Command;
@@ -28,7 +28,7 @@ use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 
 /// See what your dev sessions left running.
 #[derive(Parser)]
-#[command(name = "wyd", version, about)]
+#[command(name = "wyd", version, about, subcommand_negates_reqs = true)]
 struct Cli {
     /// Print JSON and exit (no TUI)
     #[arg(long)]
@@ -63,6 +63,21 @@ enum Subcmd {
     Serve,
     /// Run an MCP server over stdio (for coding agents)
     Mcp,
+    /// Serve a loopback web dashboard with WebMCP tools
+    Web {
+        /// Bind address (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Bind port (default: 8732)
+        #[arg(long, default_value_t = 8732)]
+        port: u16,
+        /// Serve deterministic synthetic data instead of the host runtime
+        #[arg(long)]
+        demo: bool,
+        /// Allow binding to a non-loopback address (LAN exposure; discouraged)
+        #[arg(long)]
+        allow_lan: bool,
+    },
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -125,6 +140,17 @@ fn main() -> io::Result<()> {
         Some(Subcmd::Why { pid }) => run_why(pid),
         Some(Subcmd::Serve) => server::serve(),
         Some(Subcmd::Mcp) => mcp::serve_stdio(),
+        Some(Subcmd::Web {
+            host,
+            port,
+            demo,
+            allow_lan,
+        }) => web::serve(web::WebOptions {
+            host,
+            port,
+            demo,
+            allow_lan,
+        }),
         None => {
             if cli.json || cli.plain {
                 run_cli(cli)
@@ -140,7 +166,6 @@ fn main() -> io::Result<()> {
         }
     }
 }
-
 fn run_upgrade() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
