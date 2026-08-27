@@ -2780,6 +2780,7 @@ dependencies = [
  "bollard",
  "clap",
  "crossterm",
+ "getrandom 0.3.4",
  "libc",
  "netstat2",
  "parking_lot",

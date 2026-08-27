@@ -207,15 +207,9 @@ impl WebState {
 }
 
 fn new_csrf() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let mix = |salt: u64| {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(salt);
-        h.write_u64(now());
-        h.write_u32(std::process::id());
-        h.finish()
-    };
-    format!("{:016x}{:016x}", mix(0xC5F1), mix(0xC5F2))
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).expect("rng");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn now() -> u64 {
@@ -997,5 +991,14 @@ mod tests {
         let html = String::from_utf8(resp.body).unwrap();
         assert!(html.contains(&csrf));
         assert!(!html.contains("__WYD_CSRF__"));
+    }
+
+    #[test]
+    fn csrf_token_is_hex_and_unique() {
+        let a = new_csrf();
+        let b = new_csrf();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 }

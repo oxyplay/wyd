@@ -25,6 +25,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
 serde_json = "1.0.151"
 rusqlite = { version = "0.32", features = ["bundled"] }
+getrandom = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
