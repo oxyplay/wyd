@@ -189,6 +189,7 @@ pub fn serve(opts: WebOptions) -> io::Result<()> {
 struct WebState {
     #[allow(dead_code)]
     mode: &'static str,
+    csrf: String,
     proposals: HashMap<String, Value>,
     #[allow(dead_code)]
     last_snapshot_version: u64,
@@ -198,10 +199,23 @@ impl WebState {
     fn new(mode: &'static str) -> Self {
         Self {
             mode,
+            csrf: new_csrf(),
             proposals: HashMap::new(),
             last_snapshot_version: 0,
         }
     }
+}
+
+fn new_csrf() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mix = |salt: u64| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(salt);
+        h.write_u64(now());
+        h.write_u32(std::process::id());
+        h.finish()
+    };
+    format!("{:016x}{:016x}", mix(0xC5F1), mix(0xC5F2))
 }
 
 fn now() -> u64 {
@@ -347,26 +361,28 @@ impl HttpResponse {
             extra_headers: Vec::new(),
         }
     }
-    fn html(body: &[u8]) -> Self {
-        Self {
-            status: 200,
-            reason: "OK",
-            content_type: "text/html; charset=utf-8",
-            body: body.to_vec(),
-            extra_headers: Vec::new(),
-        }
-    }
     fn not_found() -> Self {
         Self::json(404, json!({"ok": false, "error": "not found"}))
     }
-    fn cors(mut self) -> Self {
-        self.extra_headers
-            .push(("Access-Control-Allow-Origin", "*".into()));
-        self.extra_headers
-            .push(("Access-Control-Allow-Methods", "GET, POST, OPTIONS".into()));
-        self.extra_headers
-            .push(("Access-Control-Allow-Headers", "Content-Type".into()));
-        self
+}
+
+fn csrf_ok(req: &ParsedRequest, token: &str) -> bool {
+    serde_json::from_str::<Value>(&req.body)
+        .ok()
+        .and_then(|v| v.get("csrf").and_then(Value::as_str).map(|s| s == token))
+        .unwrap_or(false)
+}
+
+fn index_html(csrf: &str) -> HttpResponse {
+    let body = String::from_utf8_lossy(assets::INDEX_HTML)
+        .replace("__WYD_CSRF__", csrf)
+        .into_bytes();
+    HttpResponse {
+        status: 200,
+        reason: "OK",
+        content_type: "text/html; charset=utf-8",
+        body,
+        extra_headers: Vec::new(),
     }
 }
 
@@ -376,7 +392,14 @@ fn build_response(
     state: &Arc<RwLock<WebState>>,
     provider: &dyn RuntimeProvider,
 ) -> HttpResponse {
-    let resp = match route {
+    if matches!(
+        route,
+        Route::ProposalPost | Route::ConfirmPost | Route::KillPost
+    ) && !csrf_ok(req, &state.read().csrf)
+    {
+        return HttpResponse::json(403, json!({"ok": false, "error": "forbidden"}));
+    }
+    match route {
         Route::Health => HttpResponse::json(
             200,
             json!({
@@ -412,8 +435,8 @@ fn build_response(
         },
         Route::ProposalPost => proposal_response(req, state, provider),
         Route::ConfirmPost => confirm_response(req, state, provider),
-        Route::KillPost => kill_response(req),
-        Route::StaticIndex => HttpResponse::html(assets::INDEX_HTML),
+        Route::KillPost => kill_response(req, provider),
+        Route::StaticIndex => index_html(&state.read().csrf),
         Route::StaticAsset { path } => match assets::lookup(path) {
             Some((ct, body)) => HttpResponse {
                 status: 200,
@@ -425,8 +448,7 @@ fn build_response(
             None => HttpResponse::not_found(),
         },
         Route::NotFound => HttpResponse::not_found(),
-    };
-    resp.cors()
+    }
 }
 
 fn write_response(stream: &mut TcpStream, resp: &HttpResponse) -> io::Result<()> {
@@ -759,6 +781,7 @@ fn confirm_response(
         200,
         json!({
             "ok": true,
+            "simulated": provider.mode() == "demo",
             "data": {
                 "id": id,
                 "applied": false,
@@ -770,9 +793,8 @@ fn confirm_response(
 }
 
 /// Terminate a single process by pid, with PID + start-time revalidation.
-/// This is a deliberate, human-confirmed action: the UI asks before calling it.
-/// Returns a report so the client can tell the user how many were stopped.
-fn kill_response(req: &ParsedRequest) -> HttpResponse {
+/// `--demo` is a no-op and never reads the host process table.
+fn kill_response(req: &ParsedRequest, provider: &dyn RuntimeProvider) -> HttpResponse {
     let body: Value = match serde_json::from_str(&req.body) {
         Ok(v) => v,
         Err(e) => {
@@ -786,7 +808,17 @@ fn kill_response(req: &ParsedRequest) -> HttpResponse {
         return HttpResponse::json(400, json!({"ok": false, "error": "missing pid"}));
     };
     let pid = pid as u32;
-    let snap = crate::collect::snapshot();
+    if provider.mode() == "demo" {
+        return HttpResponse::json(
+            200,
+            json!({
+                "ok": true,
+                "simulated": true,
+                "data": { "pid": pid, "signaled": 0, "skipped": 0, "failed": 0 }
+            }),
+        );
+    }
+    let snap = provider.snapshot();
     let Some(proc) = snap.processes.iter().find(|p| p.pid == pid) else {
         return HttpResponse::json(
             404,
@@ -880,5 +912,90 @@ mod tests {
         let resp = snapshot_response(&p);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "application/json");
+    }
+
+    fn demo_state() -> Arc<RwLock<WebState>> {
+        Arc::new(RwLock::new(WebState::new("demo")))
+    }
+
+    fn post_json(body: Value) -> ParsedRequest {
+        ParsedRequest {
+            method: "POST".into(),
+            body: body.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn responses_have_no_cors() {
+        let state = demo_state();
+        let req = ParsedRequest {
+            method: "GET".into(),
+            path: "/api/health".into(),
+            ..Default::default()
+        };
+        let resp = build_response(&Route::Health, &req, &state, &DemoProvider);
+        assert!(
+            resp.extra_headers
+                .iter()
+                .all(|(k, _)| !k.starts_with("Access-Control"))
+        );
+    }
+
+    #[test]
+    fn mutating_routes_reject_missing_csrf() {
+        let state = demo_state();
+        let resp = build_response(
+            &Route::KillPost,
+            &post_json(json!({"pid": 4101})),
+            &state,
+            &DemoProvider,
+        );
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn mutating_routes_reject_wrong_csrf() {
+        let state = demo_state();
+        let resp = build_response(
+            &Route::KillPost,
+            &post_json(json!({"pid": 4101, "csrf": "nope"})),
+            &state,
+            &DemoProvider,
+        );
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn demo_kill_is_simulated_and_skips_host() {
+        let state = demo_state();
+        let csrf = state.read().csrf.clone();
+        let resp = build_response(
+            &Route::KillPost,
+            &post_json(json!({"pid": 1, "csrf": csrf})),
+            &state,
+            &DemoProvider,
+        );
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["simulated"], true);
+        assert_eq!(v["data"]["pid"], 1);
+        assert_eq!(v["data"]["signaled"], 0);
+    }
+
+    #[test]
+    fn index_injects_csrf_token() {
+        let state = demo_state();
+        let csrf = state.read().csrf.clone();
+        let req = ParsedRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let resp = build_response(&Route::StaticIndex, &req, &state, &DemoProvider);
+        let html = String::from_utf8(resp.body).unwrap();
+        assert!(html.contains(&csrf));
+        assert!(!html.contains("__WYD_CSRF__"));
     }
 }

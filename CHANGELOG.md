@@ -24,6 +24,11 @@ All notable changes to wyd.
 ### Changed
 - CLI: `subcommand_negates_reqs` so `wyd web ...` doesn't need a filter arg.
 
+### Fixed
+- **`wyd web` CSRF / demo kill:** no wildcard CORS; POST `/api/kill`,
+  `/api/confirm`, `/api/proposal` require a per-process CSRF token issued
+  with `index.html`; `--demo` kill/confirm never touch the host process table.
+
 ## [0.6.0] - 2026-08-26
 
 ### Added

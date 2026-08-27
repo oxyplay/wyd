@@ -3,6 +3,7 @@
 // One source of truth: `state`. Agent + human both go through dispatch().
 
 const $ = (id) => document.getElementById(id);
+const CSRF = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
 
 const state = {
   mode: 'local',
@@ -70,10 +71,11 @@ function toast(msg) {
 }
 
 async function api(path, opts = {}) {
+  const json = opts.json ? { ...opts.json, csrf: CSRF } : undefined;
   const r = await fetch(path, {
-    headers: opts.json ? { 'Content-Type': 'application/json' } : {},
+    headers: json ? { 'Content-Type': 'application/json' } : {},
     method: opts.method || 'GET',
-    body: opts.json ? JSON.stringify(opts.json) : undefined,
+    body: json ? JSON.stringify(json) : undefined,
   });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || 'request failed');

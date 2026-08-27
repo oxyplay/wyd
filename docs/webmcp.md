@@ -97,7 +97,10 @@ always excluded.
 - `/api/confirm` requires a matching `snapshot_version`; stale proposals are
   rejected with HTTP 409.
 - `/api/kill` re-validates PID + start time (rejects PID reuse) and never
-  uses `killpg` — only the item's own PIDs.
+  uses `killpg` — only the item's own PIDs. `--demo` returns
+  `simulated: true` and does not signal host processes.
+- POST `/api/kill`, `/api/confirm`, `/api/proposal` require a CSRF token
+  issued with `index.html`. Responses have no CORS headers.
 - The local server does not contact `wyd.sh`, has no telemetry, no accounts.
 
 ## Difference from `wyd mcp`
