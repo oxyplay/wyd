@@ -214,6 +214,10 @@ fn updater_for(exe: &Path) -> Option<(&'static str, &'static [&'static str])> {
         Some(("brew", &["upgrade", "wyd"]))
     } else if p.contains("/.cargo/") || p.contains("/cargo/bin/") {
         Some(("cargo", &["install", "wyd"]))
+    } else if p.contains("/.local/bin/") {
+        // curl-installed (https://wyd.sh/install.sh): re-run the installer —
+        // it detects the platform, verifies the checksum, and replaces in place.
+        Some(("sh", &["-c", "curl -fsSL https://wyd.sh/install.sh | sh"]))
     } else {
         None
     }
@@ -457,6 +461,9 @@ mod tests {
             updater_for(Path::new("/Users/x/.cargo/bin/wyd")).map(|(c, _)| c),
             Some("cargo")
         );
+        let (cmd, args) = updater_for(Path::new("/Users/x/.local/bin/wyd")).unwrap();
+        assert_eq!(cmd, "sh");
+        assert!(args[1].contains("wyd.sh/install.sh"));
         assert!(updater_for(Path::new("/usr/local/bin/wyd")).is_none());
     }
 }

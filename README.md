@@ -22,6 +22,8 @@ Local, macOS and Linux. No account, no network, no telemetry.
 **https://wyd.sh**
 
 ```bash
+curl -fsSL https://wyd.sh/install.sh | sh
+# or
 brew install oxyplay/tap/wyd
 # or
 cargo install wyd
