@@ -2,6 +2,28 @@
 
 All notable changes to wyd.
 
+## [0.7.0] - 2026-08-27
+
+### Added
+- **`wyd web` — loopback HTTP dashboard + WebMCP tool surface.** A browser
+  agent can investigate runtime provenance in the same UI the human sees.
+  - Overview sidebar (categories with counts/memory, leftovers highlighted),
+    Runtime tree (agent → MCP → browser/dev-server), details drawer with
+    verdict, reasons, provenance evidence, `Terminate` (PID + start-time
+    revalidated) and *Copy investigation prompt*.
+  - Cleanup proposal: optional block, excludes persistent services, human
+    confirms (`/api/confirm`, version-gated).
+  - `--demo` mode with a deterministic synthetic dataset (5 agents incl.
+    opencode/claude/cursor/codex/gemini-cli, popular MCP servers, persistent
+    postgres/redis/mysql). Loopback-only by default.
+  - Light + dark theme with a header toggle; responsive columns (status
+    collapses to a dot on narrow screens; paths show their tail).
+- **`RuntimeStore::session_for_root_pid`** — attach `session_id` to runtime
+  items so the dashboard can filter resources by the owning session.
+
+### Changed
+- CLI: `subcommand_negates_reqs` so `wyd web ...` doesn't need a filter arg.
+
 ## [0.6.0] - 2026-08-26
 
 ### Added

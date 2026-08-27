@@ -86,6 +86,27 @@ Registered in the MCP Registry:
 
 - MCP Registry name: `mcp-name: io.github.oxyplay/wyd`
 
+## WebMCP (browser)
+
+`wyd web` is a loopback HTTP dashboard plus a WebMCP tool surface, so a
+**browser** agent can investigate runtime provenance in the same UI the
+human sees — not just a coding agent over stdio.
+
+```bash
+wyd web              # real local runtime (loopback only)
+wyd web --demo       # deterministic synthetic dataset, no host data
+```
+
+- **Overview** sidebar: categories with counts and memory, leftovers highlighted.
+- **Runtime** tree: agent → MCP → browser/dev-server hierarchy with RAM/CPU/status/age.
+- **Details** drawer: verdict, why-it's-flagged reasons, provenance evidence, `Terminate` (PID + start-time revalidated, human-confirmed) and *Copy investigation prompt*.
+- **Light + dark** themes, responsive columns.
+- Loopback-only by default; `--allow-lan` is explicit and discouraged.
+
+`wyd mcp` (stdio) and `wyd web` (browser WebMCP) read the same store and
+expose the same session/ownership primitives — they're entry points for
+different clients. See [docs/webmcp.md](docs/webmcp.md).
+
 ## Keys
 
 | Key | Action |
