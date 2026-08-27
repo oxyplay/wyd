@@ -2,6 +2,20 @@
 
 All notable changes to wyd.
 
+## [0.7.1] - 2026-08-27
+
+### Added
+- **curl installer:** `curl -fsSL https://wyd.sh/install.sh | sh` — platform
+  detect, sha256 verification, installs to `~/.local/bin/wyd`.
+
+### Changed
+- **`wyd upgrade` supports curl installs:** a binary under `~/.local/bin`
+  re-runs the installer instead of suggesting `brew upgrade wyd`.
+
+### Fixed
+- **`wyd web` CSRF tokens:** generated from the OS CSPRNG (`getrandom`)
+  instead of a RandomState/clock/pid mix.
+
 ## [0.7.0] - 2026-08-27
 
 ### Added
