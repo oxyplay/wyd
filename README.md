@@ -99,9 +99,14 @@ wyd web              # real local runtime (loopback only)
 wyd web --demo       # deterministic synthetic dataset, no host data
 ```
 
-- **Overview** sidebar: categories with counts and memory, leftovers highlighted.
+- **Overview** sidebar: categories with counts; RAM/CPU metrics shown as small
+  icons (with alt text), reclaimable Docker disk shown against Docker, never
+  the Leftovers total.
 - **Runtime** tree: agent → MCP → browser/dev-server hierarchy with RAM/CPU/status/age.
-- **Details** drawer: verdict, why-it's-flagged reasons, provenance evidence, `Terminate` (PID + start-time revalidated, human-confirmed) and *Copy investigation prompt*.
+- **Details** drawer: verdict, score, why-it's-flagged reasons with a shared
+  plain-language explanation, listening sockets (address/port/protocol/pid —
+  not assumed URLs), provenance evidence, `Terminate` (PID + start-time
+  revalidated, human-confirmed) and *Copy investigation prompt*.
 - **Light + dark** themes, responsive columns.
 - Loopback-only by default; `--allow-lan` is explicit and discouraged.
 
@@ -114,7 +119,7 @@ different clients. See [docs/webmcp.md](docs/webmcp.md).
 | Key | Action |
 |---|---|
 | `←` `→` / `h` `l` | overview / list |
-| `↑` `↓` / `j` `k` | move |
+| `↑` `↓` / `j` `k` | move (scroll the details popup) |
 | `Tab` | focus overview / list |
 | `backspace` | go back (clear filter / project / section, never quits) |
 | `enter` | details popup; on a project, pin that project |
@@ -123,7 +128,7 @@ different clients. See [docs/webmcp.md](docs/webmcp.md).
 | `s` | stop running Docker container (running ones sort first) |
 | `c` | Docker clean (`y`; volumes need `D`) |
 | `P` | prune unused anonymous volumes (confirm; named data kept) |
-| `o` | open server URL from details (`http://…` shown only for a live socket) |
+| `o` | open the selected listener as HTTP (`o try HTTP` — an explicit assumption; listeners are shown as sockets, not URLs) |
 | `p` | projects |
 | `/` | filter |
 | `r` | refresh |

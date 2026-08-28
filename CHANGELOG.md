@@ -2,6 +2,43 @@
 
 All notable changes to wyd.
 
+## [Unreleased]
+
+### Added
+- **Semantic verdicts in details (TUI + web):** a leftover item now shows
+  `leftover candidate` as a verdict before the numeric score, plus a shared
+  plain-language explanation per `SuspicionReason` (`may`/`candidate`/`associated`
+  hedged, exact provenance stated only where it is).
+- **TUI bottom-of-pane summary:** total RAM + CPU of the runtime items in the
+  current view, right-aligned under the Runtime table.
+- **`Protocol::as_str()`** — stable lowercase `tcp` for JSON output (was Rust
+  Debug).
+- Web items JSON now exposes `verdict`, `score`, and `explanations` alongside
+  the short `reasons`.
+
+### Changed
+- **Listeners are sockets, not URLs.** Details (TUI + web) show listening
+  sockets as address / port / protocol / owning PID, never `http://…`; a
+  listener owned by a different PID is marked `(other)`. `o` still opens a
+  listener, but honestly (`o try HTTP`).
+- **Compact `WHAT`:** no listeners → `server`/`db`; one → `srv :5173`;
+  several → `srv ×4` — no single listener is implied canonical.
+- **Dedicated TUI details layout** with a small label column and wrapping long
+  values (command, cwd, reasons, explanations, listeners), replacing the
+  Runtime-table column layout that truncated them.
+- **Responsive, scrollable details popup:** margins shrink with the terminal,
+  never overflow, and scroll with `↑`/`↓`/`j`/`k` (`PgUp`/`PgDn`).
+- **Overview sidebar:** TUI shows name + count only; web shows RAM/CPU metrics
+  as small icons with alt text. Docker reclaimable disk is shown against
+  Docker, never folded into the Leftovers metric.
+- **Web sidebar narrower; aggregation line right-aligned.**
+- **`wyd web` local CPU fix:** the local provider keeps one persistent process
+  scanner, so CPU is a real delta across the 2s polls instead of always 0
+  (sysinfo needs two samples).
+
+### Removed
+- Dead `leftover_ram` helper (TUI overview no longer shows metrics).
+
 ## [0.7.1] - 2026-08-27
 
 ### Added

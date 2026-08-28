@@ -79,10 +79,11 @@ always excluded.
 
 ## Human ↔ agent in the same UI
 
-- Selecting a resource opens a **details drawer**: verdict, why-it's-flagged
-  reasons, provenance evidence, and a *Copy investigation prompt* button —
-  the user pastes `Explain why <name> PID <pid> is <status> in wyd.` into
-  their agent chat themselves.
+- Selecting a resource opens a **details drawer**: verdict, score, why-it's-flagged
+  reasons with a plain-language explanation, listening sockets (address / port /
+  protocol / pid — not assumed URLs), provenance evidence, and a *Copy
+  investigation prompt* button — the user pastes `Explain why <name> PID <pid>
+  is <status> in wyd.` into their agent chat themselves.
 - The browser agent and the human clicks both go through the same
   `dispatch()` reducer, so `focus_resource`/`propose_cleanup` visibly update
   the page the user is looking at.
