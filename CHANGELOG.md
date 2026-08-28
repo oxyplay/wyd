@@ -7,9 +7,9 @@ All notable changes to wyd.
 ### Added
 - **`wyd --demo` (TUI + CLI):** the same deterministic synthetic dataset as
   `wyd web --demo` — 5 agent sessions, MCP servers, browsers, dev servers,
-  persistent databases, realistic ages — for screenshots/demos with no host
-  scan. The demo data source moved to a shared `src/demo.rs` and got
-  realistic process start times.
+  persistent databases, realistic ages, plus a small Docker set — for
+  screenshots/demos with no host scan. The demo data source moved to a
+  shared `src/demo.rs` and got realistic process start times.
 - **Semantic verdicts in details (TUI + web):** a leftover item now shows
   `leftover candidate` as a verdict before the numeric score, plus a shared
   plain-language explanation per `SuspicionReason` (`may`/`candidate`/`associated`
@@ -22,6 +22,12 @@ All notable changes to wyd.
   the short `reasons`.
 
 ### Changed
+- **`wyd web` matches the TUI's sections:** Ports, Projects, Docker and
+  Sessions now have their own views (sidebar rows switch sections; Docker
+  resources can be stopped / removed / pruned with confirmations, force-kill
+  added, project rows pin the Runtime tree to a project). Details gains
+  process identity (PID/PPID/cwd/command/tty) and an `Open as HTTP` action.
+  All mutating routes are CSRF-guarded; demo mode stays simulated.
 - **Listeners are sockets, not URLs.** Details (TUI + web) show listening
   sockets as address / port / protocol / owning PID, never `http://…`; a
   listener owned by a different PID is marked `(other)`. `o` still opens a

@@ -144,6 +144,9 @@ enum Route<'a> {
     ProposalPost,
     ConfirmPost,
     KillPost,
+    DockerStopPost,
+    DockerRemovePost,
+    DockerPrunePost,
     StaticIndex,
     StaticAsset { path: &'a str },
     NotFound,
@@ -340,6 +343,9 @@ fn match_route<'a>(method: &str, path: &'a str) -> Route<'a> {
         ("POST", "/api/proposal") => Route::ProposalPost,
         ("POST", "/api/confirm") => Route::ConfirmPost,
         ("POST", "/api/kill") => Route::KillPost,
+        ("POST", "/api/docker/stop") => Route::DockerStopPost,
+        ("POST", "/api/docker/remove") => Route::DockerRemovePost,
+        ("POST", "/api/docker/prune") => Route::DockerPrunePost,
         ("GET", "/" | "/index.html") => Route::StaticIndex,
         ("GET", p) if p.starts_with("/assets/") => Route::StaticAsset { path: p },
         _ => Route::NotFound,
@@ -398,7 +404,12 @@ fn build_response(
 ) -> HttpResponse {
     if matches!(
         route,
-        Route::ProposalPost | Route::ConfirmPost | Route::KillPost
+        Route::ProposalPost
+            | Route::ConfirmPost
+            | Route::KillPost
+            | Route::DockerStopPost
+            | Route::DockerRemovePost
+            | Route::DockerPrunePost
     ) && !csrf_ok(req, &state.read().csrf)
     {
         return HttpResponse::json(403, json!({"ok": false, "error": "forbidden"}));
@@ -440,6 +451,9 @@ fn build_response(
         Route::ProposalPost => proposal_response(req, state, provider),
         Route::ConfirmPost => confirm_response(req, state, provider),
         Route::KillPost => kill_response(req, provider),
+        Route::DockerStopPost => docker_stop_response(req, provider),
+        Route::DockerRemovePost => docker_remove_response(req, provider),
+        Route::DockerPrunePost => docker_prune_response(req, provider),
         Route::StaticIndex => index_html(&state.read().csrf),
         Route::StaticAsset { path } => match assets::lookup(path) {
             Some((ct, body)) => HttpResponse {
@@ -600,6 +614,7 @@ fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -
         item: &crate::model::RuntimeItem,
         session_map: Option<&HashMap<u32, u64>>,
         age_map: &HashMap<u32, u64>,
+        procs: &HashMap<u32, &crate::model::ProcessInfo>,
     ) -> Value {
         let status = match item.state {
             crate::model::RuntimeState::Active => "active",
@@ -633,8 +648,9 @@ fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -
         let children = item
             .children
             .iter()
-            .map(|c| build(c, session_map, age_map))
+            .map(|c| build(c, session_map, age_map, procs))
             .collect::<Vec<_>>();
+        let proc = item.root_pid.and_then(|pid| procs.get(&pid)).copied();
         json!({
             "category": item.category.label(),
             "what": what(item),
@@ -642,6 +658,10 @@ fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -
             "title": item.title(),
             "verdict": item.verdict(),
             "root_pid": item.root_pid,
+            "ppid": proc.and_then(|p| p.parent_pid),
+            "cmd": proc.map(|p| p.command.clone()).unwrap_or_default(),
+            "cwd": proc.and_then(|p| p.cwd.as_ref()).map(|c| c.display().to_string()),
+            "tty": proc.and_then(|p| p.tty.clone()),
             "session_id": session_id.map(|s| format!("{:016x}", s)),
             "memory_bytes": item.memory_bytes,
             "cpu_percent": item.cpu_percent,
@@ -669,9 +689,11 @@ fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -
         .iter()
         .map(|p| (p.pid, now.saturating_sub(p.start_time)))
         .collect();
+    let procs: HashMap<u32, &crate::model::ProcessInfo> =
+        snap.processes.iter().map(|p| (p.pid, p)).collect();
     snap.logical_items
         .iter()
-        .map(|i| build(i, session_map, &age_map))
+        .map(|i| build(i, session_map, &age_map, &procs))
         .collect()
 }
 
@@ -719,11 +741,15 @@ fn overview(snap: &RuntimeSnapshot) -> Value {
         }
         (n, ram)
     };
+    let ports = count_ports(&snap.logical_items);
+    let projects = count_projects(&snap.logical_items);
     json!({
         "total_items": total_items,
         "total_memory_bytes": total_mem,
         "suspicious": suspicious.0,
         "leftover_memory_bytes": suspicious.1,
+        "ports": ports,
+        "projects": projects,
         "categories": counts.iter().map(|(k, (n, mem, cpu))| json!({
             "category": k,
             "count": n,
@@ -731,6 +757,30 @@ fn overview(snap: &RuntimeSnapshot) -> Value {
             "cpu_percent": cpu,
         })).collect::<Vec<_>>(),
     })
+}
+
+fn count_ports(items: &[crate::model::RuntimeItem]) -> usize {
+    items
+        .iter()
+        .map(|i| i.ports.len() + count_ports(&i.children))
+        .sum()
+}
+
+fn count_projects(items: &[crate::model::RuntimeItem]) -> usize {
+    let mut names = std::collections::HashSet::new();
+    fn walk<'a>(
+        items: &'a [crate::model::RuntimeItem],
+        names: &mut std::collections::HashSet<&'a str>,
+    ) {
+        for i in items {
+            if let Some(p) = &i.project {
+                names.insert(&p.name);
+            }
+            walk(&i.children, names);
+        }
+    }
+    walk(items, &mut names);
+    names.len()
 }
 
 fn docker_json(d: &Arc<crate::model::DockerSnapshot>) -> Value {
@@ -741,11 +791,16 @@ fn docker_json(d: &Arc<crate::model::DockerSnapshot>) -> Value {
         "reclaimable_bytes": d.reclaimable_bytes,
         "resources": d.resources.iter().map(|r| json!({
             "kind": format!("{:?}", r.kind),
+            "kind_label": r.kind.label(),
             "id": r.id,
             "name": r.name,
+            "detail": r.detail,
             "size_bytes": r.size_bytes,
+            "compose": r.compose,
             "anonymous": r.anonymous,
             "persistent": r.persistent,
+            "running": r.running(),
+            "created": r.created,
         })).collect::<Vec<_>>(),
     })
 }
@@ -873,19 +928,115 @@ fn kill_response(req: &ParsedRequest, provider: &dyn RuntimeProvider) -> HttpRes
         pid,
         start_time: proc.start_time,
     };
-    let report = crate::actions::process::send(&[id], crate::actions::process::Signal::Term);
+    let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let signal = if force {
+        crate::actions::process::Signal::Kill
+    } else {
+        crate::actions::process::Signal::Term
+    };
+    let report = crate::actions::process::send(&[id], signal);
     HttpResponse::json(
         200,
         json!({
             "ok": true,
             "data": {
                 "pid": pid,
+                "force": force,
                 "signaled": report.signaled,
                 "skipped": report.skipped,
                 "failed": report.failed,
             }
         }),
     )
+}
+
+fn docker_stop_response(req: &ParsedRequest, provider: &dyn RuntimeProvider) -> HttpResponse {
+    let id = match body_id(req) {
+        Some(i) => i,
+        None => return HttpResponse::json(400, json!({"ok": false, "error": "missing id"})),
+    };
+    if provider.mode() == "demo" {
+        return HttpResponse::json(
+            200,
+            json!({"ok": true, "simulated": true, "data": { "id": id, "simulated": true } }),
+        );
+    }
+    match resource_by_id(provider, &id) {
+        Some(res) => match crate::actions::docker::stop_blocking(&res) {
+            Ok(()) => HttpResponse::json(
+                200,
+                json!({"ok": true, "data": { "id": id, "stopped": true, "simulated": false }}),
+            ),
+            Err(e) => HttpResponse::json(500, json!({"ok": false, "error": e})),
+        },
+        None => HttpResponse::json(
+            404,
+            json!({"ok": false, "error": "no such docker resource"}),
+        ),
+    }
+}
+
+fn docker_remove_response(req: &ParsedRequest, provider: &dyn RuntimeProvider) -> HttpResponse {
+    let id = match body_id(req) {
+        Some(i) => i,
+        None => return HttpResponse::json(400, json!({"ok": false, "error": "missing id"})),
+    };
+    if provider.mode() == "demo" {
+        return HttpResponse::json(
+            200,
+            json!({"ok": true, "simulated": true, "data": { "id": id, "simulated": true } }),
+        );
+    }
+    match resource_by_id(provider, &id) {
+        Some(res) => match crate::actions::docker::remove_blocking(&res) {
+            Ok(()) => HttpResponse::json(
+                200,
+                json!({"ok": true, "data": { "id": id, "removed": true, "simulated": false }}),
+            ),
+            Err(e) => HttpResponse::json(500, json!({"ok": false, "error": e})),
+        },
+        None => HttpResponse::json(
+            404,
+            json!({"ok": false, "error": "no such docker resource"}),
+        ),
+    }
+}
+
+fn docker_prune_response(_req: &ParsedRequest, provider: &dyn RuntimeProvider) -> HttpResponse {
+    if provider.mode() == "demo" {
+        return HttpResponse::json(
+            200,
+            json!({"ok": true, "simulated": true, "data": { "pruned": 0, "reclaim_bytes": 0, "simulated": true } }),
+        );
+    }
+    let ids = provider.snapshot().docker.prunable_ids();
+    match crate::actions::docker::prune_anonymous_volumes_blocking(&ids) {
+        Ok((pruned, bytes)) => HttpResponse::json(
+            200,
+            json!({"ok": true, "data": { "pruned": pruned, "reclaim_bytes": bytes } }),
+        ),
+        Err(e) => HttpResponse::json(500, json!({"ok": false, "error": e})),
+    }
+}
+
+/// Parse `{ "id": "..." }` from a request body.
+fn body_id(req: &ParsedRequest) -> Option<String> {
+    let v: Value = serde_json::from_str(&req.body).ok()?;
+    v.get("id").and_then(Value::as_str).map(|s| s.to_string())
+}
+
+/// Find a docker resource by id in the current snapshot.
+fn resource_by_id(
+    provider: &dyn RuntimeProvider,
+    id: &str,
+) -> Option<crate::model::DockerResource> {
+    provider
+        .snapshot()
+        .docker
+        .resources
+        .iter()
+        .find(|r| r.id == id)
+        .cloned()
 }
 
 #[cfg(test)]
@@ -989,13 +1140,20 @@ mod tests {
     #[test]
     fn mutating_routes_reject_missing_csrf() {
         let state = demo_state();
-        let resp = build_response(
-            &Route::KillPost,
-            &post_json(json!({"pid": 4101})),
-            &state,
-            &DemoProvider,
-        );
-        assert_eq!(resp.status, 403);
+        for route in [
+            Route::KillPost,
+            Route::DockerStopPost,
+            Route::DockerRemovePost,
+            Route::DockerPrunePost,
+        ] {
+            let resp = build_response(
+                &route,
+                &post_json(json!({"id": "x"})),
+                &state,
+                &DemoProvider,
+            );
+            assert_eq!(resp.status, 403, "route {route:?} must require csrf");
+        }
     }
 
     #[test]
@@ -1086,7 +1244,21 @@ mod tests {
             children: vec![],
         };
         RuntimeSnapshot {
-            processes: vec![],
+            processes: vec![crate::model::ProcessInfo {
+                pid: 90167,
+                parent_pid: Some(1),
+                name: "node".into(),
+                command: vec![
+                    "/Library/Application Support/OpenCode/open-code".into(),
+                    "server".into(),
+                ],
+                executable: None,
+                cwd: Some("/".into()),
+                cpu_percent: 0.0,
+                memory_bytes: 16 << 20,
+                start_time: 1,
+                tty: Some("ttys000".into()),
+            }],
             logical_items: vec![item],
             docker: Arc::new(crate::model::DockerSnapshot::default()),
             total_memory_bytes: 32 << 30,
@@ -1136,5 +1308,39 @@ mod tests {
                 .contains("original parent")
         );
         assert_eq!(it["verdict"], "leftover candidate");
+    }
+
+    #[test]
+    fn items_expose_process_identity() {
+        let it = &items_json(&node_snapshot(), None)[0];
+        assert_eq!(it["ppid"], 1);
+        assert_eq!(it["cwd"], "/");
+        assert_eq!(it["tty"], "ttys000");
+        assert_eq!(
+            it["cmd"][0],
+            "/Library/Application Support/OpenCode/open-code"
+        );
+        assert_eq!(it["cmd"][1], "server");
+    }
+
+    #[test]
+    fn demo_docker_actions_are_simulated() {
+        let state = demo_state();
+        let csrf = state.read().csrf.clone();
+        for route in [
+            Route::DockerStopPost,
+            Route::DockerRemovePost,
+            Route::DockerPrunePost,
+        ] {
+            let body = if matches!(route, Route::DockerPrunePost) {
+                json!({"csrf": csrf.clone()})
+            } else {
+                json!({"id": "abc", "csrf": csrf.clone()})
+            };
+            let resp = build_response(&route, &post_json(body), &state, &DemoProvider);
+            assert_eq!(resp.status, 200, "route {route:?}");
+            let v: Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(v["simulated"], true, "route {route:?}");
+        }
     }
 }

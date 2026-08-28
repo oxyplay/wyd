@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::model::{
     Category, ListeningPort, ProcessInfo, Project, Protocol, RuntimeItem, RuntimeSnapshot,
     RuntimeState, Suspicion, SuspicionReason,
-    docker::DockerSnapshot,
+    docker::{DockerKind, DockerResource, DockerSnapshot},
     session::{RuntimeSessionId, SessionInfo},
 };
 use crate::store::SessionRecord;
@@ -127,6 +127,65 @@ fn project(name: &str, root: &str) -> Option<Project> {
 
 fn suspicious(score: u8, reasons: Vec<SuspicionReason>) -> Option<Suspicion> {
     Some(Suspicion { score, reasons })
+}
+
+/// Deterministic docker snapshot: a running container, a stopped one, an
+/// anonymous volume, and a persistent named volume — enough to exercise the
+/// web/TUI Docker sections without a live daemon.
+fn demo_docker() -> DockerSnapshot {
+    let n = now();
+    let c = |id: &str, name: &str, detail: &str, size: u64, compose: Option<&str>, created: u64| {
+        DockerResource {
+            kind: DockerKind::Container,
+            id: id.into(),
+            name: name.into(),
+            detail: detail.into(),
+            size_bytes: size,
+            compose: compose.map(str::to_string),
+            persistent: false,
+            anonymous: false,
+            created: created as i64,
+        }
+    };
+    DockerSnapshot {
+        ok: true,
+        note: String::new(),
+        disk_bytes: 9 << 30,
+        reclaimable_bytes: 103 << 20,
+        resources: vec![
+            c(
+                "a1b2c3",
+                "wyd-test-web",
+                "running",
+                42 << 20,
+                Some("testapp"),
+                n - 3600,
+            ),
+            c("d4e5f6", "old_worker", "exited", 12 << 20, None, n - 86400),
+            DockerResource {
+                kind: DockerKind::Volume,
+                id: "v-abc".into(),
+                name: "anonymous-1".into(),
+                detail: "unused".into(),
+                size_bytes: 103 << 20,
+                compose: None,
+                persistent: false,
+                anonymous: true,
+                created: (n - 7200) as i64,
+            },
+            DockerResource {
+                kind: DockerKind::Volume,
+                id: "v-pg".into(),
+                name: "pgdata".into(),
+                detail: "unused".into(),
+                size_bytes: 2 << 30,
+                compose: Some("pg".into()),
+                persistent: true,
+                anonymous: false,
+                created: (n - 5 * 86400) as i64,
+            },
+        ],
+    }
 }
 
 pub fn snapshot() -> RuntimeSnapshot {
@@ -577,7 +636,7 @@ pub fn snapshot() -> RuntimeSnapshot {
     RuntimeSnapshot {
         processes: procs,
         logical_items: items,
-        docker: Arc::new(DockerSnapshot::default()),
+        docker: Arc::new(demo_docker()),
         total_memory_bytes: 16u64 << 30,
         used_memory_bytes: 6u64 << 30,
         cpu_percent: 6.8,

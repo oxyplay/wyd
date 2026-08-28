@@ -14,6 +14,8 @@ const state = {
   docker: null,
   query: '',
   selectedCategory: null,  // filter from Overview, or null = All
+  section: 'runtime',      // runtime | ports | projects | docker | sessions
+  project: null,           // project root-path filter for the runtime tree
   selection: null,         // selected item (flattened ref)
   proposal: null,
   confirmPid: null,
@@ -138,11 +140,6 @@ function visibleItems() {
 
 function dispatch(action) {
   switch (action.type) {
-    case 'category':
-      state.selectedCategory = action.category;
-      state.selection = null;
-      render();
-      break;
     case 'select':
       state.selection = { kind: 'item', data: action.item };
       state.confirmPid = null;
@@ -172,6 +169,79 @@ function dispatch(action) {
       })();
       break;
     }
+    case 'terminate-force': {
+      (async () => {
+        try {
+          const out = await api('/api/kill', { method: 'POST', json: { pid: action.pid, force: true } });
+          toast(`Force-killed PID ${action.pid} (${out.signaled} signaled)`);
+          poll();
+        } catch (e) { toast(`Failed: ${e.message}`); }
+      })();
+      break;
+    }
+    case 'category': {
+      state.selectedCategory = action.category;
+      state.section = 'runtime';
+      state.project = null;
+      state.selection = null;
+      render();
+      break;
+    }
+    case 'section': {
+      state.section = action.section;
+      state.project = null;
+      state.selection = null;
+      render();
+      break;
+    }
+    case 'project': {
+      state.project = action.project;
+      state.section = 'runtime';
+      state.selectedCategory = null;
+      state.selection = null;
+      render();
+      break;
+    }
+    case 'project-clear':
+      state.project = null;
+      render();
+      break;
+    case 'docker-stop': {
+      (async () => {
+        try {
+          const out = await api('/api/docker/stop', { method: 'POST', json: { id: action.id } });
+          toast(out.simulated ? 'Demo: stopped (simulated)' : `Stopped ${action.name}`);
+          poll();
+        } catch (e) { toast(`Failed: ${e.message}`); }
+      })();
+      break;
+    }
+    case 'docker-remove': {
+      const persistent = action.persistent;
+      const msg = persistent
+        ? `Delete ${action.name}? PERSISTENT DATA — this cannot be undone.`
+        : `Remove ${action.name}?`;
+      if (!window.confirm(msg)) break;
+      (async () => {
+        try {
+          const out = await api('/api/docker/remove', { method: 'POST', json: { id: action.id } });
+          toast(out.simulated ? 'Demo: removed (simulated)' : `Removed ${action.name}`);
+          poll();
+        } catch (e) { toast(`Failed: ${e.message}`); }
+      })();
+      break;
+    }
+    case 'docker-prune': {
+      if (!window.confirm('Prune all unused anonymous volumes? Named volumes and attached data are kept.')) break;
+      (async () => {
+        try {
+          const out = await api('/api/docker/prune', { method: 'POST', json: {} });
+          toast(out.simulated ? 'Demo: pruned (simulated)' : `Pruned ${out.pruned} volumes (${fmtBytes(out.reclaim_bytes)})`);
+          poll();
+        } catch (e) { toast(`Failed: ${e.message}`); }
+      })();
+      break;
+    }
     case 'proposal':
       state.proposal = { ...action.proposal, id: action.id };
       render();
@@ -196,7 +266,7 @@ function render() {
   $('topbar-meta').textContent = `v${state.version} · ${state.mode}`;
   document.body.classList.toggle('demo', state.mode === 'demo');
   renderOverview();
-  renderRuntime();
+  renderMain();
   renderProposal();
   // drawer follows selection state
   const drawer = $('details-drawer');
@@ -229,9 +299,11 @@ function renderOverview() {
     list.appendChild(row);
   };
 
+  const on = (s, catOk = true) => state.section === s && catOk;
+
   // All row
   ovRow({
-    cls: state.selectedCategory === null ? 'selected' : '',
+    cls: on('runtime', state.selectedCategory === null) ? 'selected' : '',
     name: 'All',
     count: state.overview?.total_items || 0,
     onClick: () => dispatch({ type: 'category', category: null }),
@@ -242,7 +314,7 @@ function renderOverview() {
     ? metric('ram', escapeHtml(fmtBytes(state.overview.leftover_memory_bytes)), 'RAM')
     : '';
   ovRow({
-    cls: 'suspicious' + (state.selectedCategory === 'suspicious' ? ' selected' : ''),
+    cls: 'suspicious' + (on('runtime', state.selectedCategory === 'suspicious') ? ' selected' : ''),
     name: 'Leftovers',
     count: state.overview?.suspicious || 0,
     sub: loRam,
@@ -251,7 +323,7 @@ function renderOverview() {
 
   // Category rows: name = text, subtitle = RAM (+ CPU) metric icons.
   (state.overview?.categories || []).forEach(c => {
-    const selected = state.selectedCategory === c.category;
+    const selected = on('runtime', state.selectedCategory === c.category);
     let sub = metric('ram', fmtBytes(c.memory_bytes), 'RAM');
     if (c.cpu_percent) sub += ' ' + metric('cpu', `${c.cpu_percent.toFixed(1)}%`, 'CPU');
     ovRow({
@@ -269,8 +341,34 @@ function renderOverview() {
     const n = (dk.resources || []).length;
     let sub = metric('disk', fmtBytes(dk.disk_bytes), 'Disk');
     if (dk.reclaimable_bytes > 0) sub += ' ' + metric('disk', fmtBytes(dk.reclaimable_bytes), 'Reclaimable');
-    ovRow({ name: 'Docker', count: n, sub });
+    ovRow({
+      cls: on('docker') ? 'selected' : '',
+      name: 'Docker',
+      count: n,
+      sub,
+      onClick: () => dispatch({ type: 'section', section: 'docker' }),
+    });
   }
+
+  // Ports / Projects / Sessions rows.
+  ovRow({
+    cls: on('ports') ? 'selected' : '',
+    name: 'Ports',
+    count: state.overview?.ports || 0,
+    onClick: () => dispatch({ type: 'section', section: 'ports' }),
+  });
+  ovRow({
+    cls: on('projects') ? 'selected' : '',
+    name: 'Projects',
+    count: state.overview?.projects || 0,
+    onClick: () => dispatch({ type: 'section', section: 'projects' }),
+  });
+  ovRow({
+    cls: on('sessions') ? 'selected' : '',
+    name: 'Sessions',
+    count: state.sessions.length,
+    onClick: () => dispatch({ type: 'section', section: 'sessions' }),
+  });
 }
 
 // Build the display tree: reuse the backend tree, but pull orphan
@@ -301,6 +399,182 @@ function buildDisplayTree() {
   return kept;
 }
 
+function renderMain() {
+  setPanel(state.section);
+  switch (state.section) {
+    case 'ports': renderPorts(); break;
+    case 'projects': renderProjects(); break;
+    case 'docker': renderDocker(); break;
+    case 'sessions': renderSessions(); break;
+    default: renderRuntime(); break;
+  }
+}
+
+function setPanel(section) {
+  const title = { runtime: 'Runtime', ports: 'Ports', projects: 'Projects', docker: 'Docker', sessions: 'Sessions' }[section] || 'Runtime';
+  const head = document.querySelector('#panel-runtime .panel-head h2');
+  if (head) head.textContent = title;
+  const rtHead = document.querySelector('.runtime-table .rt-head');
+  if (rtHead) rtHead.style.display = section === 'runtime' ? '' : 'none';
+  const hint = $('runtime-hint');
+  if (hint) hint.textContent = section === 'runtime' && state.project ? `project: ${state.project}` : '';
+}
+
+function allItems() {
+  return flatten(state.items);
+}
+
+function filterQ(q, ...fields) {
+  if (!q) return true;
+  return fields.filter(Boolean).join(' ').toLowerCase().includes(q);
+}
+
+function basename(p) {
+  if (!p) return '';
+  return p.replace(/\/+$/, '').split('/').pop() || p;
+}
+
+function secRow(body, { name, nameTitle, what, from, fromTitle, meta, metaCls = '', action = '', onClick, cls = '' }) {
+  const row = document.createElement('div');
+  row.className = 'sec-row' + (onClick ? ' clickable' : '') + (cls ? ' ' + cls : '');
+  row.innerHTML = `
+    <span class="sec-name" title="${escapeHtml(nameTitle || '')}">${name}</span>
+    <span class="sec-what">${what}</span>
+    <span class="sec-from" title="${escapeHtml(fromTitle || '')}">${from}</span>
+    <span class="sec-meta ${metaCls}">${meta}</span>
+    <span class="sec-action">${action}</span>
+  `;
+  if (onClick) row.onclick = onClick;
+  body.appendChild(row);
+}
+
+function renderPorts() {
+  const body = $('runtime-rows');
+  body.innerHTML = '';
+  const q = state.query.trim().toLowerCase();
+  const seen = new Set();
+  let rows = [];
+  for (const it of allItems()) {
+    for (const p of it.ports || []) {
+      if (seen.has(p.port)) continue;
+      seen.add(p.port);
+      rows.push({ port: p, owner: it });
+    }
+  }
+  rows = rows.filter(r => filterQ(q, ':' + r.port.port, r.owner.title, r.owner.project));
+  if (!rows.length) { body.innerHTML = `<div class="muted" style="padding:16px 8px">No ports.</div>`; return; }
+  for (const r of rows) {
+    const other = r.port.pid != null && Number(r.port.pid) && r.port.pid !== Number(r.owner.root_pid)
+      ? ' <span class="sec-warn">(other)</span>' : '';
+    secRow(body, {
+      nameTitle: `${r.owner.title} :${r.port.port}`,
+      name: `${iconFor(r.owner)}<span>${escapeHtml(String(r.port.address || ''))}:${escapeHtml(String(r.port.port))}</span>`,
+      what: `<span class="sec-proto">${escapeHtml(r.port.protocol || 'tcp')}</span>`,
+      fromTitle: r.owner.project || '',
+      from: `${escapeHtml(r.owner.title)}${other}`,
+      meta: `PID ${escapeHtml(String(r.port.pid ?? '—'))}`,
+      onClick: () => dispatch({ type: 'select', item: r.owner }),
+    });
+  }
+}
+
+function renderProjects() {
+  const body = $('runtime-rows');
+  body.innerHTML = '';
+  const q = state.query.trim().toLowerCase();
+  const map = new Map();
+  for (const it of allItems()) {
+    if (!it.project) continue;
+    let e = map.get(it.project);
+    if (!e) { e = { path: it.project, name: basename(it.project), ram: 0, kids: 0 }; map.set(it.project, e); }
+    e.ram += it.memory_bytes;
+    e.kids += 1;
+  }
+  let rows = [...map.values()].filter(e => filterQ(q, e.name, e.path)).sort((a, b) => a.name.localeCompare(b.name));
+  if (!rows.length) { body.innerHTML = `<div class="muted" style="padding:16px 8px">No projects.</div>`; return; }
+  for (const e of rows) {
+    secRow(body, {
+      nameTitle: e.path,
+      name: `<span>${escapeHtml(e.name)}</span>`,
+      what: `<span class="sec-proto">project</span>`,
+      fromTitle: e.path,
+      from: escapeHtml(shortenPath(e.path)),
+      meta: `${e.kids} item${e.kids === 1 ? '' : 's'} · ${fmtBytes(e.ram)}`,
+      cls: state.project === e.path ? 'selected' : '',
+      onClick: () => dispatch({ type: 'project', project: e.path }),
+    });
+  }
+}
+
+function renderDocker() {
+  const body = $('runtime-rows');
+  body.innerHTML = '';
+  const dk = state.docker;
+  if (!dk || dk.ok === false) {
+    body.innerHTML = `<div class="muted" style="padding:16px 8px">Docker unavailable${dk && dk.note ? ' — ' + escapeHtml(dk.note) : ''}.</div>`;
+    return;
+  }
+  const q = state.query.trim().toLowerCase();
+  const res = (dk.resources || []).filter(r => filterQ(q, r.name, r.kind_label, r.detail, r.compose || ''));
+  const prunable = (dk.resources || []).filter(r => r.anonymous && !r.persistent);
+  if (prunable.length) {
+    const bar = document.createElement('div');
+    bar.className = 'sec-toolbar';
+    const bytes = prunable.reduce((a, r) => a + r.size_bytes, 0);
+    bar.innerHTML = `<span class="sec-toolbar-note">${prunable.length} anonymous volume${prunable.length === 1 ? '' : 's'} · ${fmtBytes(bytes)}</span><button class="btn-ghost-sm" id="docker-prune-btn">Prune</button>`;
+    bar.querySelector('#docker-prune-btn').onclick = () => dispatch({ type: 'docker-prune' });
+    body.appendChild(bar);
+  }
+  if (!res.length) { body.innerHTML += `<div class="muted" style="padding:16px 8px">No resources.</div>`; return; }
+  for (const r of res) {
+    const running = !!r.running;
+    const marker = running ? '● ' : '○ ';
+    const badge = r.persistent ? ' <span class="sec-warn">persistent</span>'
+      : (r.anonymous ? ' <span class="sec-muted">anon</span>' : '');
+    let action = '';
+    if (running) action += `<button class="btn-ghost-sm" data-a="stop">Stop</button>`;
+    action += `<button class="btn-ghost-sm" data-a="remove">${r.persistent ? 'Delete' : 'Remove'}</button>`;
+    secRow(body, {
+      nameTitle: `${r.name} (${r.id})`,
+      name: `<span>${marker}${escapeHtml(r.name)}</span>`,
+      what: `${escapeHtml(r.kind_label || '')}${badge}`,
+      fromTitle: r.compose || '',
+      from: escapeHtml(r.compose || '—'),
+      meta: `${escapeHtml(r.detail || '')} · ${fmtBytes(r.size_bytes)}`,
+      metaCls: running ? 'sec-ok' : 'sec-muted',
+      action,
+    });
+    const last = body.lastElementChild;
+    last.querySelector('[data-a="stop"]')?.addEventListener('click', (e) => {
+      e.stopPropagation(); dispatch({ type: 'docker-stop', id: r.id, name: r.name });
+    });
+    last.querySelector('[data-a="remove"]')?.addEventListener('click', (e) => {
+      e.stopPropagation(); dispatch({ type: 'docker-remove', id: r.id, name: r.name, persistent: r.persistent });
+    });
+  }
+}
+
+function renderSessions() {
+  const body = $('runtime-rows');
+  body.innerHTML = '';
+  const q = state.query.trim().toLowerCase();
+  const rows = state.sessions
+    .filter(s => filterQ(q, s.agent, s.project, s.id))
+    .sort((a, b) => (b.active - a.active) || (b.started_at - a.started_at));
+  if (!rows.length) { body.innerHTML = `<div class="muted" style="padding:16px 8px">No sessions.</div>`; return; }
+  for (const s of rows) {
+    secRow(body, {
+      nameTitle: `${s.agent} ${s.id}`,
+      name: `<span>${escapeHtml(s.agent)}</span>`,
+      what: `<span class="sec-proto">session</span>`,
+      fromTitle: s.project || '',
+      from: escapeHtml(shortenPath(s.project)) || '—',
+      meta: `${s.active ? 'active' : 'ended'} · ${fmtAge(s.age_seconds)} · ${escapeHtml(String(s.id).slice(0, 8))}`,
+      metaCls: s.active ? 'sec-ok' : 'sec-muted',
+    });
+  }
+}
+
 function renderRuntime() {
   const body = $('runtime-rows');
   body.innerHTML = '';
@@ -312,7 +586,8 @@ function renderRuntime() {
   }
 
   const q = state.query.trim().toLowerCase();
-  const filtered = tree.filter(item => treeMatches(item, q, state.selectedCategory));
+  const project = state.project;
+  const filtered = tree.filter(item => treeMatches(item, q, state.selectedCategory, project));
   if (!filtered.length) {
     body.innerHTML = `<div class="muted" style="padding:16px 8px">No items match.</div>`;
     return;
@@ -320,14 +595,14 @@ function renderRuntime() {
 
   // When a category/status filter is active, hide the tree indentation
   // (children have no visible parent, so the tree connectors look wrong).
-  const flat = !!state.selectedCategory;
+  const flat = !!state.selectedCategory || !!state.project;
   filtered.forEach(it => {
-    renderTreeRow(body, it, 0, q, state.selectedCategory, flat);
+    renderTreeRow(body, it, 0, q, state.selectedCategory, flat, project);
   });
 }
 
-// does a subtree contain anything that matches the query/category?
-function treeMatches(item, q, cat) {
+// does a subtree contain anything that matches the query/category/project?
+function treeMatches(item, q, cat, project) {
   // A node matches if it satisfies the active category/status filter,
   // OR (if no category filter) it matches the text query.
   let self;
@@ -338,13 +613,18 @@ function treeMatches(item, q, cat) {
   } else {
     self = !q || matchesQuery(item);
   }
+  if (project && !projectMatch(item, project)) self = false;
   if (self) return true;
-  return (item.children || []).some(c => treeMatches(c, q, cat));
+  return (item.children || []).some(c => treeMatches(c, q, cat, project));
+}
+
+function projectMatch(item, project) {
+  return (item.project || '') === project;
 }
 
 // recursive tree row: parent + nested children with indent
-function renderTreeRow(body, item, depth, q, cat, flat) {
-  const children = (item.children || []).filter(c => treeMatches(c, q, cat));
+function renderTreeRow(body, item, depth, q, cat, flat, project) {
+  const children = (item.children || []).filter(c => treeMatches(c, q, cat, project));
   let show;
   if (cat === 'suspicious') {
     show = item.status === 'suspicious';
@@ -353,10 +633,11 @@ function renderTreeRow(body, item, depth, q, cat, flat) {
   } else {
     show = !q || matchesQuery(item);
   }
+  if (project && !projectMatch(item, project)) show = false;
   if (show) {
     body.appendChild(rtRow(item, depth, flat));
   }
-  children.forEach(c => renderTreeRow(body, c, depth + 1, q, cat, flat));
+  children.forEach(c => renderTreeRow(body, c, depth + 1, q, cat, flat, project));
 }
 
 function rtRow(it, depth, flat) {
@@ -465,6 +746,21 @@ function renderDetails() {
     </div>
   ` : '';
 
+  // Observed process identity.
+  const cmd = i.cmd && i.cmd.length ? i.cmd.join(' ') : null;
+  const identityBlock = (i.root_pid || i.ppid != null || i.cwd || cmd || i.tty) ? `
+    <div class="evidence">
+      <div class="evidence-label">Process</div>
+      <div class="kv id-grid">
+        ${i.root_pid ? `<div class="k">PID</div><div class="v">${i.root_pid}</div>` : ''}
+        ${i.ppid != null ? `<div class="k">PPID</div><div class="v">${i.ppid}</div>` : ''}
+        ${i.cwd ? `<div class="k">CWD</div><div class="v">${escapeHtml(i.cwd)}</div>` : ''}
+        ${cmd ? `<div class="k">Command</div><div class="v cmd-wrap">${escapeHtml(cmd)}</div>` : ''}
+        ${i.tty ? `<div class="k">TTY</div><div class="v">${escapeHtml(i.tty)}</div>` : ''}
+      </div>
+    </div>
+  ` : '';
+
   body.innerHTML = `
     <div class="verdict verdict-${verdictTone}">
       <span class="verdict-label">Verdict</span>
@@ -488,6 +784,7 @@ function renderDetails() {
     ` : ''}
     ${evidenceBlock}
     ${listenerBlock}
+    ${identityBlock}
     <div class="kv">
       <div class="k">Category</div><div class="v">${escapeHtml(i.category)}</div>
       <div class="k">Status</div><div class="v">${escapeHtml(i.status)}</div>
@@ -496,9 +793,22 @@ function renderDetails() {
     </div>
     <div class="details-actions">
       <button class="btn-ask" id="copy-prompt">Copy investigation prompt</button>
+      ${ports.length ? '<button class="btn-ask" id="open-http">Open as HTTP</button>' : ''}
       ${renderTerminate(i)}
     </div>
   `;
+
+  const openBtn = document.getElementById('open-http');
+  if (openBtn) {
+    openBtn.onclick = () => {
+      const p = ports[0];
+      if (!p) return;
+      const host = p.address && !/^0\.0\.0\.0$/.test(p.address) && !['::', '::0'].includes(p.address)
+        ? p.address : '127.0.0.1';
+      const url = `http://${host.includes(':') ? '[' + host + ']' : host}:${p.port}`;
+      window.open(url, '_blank');
+    };
+  }
 
   const copyBtn = document.getElementById('copy-prompt');
   if (copyBtn) {
@@ -539,7 +849,12 @@ function renderTerminate(i) {
       </div>
     `;
   }
-  return `<button class="btn-terminate" id="terminate-btn">Terminate</button>`;
+  return `
+    <div class="term-btns">
+      <button class="btn-terminate" id="terminate-btn">Terminate</button>
+      <button class="btn-force" id="force-btn" title="SIGKILL — cannot be caught">Force kill</button>
+    </div>
+  `;
 }
 
 function renderProposal() {
@@ -587,6 +902,9 @@ document.addEventListener('click', (e) => {
   if (t.id === 'terminate-btn') {
     const pid = Number(state.selection?.data?.root_pid);
     if (pid) dispatch({ type: 'terminate-ask', pid });
+  } else if (t.id === 'force-btn') {
+    const pid = Number(state.selection?.data?.root_pid);
+    if (pid) dispatch({ type: 'terminate-force', pid });
   } else if (t.id === 'confirm-yes') {
     const pid = state.confirmPid;
     if (pid) dispatch({ type: 'terminate-go', pid });

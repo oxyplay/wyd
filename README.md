@@ -103,10 +103,13 @@ wyd web --demo       # deterministic synthetic dataset, no host data
 - **Overview** sidebar: categories with counts; RAM/CPU metrics shown as small
   icons (with alt text), reclaimable Docker disk shown against Docker, never
   the Leftovers total.
-- **Runtime** tree: agent → MCP → browser/dev-server hierarchy with RAM/CPU/status/age.
+- **Runtime** tree: agent → MCP → browser/dev-server hierarchy with RAM/CPU/status/age,
+  plus **Ports**, **Projects**, **Docker** and **Sessions** sections (Docker
+  resources can be stopped / removed / pruned right from the UI).
 - **Details** drawer: verdict, score, why-it's-flagged reasons with a shared
-  plain-language explanation, listening sockets (address/port/protocol/pid —
-  not assumed URLs), provenance evidence, `Terminate` (PID + start-time
+  plain-language explanation, process identity (PID/PPID/cwd/command/tty),
+  listening sockets (address/port/protocol/pid — not assumed URLs), provenance
+  evidence, `Open as HTTP`, `Terminate` and `Force kill` (PID + start-time
   revalidated, human-confirmed) and *Copy investigation prompt*.
 - **Light + dark** themes, responsive columns.
 - Loopback-only by default; `--allow-lan` is explicit and discouraged.
