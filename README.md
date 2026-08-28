@@ -40,7 +40,7 @@ still prints a hint if a formula bump is ever lagging.
 Binaries: [GitHub Releases](https://github.com/oxyplay/wyd/releases). From a clone: `cargo install --path .`
 
 
-![wyd TUI — agents, MCP, Vite, and project folders](docs/screenshot.webp)
+![wyd TUI (wyd --demo) — 5 agent sessions, MCP servers, dev servers, databases and Docker](docs/screenshot.webp)
 
 OS daemons stay hidden. Desktop Chrome stays hidden. Agent-spawned Chromium does not.
 
