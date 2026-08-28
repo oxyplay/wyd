@@ -30,7 +30,7 @@ fn stable_id(seed: &str) -> u64 {
     h
 }
 
-fn proc(pid: u32, name: &str, cmd: &[&str], memory: u64) -> ProcessInfo {
+fn proc(pid: u32, name: &str, cmd: &[&str], memory: u64, ago: u64) -> ProcessInfo {
     ProcessInfo {
         pid,
         parent_pid: None,
@@ -40,7 +40,7 @@ fn proc(pid: u32, name: &str, cmd: &[&str], memory: u64) -> ProcessInfo {
         cwd: None,
         cpu_percent: 0.0,
         memory_bytes: memory,
-        start_time: 1,
+        start_time: now().saturating_sub(ago),
         tty: None,
     }
 }
@@ -394,44 +394,113 @@ pub fn snapshot() -> RuntimeSnapshot {
     };
 
     let procs = vec![
-        proc(4100, "opencode", &["opencode", "~/Work/wyd"], 140 << 20),
+        proc(
+            4100,
+            "opencode",
+            &["opencode", "~/Work/wyd"],
+            140 << 20,
+            47 * 60,
+        ),
         proc(
             4101,
             "chrome-devtools-mcp",
             &["chrome-devtools-mcp"],
             42 << 20,
+            45 * 60,
         ),
-        proc(4102, "Chromium", &["Chromium", "--headless"], 145 << 20),
-        proc(4103, "vite", &["vite", "--port", "5173"], 118 << 20),
-        proc(4200, "claude", &["claude", "~/Work/docs"], 160 << 20),
-        proc(4201, "playwright-mcp", &["playwright-mcp"], 58 << 20),
-        proc(4202, "Chromium", &["Chromium", "--headless"], 150 << 20),
-        proc(4203, "filesystem-mcp", &["filesystem-mcp"], 12 << 20),
-        proc(4204, "next", &["next", "dev"], 210 << 20),
-        proc(4300, "cursor", &["cursor", "~/Work/site"], 150 << 20),
-        proc(4301, "github-mcp", &["github-mcp"], 30 << 20),
-        proc(4302, "vite", &["vite", "--port", "5173"], 118 << 20),
-        proc(5100, "codex", &["codex", "~/Work/api"], 90 << 20),
-        proc(5101, "github-mcp", &["github-mcp"], 22 << 20),
-        proc(5102, "context7-mcp", &["context7-mcp"], 18 << 20),
-        proc(5103, "rust-analyzer", &["rust-analyzer"], 220 << 20),
-        proc(5104, "cargo-watch", &["cargo-watch"], 35 << 20),
+        proc(
+            4102,
+            "Chromium",
+            &["Chromium", "--headless"],
+            145 << 20,
+            30 * 60,
+        ),
+        proc(
+            4103,
+            "vite",
+            &["vite", "--port", "5173"],
+            118 << 20,
+            25 * 60,
+        ),
+        proc(
+            4200,
+            "claude",
+            &["claude", "~/Work/docs"],
+            160 << 20,
+            2 * 3600,
+        ),
+        proc(
+            4201,
+            "playwright-mcp",
+            &["playwright-mcp"],
+            58 << 20,
+            110 * 60,
+        ),
+        proc(
+            4202,
+            "Chromium",
+            &["Chromium", "--headless"],
+            150 << 20,
+            90 * 60,
+        ),
+        proc(
+            4203,
+            "filesystem-mcp",
+            &["filesystem-mcp"],
+            12 << 20,
+            115 * 60,
+        ),
+        proc(4204, "next", &["next", "dev"], 210 << 20, 105 * 60),
+        proc(
+            4300,
+            "cursor",
+            &["cursor", "~/Work/site"],
+            150 << 20,
+            3 * 3600,
+        ),
+        proc(4301, "github-mcp", &["github-mcp"], 30 << 20, 170 * 60),
+        proc(
+            4302,
+            "vite",
+            &["vite", "--port", "5173"],
+            118 << 20,
+            160 * 60,
+        ),
+        proc(5100, "codex", &["codex", "~/Work/api"], 90 << 20, 11 * 60),
+        proc(5101, "github-mcp", &["github-mcp"], 22 << 20, 10 * 60),
+        proc(5102, "context7-mcp", &["context7-mcp"], 18 << 20, 9 * 60),
+        proc(
+            5103,
+            "rust-analyzer",
+            &["rust-analyzer"],
+            220 << 20,
+            11 * 60,
+        ),
+        proc(5104, "cargo-watch", &["cargo-watch"], 35 << 20, 8 * 60),
         proc(
             5200,
             "gemini-cli",
             &["gemini-cli", "~/Work/notes"],
             110 << 20,
+            25 * 60,
         ),
         proc(
             5201,
             "sequential-thinking",
             &["sequential-thinking"],
             24 << 20,
+            24 * 60,
         ),
-        proc(5202, "fetch-mcp", &["fetch-mcp"], 20 << 20),
-        proc(9100, "postgres", &["postgres"], 320 << 20),
-        proc(9101, "redis-server", &["redis-server"], 18 << 20),
-        proc(9102, "mysqld", &["mysqld"], 260 << 20),
+        proc(5202, "fetch-mcp", &["fetch-mcp"], 20 << 20, 20 * 60),
+        proc(9100, "postgres", &["postgres"], 320 << 20, 10 * 86400),
+        proc(
+            9101,
+            "redis-server",
+            &["redis-server"],
+            18 << 20,
+            20 * 86400,
+        ),
+        proc(9102, "mysqld", &["mysqld"], 260 << 20, 30 * 86400),
     ];
 
     let items = vec![

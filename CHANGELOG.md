@@ -5,6 +5,11 @@ All notable changes to wyd.
 ## [Unreleased]
 
 ### Added
+- **`wyd --demo` (TUI + CLI):** the same deterministic synthetic dataset as
+  `wyd web --demo` — 5 agent sessions, MCP servers, browsers, dev servers,
+  persistent databases, realistic ages — for screenshots/demos with no host
+  scan. The demo data source moved to a shared `src/demo.rs` and got
+  realistic process start times.
 - **Semantic verdicts in details (TUI + web):** a leftover item now shows
   `leftover candidate` as a verdict before the numeric score, plus a shared
   plain-language explanation per `SuspicionReason` (`may`/`candidate`/`associated`

@@ -29,6 +29,7 @@ brew install oxyplay/tap/wyd
 cargo install wyd
 wyd
 wyd upgrade   # brew or cargo, matching the install
+wyd --demo    # deterministic synthetic dataset — screenshots/demos, no host scan
 ```
 
 Each tagged release publishes the crate to crates.io and bumps

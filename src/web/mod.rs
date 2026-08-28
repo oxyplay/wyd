@@ -19,13 +19,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
+use crate::demo;
 use crate::model::{RuntimeSnapshot, session::SessionInfo};
 use crate::scanner::processes::SysinfoProcessScanner;
 use crate::server;
 use crate::store::{RuntimeStore, SessionRecord};
 
 mod assets;
-mod demo;
 mod proposal;
 
 /// Knobs for `wyd web`.

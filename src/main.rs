@@ -2,6 +2,7 @@ mod actions;
 mod classify;
 mod collect;
 mod config;
+mod demo;
 mod mcp;
 mod model;
 mod output;
@@ -36,6 +37,9 @@ struct Cli {
     /// Print one item per line and exit (no TUI)
     #[arg(long)]
     plain: bool,
+    /// Deterministic synthetic dataset — no host scan (screenshots, demos)
+    #[arg(long)]
+    demo: bool,
     /// leftovers | mcp | agents | docker | project
     filter: Option<String>,
     /// Project name when filter is `project`
@@ -154,6 +158,12 @@ fn main() -> io::Result<()> {
         None => {
             if cli.json || cli.plain {
                 run_cli(cli)
+            } else if cli.demo {
+                // Deterministic dataset for screenshots: no scanner thread,
+                // static snapshot, `r` just redraws.
+                let snapshot = Arc::new(RwLock::new(demo::snapshot()));
+                let (force_tx, _force_rx) = mpsc::channel::<()>();
+                tui::run_tui(snapshot, force_tx)
             } else {
                 let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::default()));
                 let (force_tx, force_rx) = mpsc::channel::<()>();
@@ -419,7 +429,11 @@ fn run_cli(cli: Cli) -> io::Result<()> {
             "filter `project` needs a name: wyd --json project myapp",
         ));
     }
-    let snap = session_aware_snapshot(collect::snapshot());
+    let snap = if cli.demo {
+        demo::snapshot()
+    } else {
+        session_aware_snapshot(collect::snapshot())
+    };
     let project = cli.name.as_deref();
     let text = if cli.json {
         output::render_json(&snap, filter, project)
