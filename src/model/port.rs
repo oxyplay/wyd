@@ -6,7 +6,15 @@ pub enum Protocol {
     Tcp,
 }
 
-/// A listening socket associated with a PID.
+impl Protocol {
+    /// Stable lowercase protocol string for JSON/web output. NOT Rust Debug.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListeningPort {
     pub protocol: Protocol,

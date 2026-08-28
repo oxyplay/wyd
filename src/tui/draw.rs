@@ -8,12 +8,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
-use crate::classify::short_path;
-use crate::config;
-use crate::model::{DockerResource, ProcessInfo, RuntimeItem, RuntimeSnapshot, RuntimeState};
-
 use super::rows::{self, Row, Section, fmt_age, fmt_bytes, truncate};
 use super::{App, Focus, Mode};
+use crate::classify::short_path;
+use crate::config;
+use crate::model::{
+    DockerResource, ListeningPort, ProcessInfo, RuntimeItem, RuntimeSnapshot, RuntimeState,
+};
 
 const CYAN: Color = Color::Cyan;
 const YELLOW: Color = Color::Yellow;
@@ -62,6 +63,36 @@ fn popup_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     pop
 }
 
+/// Responsive details popup: margins shrink as the terminal shrinks; it never
+/// overflows and never fills the whole terminal on large sizes.
+fn details_rect(area: Rect) -> Rect {
+    let w = area.width.max(1) as usize;
+    let h = area.height.max(1) as usize;
+    let x_margin = match w {
+        0..=79 => 1,
+        80..=119 => 2,
+        120..=159 => 4,
+        _ => 6,
+    };
+    let y_margin = match h {
+        0..=19 => 0,
+        20..=29 => 1,
+        30..=49 => 2,
+        _ => 4,
+    };
+    let pw = w.saturating_sub(2 * x_margin).max(24).min(w);
+    let ph = h.saturating_sub(2 * y_margin).max(8).min(h);
+    let x = area.x + ((w - pw) / 2) as u16;
+    let y = area.y + ((h - ph) / 2) as u16;
+    Rect::new(x, y, pw as u16, ph as u16)
+}
+
+/// Width available to details body text inside a details popup: the popup
+/// width minus its two border columns and its left/right padding.
+fn details_inner_width(area: Rect) -> usize {
+    details_rect(area).width.saturating_sub(2 + 4) as usize
+}
+
 pub(super) struct Hits {
     pub overview: Rect,
     pub list: Rect,
@@ -72,26 +103,26 @@ pub(super) fn hits(area: Rect) -> Hits {
     let [main, _] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let inner = Block::default().borders(Borders::ALL).inner(main);
     let [left, right] =
-        Layout::horizontal([Constraint::Length(46), Constraint::Min(20)]).areas(inner);
+        Layout::horizontal([Constraint::Length(OVERVIEW_W), Constraint::Min(20)]).areas(inner);
     let overview = Block::default().borders(Borders::ALL).inner(left);
     let body = Block::default().borders(Borders::ALL).inner(right);
     let [_, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
     Hits {
         overview,
         list,
-        popup: popup_rect(inner, 58, 50),
+        popup: details_rect(inner),
     }
 }
 
 fn draw_popup(
     frame: &mut Frame,
-    area: Rect,
+    rect: Rect,
     title: &str,
     accent: Style,
     lines: Vec<Line<'static>>,
+    scroll: u16,
 ) {
-    let pop = popup_rect(area, 58, 50);
-    frame.render_widget(Clear, pop);
+    frame.render_widget(Clear, rect);
     let fill = Style::new().bg(Color::Black);
     let block = Block::default()
         .title(format!(" {title} "))
@@ -100,10 +131,13 @@ fn draw_popup(
         .border_style(accent)
         .padding(Padding::new(2, 2, 1, 1))
         .style(fill);
-    let inner = block.inner(pop);
-    frame.render_widget(block, pop);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
     frame.render_widget(
-        Paragraph::new(lines).style(fill).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .style(fill)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         inner,
     );
 }
@@ -178,17 +212,26 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
         | Mode::ConfirmDocker
         | Mode::ConfirmPrune => {
             let [left, right] =
-                Layout::horizontal([Constraint::Length(46), Constraint::Min(20)]).areas(inner);
+                Layout::horizontal([Constraint::Length(OVERVIEW_W), Constraint::Min(20)])
+                    .areas(inner);
             frame.render_widget(
-                Paragraph::new(overview_lines(snap, app))
-                    .block(pane("Overview", app.focus == Focus::Overview)),
+                Paragraph::new(overview_lines(
+                    snap,
+                    app,
+                    left.width.saturating_sub(2) as usize,
+                ))
+                .block(pane("Overview", app.focus == Focus::Overview)),
                 left,
             );
             let block = pane(app.section.title(), app.focus == Focus::Runtime);
             let body = block.inner(right);
             frame.render_widget(block, right);
-            let [head, list] =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+            let [head, list, summary] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .areas(body);
             let width = list.width as usize;
             follow_selected(app, list.height);
             frame.render_widget(Paragraph::new(col_header(width)), head);
@@ -196,16 +239,18 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
                 Paragraph::new(runtime_lines(snap, app, &rs, width)).scroll((app.scroll, 0)),
                 list,
             );
-            let pw = popup_rect(inner, 58, 50).width.saturating_sub(2 + 4) as usize;
+            frame.render_widget(Paragraph::new(runtime_summary(&rs, width)), summary);
             match app.mode {
                 Mode::Details => {
-                    draw_popup(
-                        frame,
-                        inner,
-                        "details",
-                        chrome(),
-                        details_lines(snap, app, pw),
-                    );
+                    let drect = details_rect(inner);
+                    let dw = details_inner_width(inner);
+                    let lines = details_lines(snap, app, dw);
+                    let inner_h = drect.height.saturating_sub(2 + 2) as usize; // borders + v-padding
+                    let max_scroll = lines.len().saturating_sub(inner_h.max(1));
+                    if app.detail_scroll as usize > max_scroll {
+                        app.detail_scroll = max_scroll as u16;
+                    }
+                    draw_popup(frame, drect, "details", chrome(), lines, app.detail_scroll);
                 }
                 Mode::ConfirmKill { force } => {
                     let (title, accent) = if force {
@@ -213,12 +258,19 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
                     } else {
                         ("terminate", warn())
                     };
-                    draw_popup(frame, inner, title, accent, confirm_lines(app, force));
+                    draw_popup(
+                        frame,
+                        popup_rect(inner, 58, 50),
+                        title,
+                        accent,
+                        confirm_lines(app, force),
+                        0,
+                    );
                 }
                 Mode::ConfirmDocker => {
                     draw_popup(
                         frame,
-                        inner,
+                        popup_rect(inner, 58, 50),
                         "docker",
                         if app.frozen_docker.iter().any(|r| r.persistent) {
                             warn()
@@ -226,10 +278,18 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
                             chrome()
                         },
                         docker_confirm_lines(app),
+                        0,
                     );
                 }
                 Mode::ConfirmPrune => {
-                    draw_popup(frame, inner, "volume prune", warn(), prune_lines(snap));
+                    draw_popup(
+                        frame,
+                        popup_rect(inner, 58, 50),
+                        "volume prune",
+                        warn(),
+                        prune_lines(snap),
+                        0,
+                    );
                 }
                 _ => {}
             }
@@ -255,6 +315,10 @@ pub(super) fn follow_selected(app: &mut App, view_h: u16) {
         app.scroll = (sel + 1 - h) as u16;
     }
 }
+
+/// Overview sidebar pane width (name + count only). Narrow enough that the
+/// Runtime table keeps most of the window.
+const OVERVIEW_W: u16 = 28;
 
 const RAM_W: usize = 6;
 const CPU_W: usize = 6;
@@ -288,7 +352,7 @@ fn select_bar(line: Line<'static>, on: bool) -> Line<'static> {
     Line::from(text).style(Style::new().fg(Color::Black).bg(CYAN))
 }
 
-fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
+pub(super) fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
     let keys = &config::Config::global().keys;
     match app.mode {
         Mode::List if app.filtering || !app.query.is_empty() => {
@@ -337,10 +401,7 @@ fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
         }
         Mode::Details => {
             let keys = &config::Config::global().keys;
-            format!(
-                " {} kill  {} stop  o open  {} clean  esc back",
-                keys.kill, keys.stop, keys.clean
-            )
+            format!(" j/k scroll  o try HTTP  {} kill  esc back", keys.kill)
         }
         Mode::Help => " esc back".into(),
         Mode::ConfirmKill { force: true } => " y force kill  n/esc cancel".into(),
@@ -359,25 +420,26 @@ fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
     }
 }
 
-fn overview_lines(snap: &RuntimeSnapshot, app: &App) -> Vec<Line<'static>> {
+pub(super) fn overview_lines(
+    snap: &RuntimeSnapshot,
+    app: &App,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    // Name + count only — memory/CPU metrics live in the Runtime rows, not
+    // the sidebar. Regions: 1-char mark, label column, right-aligned count.
+    let mark_w = 1usize;
+    let count_w = 5usize; // " " + up to 4 digits
+    let label_w = width.saturating_sub(mark_w + count_w + 1).clamp(6, 18);
+
     for (i, row) in rows::overview(snap).into_iter().enumerate() {
         let mark = if row.section == app.section {
             "▸"
         } else {
             " "
         };
-        let extra = if row.extra.is_empty() {
-            String::new()
-        } else {
-            truncate(&row.extra, 20)
-        };
-        let text = format!(
-            "{mark}{:<18} {:>4} {:>20}",
-            truncate(row.label, 18),
-            row.count,
-            extra
-        );
+        let label = truncate(row.label, label_w);
+        let text = format!("{mark}{label:<label_w$} {:>4}", row.count);
         let style = if row.section == Section::Leftovers && row.count > 0 {
             warn()
         } else if row.count == 0 && row.section != Section::All {
@@ -485,6 +547,35 @@ fn runtime_lines(
         .collect()
 }
 
+/// Bottom-of-pane summary: total RAM + CPU of the runtime items in the
+/// current view (section + query), so the aggregate cost of what is listed
+/// is visible without scanning rows. Sections without process items (Docker,
+/// Ports, Projects, Sessions) show an empty strip.
+pub(super) fn runtime_summary(rs: &[Row<'_>], width: usize) -> Line<'static> {
+    let (mut ram, mut cpu, mut n) = (0u64, 0.0f32, 0usize);
+    for row in rs {
+        if let Row::Item { item, .. } = row {
+            ram += item.memory_bytes;
+            cpu += item.cpu_percent;
+            n += 1;
+        }
+    }
+    let text = if n == 0 {
+        String::new()
+    } else {
+        format!(
+            " {} item{} · {} RAM · {:.1}% CPU",
+            n,
+            if n == 1 { "" } else { "s" },
+            fmt_bytes(ram),
+            cpu
+        )
+    };
+    // Right-align within the pane so the totals hug the right edge.
+    let t = truncate(&text, width);
+    Line::from(format!("{t:>width$}")).style(dim())
+}
+
 fn pad_name(title: &str, extra: &str, nw: usize) -> String {
     let extra_n = extra.chars().count();
     let budget = if extra_n > 0 && extra_n < nw {
@@ -530,30 +621,40 @@ fn cols(
 }
 
 fn role(item: &RuntimeItem) -> String {
-    if item.category == crate::model::Category::DevServer
-        && let Some(p) = item.ports.iter().map(|x| x.port).min()
-    {
-        return format!("srv :{p}");
+    // Port-bearing categories get compact semantics that never imply a
+    // canonical listener: no listeners → bare role; exactly one → :port;
+    // several → ×N (WYD has no evidence any single listener is primary).
+    let ports = item.ports.len();
+    match item.category {
+        crate::model::Category::DevServer => {
+            return match ports {
+                0 => "server".into(),
+                1 => format!("srv :{}", item.ports[0].port),
+                _ => format!("srv ×{ports}"),
+            };
+        }
+        crate::model::Category::Database => {
+            return match ports {
+                0 => "db".into(),
+                1 => format!("db :{}", item.ports[0].port),
+                _ => format!("db ×{ports}"),
+            };
+        }
+        _ => {}
     }
     let n = item.process_ids.len();
     if n > 1 {
         return format!("{n} procs");
     }
-    let port = item.ports.iter().map(|p| p.port).min();
     match item.category {
         crate::model::Category::Agent => "agent".into(),
         crate::model::Category::Mcp => "mcp".into(),
         crate::model::Category::Browser => "browser".into(),
-        crate::model::Category::DevServer => port
-            .map(|p| format!("srv :{p}"))
-            .unwrap_or_else(|| "server".into()),
-        crate::model::Category::Database => port
-            .map(|p| format!("db :{p}"))
-            .unwrap_or_else(|| "db".into()),
         crate::model::Category::LanguageServer => "lsp".into(),
         crate::model::Category::Worker => "worker".into(),
         crate::model::Category::DevService => "svc".into(),
         crate::model::Category::UnknownDev => "dev".into(),
+        crate::model::Category::DevServer | crate::model::Category::Database => unreachable!(),
     }
 }
 
@@ -674,23 +775,6 @@ fn item_line(
         span.style = Style::new().fg(Color::Green);
     }
     line
-}
-
-/// True when `target` is nested under a live agent item — a running session
-/// provably spawned it. The list threads this through the row walk; the
-/// details popup re-derives it from the tree.
-fn under_live_agent(roots: &[RuntimeItem], target: &RuntimeItem) -> bool {
-    fn walk(items: &[RuntimeItem], target: &RuntimeItem, under: bool) -> bool {
-        items.iter().any(|i| {
-            (under && std::ptr::eq(i, target))
-                || walk(
-                    &i.children,
-                    target,
-                    under || i.category == crate::model::Category::Agent,
-                )
-        })
-    }
-    walk(roots, target, false)
 }
 
 fn docker_line(
@@ -823,43 +907,135 @@ pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Lin
     }
 }
 
+const DETAIL_LABEL_W: usize = 12;
+
+fn detail_header(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        chrome().add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn detail_row(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<DETAIL_LABEL_W$}", truncate(label, DETAIL_LABEL_W)),
+            dim(),
+        ),
+        Span::raw(value.to_string()),
+    ])
+}
+
+/// A value line with no label, indented under a section header (verdict,
+/// score, why, meaning, listener rows).
+fn detail_indent(value: &str) -> Line<'static> {
+    Line::from(Span::raw(format!(
+        "{}{}",
+        " ".repeat(DETAIL_LABEL_W),
+        value
+    )))
+}
+
+/// One observed listening socket. Never presented as a URL; shows address,
+/// port, protocol and owning PID. A PID that is not the selected root is
+/// called out rather than hidden.
+fn listener_line(p: &ListeningPort, root_pid: Option<u32>) -> Line<'static> {
+    let owner = match root_pid {
+        Some(rp) if rp == p.pid => String::new(),
+        Some(_) => " (other)".into(),
+        None => String::new(),
+    };
+    Line::from(Span::raw(format!(
+        "{}{:<7} {:<16} {:<4} pid {}{}",
+        " ".repeat(DETAIL_LABEL_W),
+        format!(":{}", p.port),
+        p.address.to_string(),
+        p.protocol.as_str(),
+        p.pid,
+        owner
+    )))
+}
+
 fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot, width: usize) -> Vec<Line<'static>> {
     let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
+    let _ = width; // reserved: label/value widths derive from the popup layout
+    let leftover = item.state == RuntimeState::Suspicious;
     let proc = item.root_pid.and_then(|pid| by_pid.get(&pid).copied());
-    let nw = name_width(width);
-    let owned = under_live_agent(&snap.logical_items, item);
-    let mut lines = vec![
-        col_header(width),
-        item_line(item, 0, true, owned, &by_pid, &HashSet::new(), 0, nw),
-        Line::from(""),
-    ];
-    for p in &item.ports {
-        lines.push(fact_row("url", &p.url(), nw));
+    let mut lines = Vec::new();
+    let age = proc
+        .map(|p| fmt_age(p.start_time))
+        .unwrap_or_else(|| "—".into());
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} {}   {}   {}   {}",
+            if leftover { "⚠" } else { "  " },
+            item.display_name,
+            role(item),
+            fmt_bytes(item.memory_bytes),
+            age
+        ),
+        if leftover { warn() } else { Style::default() },
+    )));
+    lines.push(Line::from(""));
+
+    // Verdict (semantic) before the raw score, then the short reason and a
+    // shared explanation. Heuristic reasons are explained, never overstated.
+    lines.push(detail_header("verdict"));
+    lines.push(detail_indent(item.verdict()));
+    if let Some(s) = &item.suspicion {
+        lines.push(detail_header("score"));
+        lines.push(detail_indent(&format!("{} / 100", s.score)));
+        lines.push(detail_header("why"));
+        for r in &s.reasons {
+            lines.push(detail_indent(r.as_str()).style(warn()));
+        }
+        lines.push(detail_header("meaning"));
+        for r in &s.reasons {
+            lines.push(detail_indent(r.explanation()).style(dim()));
+        }
+        lines.push(Line::from(""));
     }
+
+    // Observed process identity.
     if let Some(p) = proc {
-        lines.push(fact_row("pid", &p.pid.to_string(), nw));
-        lines.push(fact_row(
+        lines.push(detail_header("process"));
+        lines.push(detail_row("pid", &p.pid.to_string()));
+        lines.push(detail_row(
             "ppid",
             &p.parent_pid
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "—".into()),
-            nw,
         ));
-        if !p.command.is_empty() {
-            lines.push(fact_row("cmd", &p.command.join(" "), nw));
-        }
         if let Some(cwd) = &p.cwd {
-            lines.push(fact_row("cwd", &short_path(cwd), nw));
+            lines.push(detail_row("cwd", &short_path(cwd)));
+        }
+        if !p.command.is_empty() {
+            lines.push(detail_row("cmd", &p.command.join(" ")));
         }
         if let Some(tty) = &p.tty {
-            lines.push(fact_row("tty", tty, nw));
+            lines.push(detail_row("tty", tty));
         }
+        lines.push(Line::from(""));
     }
+
+    // Observed listening sockets — NOT URLs. Show address, port, protocol,
+    // and owning PID; make any listener owned by another PID visible.
+    if !item.ports.is_empty() {
+        let n = item.ports.len();
+        lines.push(detail_header(&format!("listening sockets   {n} TCP")));
+        let mut ports: Vec<&ListeningPort> = item.ports.iter().collect();
+        ports.sort_by(|a, b| a.port.cmp(&b.port).then(a.pid.cmp(&b.pid)));
+        for p in ports {
+            lines.push(listener_line(p, item.root_pid));
+        }
+        lines.push(Line::from(""));
+    }
+
     if let Some(project) = &item.project {
-        lines.push(fact_row("project", &short_path(&project.root), nw));
+        lines.push(detail_row("project", &short_path(&project.root)));
     }
     if item.process_ids.len() > 1 {
-        lines.push(fact_row(
+        lines.push(detail_row(
             "procs",
             &item
                 .process_ids
@@ -867,27 +1043,18 @@ fn item_details(item: &RuntimeItem, snap: &RuntimeSnapshot, width: usize) -> Vec
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
                 .join(" "),
-            nw,
         ));
     }
     if !item.children.is_empty() {
-        lines.push(fact_row(
+        lines.push(detail_row(
             "children",
             &item
                 .children
                 .iter()
                 .map(|c| c.display_name.clone())
                 .collect::<Vec<_>>()
-                .join("  "),
-            nw,
+                .join(", "),
         ));
-    }
-    if let Some(s) = &item.suspicion {
-        lines.push(Line::from(""));
-        lines.push(fact_row("leftover", &format!("score {}", s.score), nw).style(warn()));
-        for r in &s.reasons {
-            lines.push(fact_row("", r.as_str(), nw).style(warn()));
-        }
     }
     lines
 }
@@ -1028,7 +1195,10 @@ pub fn help_lines() -> Vec<Line<'static>> {
                 k.clean
             )),
             Line::from(format!("{}            prune anonymous volumes", k.prune)),
-            Line::from(format!("{}            open server URL from details", "o")),
+            Line::from(format!(
+                "{}            open selected listener as HTTP (an assumption)",
+                "o"
+            )),
             Line::from(format!("{}            refresh", k.refresh)),
             Line::from(format!("{}            this help", k.help)),
             Line::from(format!("{}            quit", k.quit)),

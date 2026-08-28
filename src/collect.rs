@@ -20,8 +20,15 @@ use std::sync::Arc;
 /// One scan of processes, ports, Docker, and leftover scores.
 /// Shared by the TUI loop and `--json` / `--plain`.
 pub fn snapshot() -> RuntimeSnapshot {
+    snapshot_with(&mut SysinfoProcessScanner::new())
+}
+
+/// Same as [`snapshot`] but from a caller-owned scanner, so CPU usage is a
+/// real delta across calls. The web dashboard keeps one scanner alive and
+/// passes it here — otherwise every request would be a first sample and CPU
+/// would read 0 forever.
+pub fn snapshot_with(scanner: &mut SysinfoProcessScanner) -> RuntimeSnapshot {
     let cfg = Config::global();
-    let mut scanner = SysinfoProcessScanner::new();
     let mut projects = ProjectCache::with_roots(cfg.project_roots());
     let processes = scanner.scan().unwrap_or_default();
     let ports = ports::scan().unwrap_or_default();

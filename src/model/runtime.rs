@@ -59,6 +59,40 @@ impl SuspicionReason {
             Self::SessionOwnerEnded => "owning session ended",
         }
     }
+
+    /// One shared human-readable explanation per reason, used by both the
+    /// TUI details and the web dashboard. Heuristic evidence is worded with
+    /// hedges ("may", "associated") — it must not sound exact.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::ParentExited => {
+                "The original parent is gone or the process was re-parented. It may \
+                 have outlived the process that launched it."
+            }
+            Self::OwningAgentMissing => {
+                "WYD can no longer find the agent associated with this runtime."
+            }
+            Self::McpOwnerMissing => {
+                "This MCP server is still running but no owning agent is currently present."
+            }
+            Self::HeadlessBrowserDetached => {
+                "A headless browser is still running after its controller or owning \
+                 runtime disappeared."
+            }
+            Self::LongRunningDevServer => {
+                "This dev server has been running longer than the configured leftover \
+                 threshold."
+            }
+            Self::LongRunningWorker => {
+                "This background worker has been running longer than the configured \
+                 leftover threshold."
+            }
+            Self::SessionOwnerEnded => {
+                "WYD previously observed this resource under a runtime session that has \
+                 ended, but the resource is still alive."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +124,16 @@ impl RuntimeItem {
             format!("{} ×{n}", self.display_name)
         } else {
             self.display_name.clone()
+        }
+    }
+
+    /// Semantic verdict, separate from the raw numeric score. The score is a
+    /// decision output; the verdict is how WYD labels the decision.
+    pub fn verdict(&self) -> &'static str {
+        match self.state {
+            RuntimeState::Suspicious => "leftover candidate",
+            RuntimeState::Persistent => "persistent",
+            RuntimeState::Active => "active",
         }
     }
 }

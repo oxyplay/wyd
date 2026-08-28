@@ -155,22 +155,37 @@ button, input { font-family: inherit; }
 
 .overview-list { display: flex; flex-direction: column; gap: 2px; }
 .ov-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 5px 8px;
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 4px 8px;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--ink);
 }
 .ov-row:hover { background: var(--surface-2); }
 .ov-row.selected { background: var(--accent-soft); font-weight: 600; }
-.ov-row .ov-name { flex: 1; }
+.ov-line { display: flex; align-items: baseline; gap: 8px; }
+.ov-row .ov-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ov-row .ov-count { font-variant-numeric: tabular-nums; color: var(--muted); }
-.ov-row .ov-mem { font-variant-numeric: tabular-nums; color: var(--muted); width: 56px; text-align: right; }
+.ov-sub {
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.ov-metric {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.ov-metric svg { width: 12px; height: 12px; }
 .ov-row.suspicious .ov-name { color: var(--warn); font-weight: 600; }
 .ov-row.zero { color: var(--muted); opacity: 0.6; }
-.ov-row.zero .ov-count, .ov-row.zero .ov-mem { opacity: 0.6; }
-
+.ov-row.zero .ov-count, .ov-row.zero .ov-sub { opacity: 0.6; }
 /* ───────── runtime table (tree) ───────── */
 
 .runtime-table {
@@ -330,6 +345,43 @@ button, input { font-family: inherit; }
 .evidence-label {
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
   font-weight: 600; color: var(--muted); margin-bottom: 4px;
+}
+
+/* ───────── listening sockets ───────── */
+
+.listeners {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+.listeners-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  font-weight: 600; color: var(--muted); margin-bottom: 6px;
+}
+.listeners-label .l-count { color: var(--accent); }
+.listener {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 14px;
+  padding: 2px 0;
+  font-variant-numeric: tabular-nums;
+}
+.listener .l-addr { color: var(--ink-strong); }
+.listener .l-proto, .listener .l-pid { color: var(--muted); }
+.listener .l-other { color: var(--warn); font-weight: 600; }
+
+/* ───────── reason explanations ───────── */
+
+.reason-block .r-short { color: var(--ink-strong); }
+.reason-block .r-explain {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 2px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 /* ───────── inline terminate confirm ───────── */

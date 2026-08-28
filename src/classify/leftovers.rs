@@ -170,20 +170,6 @@ fn reparented(p: &ProcessInfo, present: &HashSet<u32>) -> bool {
     }
 }
 
-pub fn leftover_ram(items: &[RuntimeItem]) -> u64 {
-    items
-        .iter()
-        .map(|i| {
-            let here = if i.state == RuntimeState::Suspicious {
-                i.memory_bytes
-            } else {
-                0
-            };
-            here + leftover_ram(&i.children)
-        })
-        .sum()
-}
-
 pub fn leftover_count(items: &[RuntimeItem]) -> usize {
     items
         .iter()

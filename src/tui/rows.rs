@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::classify::{leftover_count, leftover_ram};
+use crate::classify::leftover_count;
 use crate::model::session::SessionInfo;
 use crate::model::{
     Category, DockerResource, ListeningPort, RuntimeItem, RuntimeSnapshot, RuntimeState,
@@ -41,7 +41,6 @@ pub struct OverviewLine {
     pub section: Section,
     pub label: &'static str,
     pub count: u32,
-    pub extra: String,
 }
 
 pub enum Row<'a> {
@@ -129,13 +128,11 @@ fn docker_hit(res: &DockerResource, q: &str, project: Option<&str>) -> bool {
 
 pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
     let mut counts: HashMap<Category, u32> = HashMap::new();
-    let mut ram: HashMap<Category, u64> = HashMap::new();
-    add_cat(&snap.logical_items, &mut counts, &mut ram);
+    add_cat(&snap.logical_items, &mut counts);
     let mut lines = vec![OverviewLine {
         section: Section::All,
         label: "All",
         count: count_items(&snap.logical_items) as u32,
-        extra: String::new(),
     }];
     const ALWAYS: [Category; 6] = [
         Category::Agent,
@@ -146,7 +143,7 @@ pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
         Category::Worker,
     ];
     for c in ALWAYS {
-        lines.push(cat_line(c, &counts, &ram, true));
+        lines.push(cat_line(c, &counts));
     }
     for c in [
         Category::LanguageServer,
@@ -154,84 +151,50 @@ pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
         Category::UnknownDev,
     ] {
         if counts.get(&c).copied().unwrap_or(0) > 0 {
-            lines.push(cat_line(c, &counts, &ram, false));
+            lines.push(cat_line(c, &counts));
         }
     }
     lines.push(OverviewLine {
         section: Section::Docker,
         label: "Docker",
         count: snap.docker.resources.len() as u32,
-        extra: if snap.docker.ok {
-            fmt_bytes(snap.docker.disk_bytes)
-        } else {
-            "—".into()
-        },
     });
     lines.push(OverviewLine {
         section: Section::Ports,
         label: "Ports",
         count: count_ports(&snap.logical_items) as u32,
-        extra: String::new(),
     });
     lines.push(OverviewLine {
         section: Section::Projects,
         label: "Projects",
         count: count_projects(&snap.logical_items) as u32,
-        extra: String::new(),
     });
-    let n_left = leftover_count(&snap.logical_items) as u32;
     lines.push(OverviewLine {
         section: Section::Leftovers,
         label: "Leftovers",
-        count: n_left,
-        extra: if n_left == 0 {
-            String::new()
-        } else {
-            format!(
-                "{} RAM · {} disk",
-                fmt_bytes(leftover_ram(&snap.logical_items)),
-                fmt_bytes(snap.docker.reclaimable_bytes)
-            )
-        },
+        count: leftover_count(&snap.logical_items) as u32,
     });
     lines.push(OverviewLine {
         section: Section::Sessions,
         label: "Sessions",
         count: snap.sessions.len() as u32,
-        extra: String::new(),
     });
     lines
 }
 
-fn cat_line(
-    c: Category,
-    counts: &HashMap<Category, u32>,
-    ram: &HashMap<Category, u64>,
-    always: bool,
-) -> OverviewLine {
+fn cat_line(c: Category, counts: &HashMap<Category, u32>) -> OverviewLine {
     let n = counts.get(&c).copied().unwrap_or(0);
-    let extra = if always || n > 0 {
-        ram.get(&c).copied().map(fmt_bytes).unwrap_or_default()
-    } else {
-        String::new()
-    };
     OverviewLine {
         section: Section::Category(c),
         label: c.label(),
         count: n,
-        extra,
     }
 }
 
-fn add_cat(
-    items: &[RuntimeItem],
-    counts: &mut HashMap<Category, u32>,
-    ram: &mut HashMap<Category, u64>,
-) {
+fn add_cat(items: &[RuntimeItem], counts: &mut HashMap<Category, u32>) {
     for item in items {
         *counts.entry(item.category).or_insert(0) += item.process_ids.len() as u32;
-        *ram.entry(item.category).or_insert(0) += item.memory_bytes;
-        add_cat(&item.children, counts, ram);
+        add_cat(&item.children, counts);
     }
 }
 

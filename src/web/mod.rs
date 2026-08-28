@@ -16,10 +16,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::model::{RuntimeSnapshot, session::SessionInfo};
+use crate::scanner::processes::SysinfoProcessScanner;
 use crate::server;
 use crate::store::{RuntimeStore, SessionRecord};
 
@@ -63,9 +64,20 @@ pub trait RuntimeProvider: Send + Sync + 'static {
 /// Local provider: reuses the existing store + ownership tracker.
 struct LocalProvider {
     store_path: PathBuf,
+    /// Persistent process scanner, so CPU usage is a real delta across the
+    /// dashboard's 2s polls (sysinfo needs two samples; a fresh scanner per
+    /// request would report 0 forever).
+    scanner: Mutex<SysinfoProcessScanner>,
 }
 
 impl LocalProvider {
+    fn new(store_path: PathBuf) -> Self {
+        Self {
+            store_path,
+            scanner: Mutex::new(SysinfoProcessScanner::new()),
+        }
+    }
+
     fn open_store(&self) -> io::Result<RuntimeStore> {
         RuntimeStore::open(&self.store_path)
     }
@@ -76,7 +88,7 @@ impl RuntimeProvider for LocalProvider {
         "local"
     }
     fn snapshot(&self) -> RuntimeSnapshot {
-        crate::collect::snapshot()
+        crate::collect::snapshot_with(&mut self.scanner.lock())
     }
     fn explain(&self, pid: u32) -> Option<Value> {
         server::explain_pid(pid).ok()
@@ -161,9 +173,7 @@ pub fn serve(opts: WebOptions) -> io::Result<()> {
     } else {
         thread::spawn(server::collect_loop);
         eprintln!("wyd web on http://{addr} (local)");
-        Arc::new(LocalProvider {
-            store_path: RuntimeStore::default_path(),
-        })
+        Arc::new(LocalProvider::new(RuntimeStore::default_path()))
     };
 
     let state = Arc::new(RwLock::new(WebState::new(provider.mode())));
@@ -555,17 +565,34 @@ fn session_map(provider: &dyn RuntimeProvider) -> Option<HashMap<u32, u64>> {
 /// like the TUI's `\u251c`/`\u2514` tree), plus a `what` short label per
 /// category (agent/mcp/dev/db/...) matching the TUI's WHAT column.
 fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -> Vec<Value> {
-    fn what(cat: crate::model::Category) -> &'static str {
-        match cat {
+    fn what(item: &crate::model::RuntimeItem) -> String {
+        let ports = item.ports.len();
+        // Port-bearing categories get compact semantics that never imply a
+        // canonical listener: no listeners → bare role; exactly one → :port;
+        // several → ×N (matches the TUI's WHAT column).
+        let base = match item.category {
             crate::model::Category::Agent => "agent",
             crate::model::Category::Mcp => "mcp",
             crate::model::Category::Browser => "browser",
-            crate::model::Category::DevServer => "dev",
             crate::model::Category::LanguageServer => "ls",
-            crate::model::Category::Database => "db",
             crate::model::Category::DevService => "service",
             crate::model::Category::Worker => "worker",
             crate::model::Category::UnknownDev => "dev",
+            crate::model::Category::DevServer => "server",
+            crate::model::Category::Database => "db",
+        };
+        match item.category {
+            crate::model::Category::DevServer => match ports {
+                0 => base.to_string(),
+                1 => format!("srv :{}", item.ports[0].port),
+                _ => format!("srv ×{ports}"),
+            },
+            crate::model::Category::Database => match ports {
+                0 => base.to_string(),
+                1 => format!("db :{}", item.ports[0].port),
+                _ => format!("db ×{ports}"),
+            },
+            _ => base.to_string(),
         }
     }
 
@@ -589,6 +616,16 @@ fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let explanations = item
+            .suspicion
+            .as_ref()
+            .map(|s| {
+                s.reasons
+                    .iter()
+                    .map(|r| r.explanation().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let session_id = item
             .root_pid
             .and_then(|pid| session_map.and_then(|m| m.get(&pid)).copied());
@@ -600,17 +637,25 @@ fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -
             .collect::<Vec<_>>();
         json!({
             "category": item.category.label(),
-            "what": what(item.category),
+            "what": what(item),
             "name": item.display_name,
             "title": item.title(),
+            "verdict": item.verdict(),
             "root_pid": item.root_pid,
             "session_id": session_id.map(|s| format!("{:016x}", s)),
             "memory_bytes": item.memory_bytes,
             "cpu_percent": item.cpu_percent,
             "age_seconds": age_seconds,
             "status": status,
+            "score": item.suspicion.as_ref().map(|s| s.score),
             "reasons": reasons,
-            "ports": item.ports.iter().map(|p| json!({ "port": p.port, "protocol": format!("{:?}", p.protocol) })).collect::<Vec<_>>(),
+            "explanations": explanations,
+            "ports": item.ports.iter().map(|p| json!({
+                "port": p.port,
+                "protocol": p.protocol.as_str(),
+                "address": p.address.to_string(),
+                "pid": p.pid,
+            })).collect::<Vec<_>>(),
             "project": item.project.as_ref().map(|p| p.root.display().to_string()),
             "children": children,
         })
@@ -633,12 +678,12 @@ fn items_json(snap: &RuntimeSnapshot, session_map: Option<&HashMap<u32, u64>>) -
 /// Category counts + totals for the sidebar "Overview", like the TUI.
 fn overview(snap: &RuntimeSnapshot) -> Value {
     use std::collections::BTreeMap;
-    let mut counts: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+    let mut counts: BTreeMap<String, (usize, u64, f32)> = BTreeMap::new();
     let mut total_items = 0usize;
     let mut total_mem = 0u64;
     fn walk(
         item: &crate::model::RuntimeItem,
-        counts: &mut BTreeMap<String, (usize, u64)>,
+        counts: &mut BTreeMap<String, (usize, u64, f32)>,
         total_items: &mut usize,
         total_mem: &mut u64,
     ) {
@@ -646,9 +691,10 @@ fn overview(snap: &RuntimeSnapshot) -> Value {
         *total_mem += item.memory_bytes;
         let e = counts
             .entry(item.category.label().to_string())
-            .or_insert((0, 0));
+            .or_insert((0, 0, 0.0));
         e.0 += 1;
         e.1 += item.memory_bytes;
+        e.2 += item.cpu_percent;
         for c in &item.children {
             walk(c, counts, total_items, total_mem);
         }
@@ -658,27 +704,31 @@ fn overview(snap: &RuntimeSnapshot) -> Value {
     }
     let suspicious = {
         let mut n = 0u32;
-        fn walk2(item: &crate::model::RuntimeItem, n: &mut u32) {
+        let mut ram = 0u64;
+        fn walk2(item: &crate::model::RuntimeItem, n: &mut u32, ram: &mut u64) {
             if item.state == crate::model::RuntimeState::Suspicious {
                 *n += 1;
+                *ram += item.memory_bytes;
             }
             for c in &item.children {
-                walk2(c, n);
+                walk2(c, n, ram);
             }
         }
         for item in &snap.logical_items {
-            walk2(item, &mut n);
+            walk2(item, &mut n, &mut ram);
         }
-        n
+        (n, ram)
     };
     json!({
         "total_items": total_items,
         "total_memory_bytes": total_mem,
-        "suspicious": suspicious,
-        "categories": counts.iter().map(|(k, (n, mem))| json!({
+        "suspicious": suspicious.0,
+        "leftover_memory_bytes": suspicious.1,
+        "categories": counts.iter().map(|(k, (n, mem, cpu))| json!({
             "category": k,
             "count": n,
             "memory_bytes": mem,
+            "cpu_percent": cpu,
         })).collect::<Vec<_>>(),
     })
 }
@@ -1000,5 +1050,91 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    // ── Listener JSON semantics ────────────────────────────────────────
+    fn lp(port: u16, pid: u32) -> crate::model::ListeningPort {
+        crate::model::ListeningPort {
+            protocol: crate::model::Protocol::Tcp,
+            address: "127.0.0.1".parse().unwrap(),
+            port,
+            pid,
+        }
+    }
+
+    fn node_snapshot() -> RuntimeSnapshot {
+        use crate::model::{Category, RuntimeItem, RuntimeState};
+        let item = RuntimeItem {
+            category: Category::DevServer,
+            display_name: "node".into(),
+            root_pid: Some(90167),
+            process_ids: vec![90167],
+            memory_bytes: 16 << 20,
+            cpu_percent: 0.0,
+            state: RuntimeState::Suspicious,
+            suspicion: Some(crate::model::Suspicion {
+                score: 40,
+                reasons: vec![crate::model::SuspicionReason::ParentExited],
+            }),
+            ports: vec![
+                lp(45623, 90167),
+                lp(49206, 90167),
+                lp(53674, 90167),
+                lp(53675, 90167),
+            ],
+            project: None,
+            children: vec![],
+        };
+        RuntimeSnapshot {
+            processes: vec![],
+            logical_items: vec![item],
+            docker: Arc::new(crate::model::DockerSnapshot::default()),
+            total_memory_bytes: 32 << 30,
+            used_memory_bytes: 7 << 30,
+            cpu_percent: 1.0,
+            sessions: vec![],
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn listeners_serialize_with_port_protocol_address_pid() {
+        let snap = node_snapshot();
+        let items = items_json(&snap, None);
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        let ports = it["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 4, "all four listeners survive");
+        let serialized = serde_json::to_string(it).unwrap();
+        for p in ports {
+            assert!(p["port"].is_u64(), "port present");
+            assert_eq!(p["protocol"], "tcp", "stable lowercase protocol");
+            assert_eq!(p["address"], "127.0.0.1", "address present");
+            assert!(p["pid"].is_u64(), "pid present");
+        }
+        // Protocol is a stable lowercase string, not Rust Debug output.
+        assert!(
+            !serialized.contains("\"Tcp\""),
+            "must not leak Rust Debug for protocol: {serialized}"
+        );
+        // Existing useful fields remain.
+        assert_eq!(it["root_pid"], 90167);
+        assert_eq!(it["name"], "node");
+        assert_eq!(it["status"], "suspicious");
+    }
+
+    #[test]
+    fn items_expose_score_reasons_explanations_verdict() {
+        let snap = node_snapshot();
+        let it = &items_json(&snap, None)[0];
+        assert_eq!(it["score"], 40);
+        assert_eq!(it["reasons"][0], "parent exited / re-parented");
+        assert!(
+            it["explanations"][0]
+                .as_str()
+                .unwrap()
+                .contains("original parent")
+        );
+        assert_eq!(it["verdict"], "leftover candidate");
     }
 }

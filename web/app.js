@@ -11,6 +11,7 @@ const state = {
   sessions: [],
   items: [],        // nested tree
   overview: null,
+  docker: null,
   query: '',
   selectedCategory: null,  // filter from Overview, or null = All
   selection: null,         // selected item (flattened ref)
@@ -31,6 +32,7 @@ const SVG = {
   cpu:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>',
   time:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   pid:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>',
+  disk:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="2"/><path d="M12 2a10 10 0 0 1 10 10"/></svg>',
 };
 function icon(name, cls) {
   return `<span class="ico ${cls || ''}">${SVG[name] || ''}</span>`;
@@ -90,6 +92,7 @@ async function poll() {
     state.items = data.items;
     state.overview = data.overview;
     state.sessions = data.sessions;
+    state.docker = data.docker || null;
     render();
   } catch (e) { console.error('poll', e); }
 }
@@ -209,33 +212,65 @@ function renderOverview() {
   const list = $('overview-list');
   list.innerHTML = '';
 
-  // All row
-  const all = document.createElement('div');
-  all.className = 'ov-row' + (state.selectedCategory === null ? ' selected' : '');
-  all.innerHTML = `<span class="ov-name">All</span><span class="ov-count">${state.overview?.total_items || 0}</span>`;
-  all.onclick = () => dispatch({ type: 'category', category: null });
-  list.appendChild(all);
+  // A small metric segment: icon + value (e.g. [ram] 650 MB).
+  const metric = (iconName, text, label) =>
+    `<span class="ov-metric" title="${label}" aria-label="${label}">${SVG[iconName] || ''}<span class="ov-metric-v">${text}</span></span>`;
 
-  // Leftovers row (highlighted)
-  const lo = document.createElement('div');
-  lo.className = 'ov-row suspicious' + (state.selectedCategory === 'suspicious' ? ' selected' : '');
-  lo.innerHTML = `<span class="ov-name">Leftovers</span><span class="ov-count">${state.overview?.suspicious || 0}</span>`;
-  lo.onclick = () => dispatch({ type: 'category', category: 'suspicious' });
-  list.appendChild(lo);
-
-  // Category rows
-  (state.overview?.categories || []).forEach(c => {
+  // Two-line row: name + count on the first line, a small metric subtitle
+  // (RAM / CPU icons with values) below.
+  const ovRow = ({ cls = '', name, count, sub, onClick }) => {
     const row = document.createElement('div');
-    const selected = state.selectedCategory === c.category;
-    row.className = 'ov-row' + (selected ? ' selected' : '') + (c.count === 0 ? ' zero' : '');
-    row.innerHTML = `
-      <span class="ov-name">${escapeHtml(c.category)}</span>
-      <span class="ov-count">${c.count}</span>
-      <span class="ov-mem">${fmtBytes(c.memory_bytes)}</span>
-    `;
-    row.onclick = () => dispatch({ type: 'category', category: c.category });
+    row.className = 'ov-row' + (cls ? ' ' + cls : '');
+    const subEl = sub ? `<div class="ov-sub">${sub}</div>` : '';
+    row.innerHTML =
+      `<div class="ov-line"><span class="ov-name">${name}</span><span class="ov-count">${count}</span></div>` +
+      subEl;
+    if (onClick) row.onclick = onClick;
     list.appendChild(row);
+  };
+
+  // All row
+  ovRow({
+    cls: state.selectedCategory === null ? 'selected' : '',
+    name: 'All',
+    count: state.overview?.total_items || 0,
+    onClick: () => dispatch({ type: 'category', category: null }),
   });
+
+  // Leftovers row (highlighted): subtitle = RAM metric icon + value.
+  const loRam = state.overview?.leftover_memory_bytes
+    ? metric('ram', escapeHtml(fmtBytes(state.overview.leftover_memory_bytes)), 'RAM')
+    : '';
+  ovRow({
+    cls: 'suspicious' + (state.selectedCategory === 'suspicious' ? ' selected' : ''),
+    name: 'Leftovers',
+    count: state.overview?.suspicious || 0,
+    sub: loRam,
+    onClick: () => dispatch({ type: 'category', category: 'suspicious' }),
+  });
+
+  // Category rows: name = text, subtitle = RAM (+ CPU) metric icons.
+  (state.overview?.categories || []).forEach(c => {
+    const selected = state.selectedCategory === c.category;
+    let sub = metric('ram', fmtBytes(c.memory_bytes), 'RAM');
+    if (c.cpu_percent) sub += ' ' + metric('cpu', `${c.cpu_percent.toFixed(1)}%`, 'CPU');
+    ovRow({
+      cls: (selected ? 'selected' : '') + (c.count === 0 ? ' zero' : ''),
+      name: escapeHtml(c.category),
+      count: c.count,
+      sub,
+      onClick: () => dispatch({ type: 'category', category: c.category }),
+    });
+  });
+
+  // Docker row: reclaimable disk belongs to Docker, never to Leftovers.
+  const dk = state.docker;
+  if (dk && dk.ok !== false) {
+    const n = (dk.resources || []).length;
+    let sub = metric('disk', fmtBytes(dk.disk_bytes), 'Disk');
+    if (dk.reclaimable_bytes > 0) sub += ' ' + metric('disk', fmtBytes(dk.reclaimable_bytes), 'Reclaimable');
+    ovRow({ name: 'Docker', count: n, sub });
+  }
 }
 
 // Build the display tree: reuse the backend tree, but pull orphan
@@ -392,9 +427,12 @@ function renderDetails() {
 
   const i = sel.data;
   const reasons = (i.reasons || []);
-  const verdict = reasons.length
-    ? `Leftover · ${reasons[0]}`
-    : (i.status === 'persistent' ? 'Persistent service' : (i.status === 'active' ? 'Active' : 'Unknown'));
+  const explanations = (i.explanations || []);
+  const verdict = i.verdict
+    ? i.verdict.charAt(0).toUpperCase() + i.verdict.slice(1)
+    : (reasons.length
+        ? `Leftover · ${reasons[0]}`
+        : (i.status === 'persistent' ? 'Persistent service' : (i.status === 'active' ? 'Active' : 'Unknown')));
   const verdictTone = i.status === 'suspicious' ? 'warn'
     : i.status === 'persistent' ? 'neutral'
     : 'good';
@@ -405,6 +443,25 @@ function renderDetails() {
     <div class="evidence">
       <div class="evidence-label">Provenance</div>
       <ul>${evidence.map(e => `<li>${escapeHtml(e.kind)}${e.value ? ': ' + escapeHtml(e.value) : ''}</li>`).join('')}</ul>
+    </div>
+  ` : '';
+
+  // Observed listening sockets — NOT URLs. Each shows address, port,
+  // protocol and owning PID; a socket owned by another PID is called out.
+  const ports = i.ports || [];
+  const listenerBlock = ports.length ? `
+    <div class="listeners">
+      <div class="listeners-label">Listening sockets <span class="l-count">${ports.length} TCP</span></div>
+      ${ports.map(p => {
+        const pid = p.pid != null ? Number(p.pid) : 0;
+        const other = pid && pid !== Number(i.root_pid) ? ' <span class="l-other">(other)</span>' : '';
+        const pidTxt = pid ? `PID ${pid}` : 'PID unknown';
+        return `<div class="listener">
+          <span class="l-addr">${escapeHtml(String(p.address || ''))}:${escapeHtml(String(p.port ?? ''))}</span>
+          <span class="l-proto">${escapeHtml(p.protocol || 'tcp')}</span>
+          <span class="l-pid">${pidTxt}${other}</span>
+        </div>`;
+      }).join('')}
     </div>
   ` : '';
 
@@ -421,15 +478,19 @@ function renderDetails() {
     </div>
     ${reasons.length ? `
       <div class="reason-block">
-        <div class="reason-block-label">Why it's flagged</div>
-        <ul>${reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('')}</ul>
+        <div class="reason-block-label">${i.score != null ? `Score ${i.score} / 100` : "Why it's flagged"}</div>
+        <ul>${reasons.map((r, idx) => `
+          <li>
+            <span class="r-short">${escapeHtml(r)}</span>
+            ${explanations[idx] ? `<div class="r-explain">${escapeHtml(explanations[idx])}</div>` : ''}
+          </li>`).join('')}</ul>
       </div>
     ` : ''}
     ${evidenceBlock}
+    ${listenerBlock}
     <div class="kv">
       <div class="k">Category</div><div class="v">${escapeHtml(i.category)}</div>
       <div class="k">Status</div><div class="v">${escapeHtml(i.status)}</div>
-      <div class="k">Ports</div><div class="v">${(i.ports || []).map(p => p.port || p).join(', ') || '—'}</div>
       <div class="k">Project</div><div class="v">${escapeHtml(i.project || '—')}</div>
       <div class="k">Session</div><div class="v">${escapeHtml((i.session_id || '').slice(0, 16)) || 'unattributed'}</div>
     </div>

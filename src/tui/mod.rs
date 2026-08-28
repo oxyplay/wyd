@@ -46,6 +46,7 @@ struct App {
     ov_sel: usize,
     selected: usize,
     scroll: u16,
+    detail_scroll: u16,
     mode: Mode,
     marked: HashSet<usize>,
     query: String,
@@ -64,6 +65,7 @@ impl App {
             ov_sel: 0,
             selected: 0,
             scroll: 0,
+            detail_scroll: 0,
             mode: Mode::List,
             marked: HashSet::new(),
             query: String::new(),
@@ -287,6 +289,22 @@ fn handle_key(
                     open_selected_url(snap, app, 0);
                     KeyResult::Continue
                 }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.detail_scroll = app.detail_scroll.saturating_sub(1);
+                    KeyResult::Continue
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.detail_scroll = app.detail_scroll.saturating_add(1);
+                    KeyResult::Continue
+                }
+                KeyCode::PageUp => {
+                    app.detail_scroll = app.detail_scroll.saturating_sub(8);
+                    KeyResult::Continue
+                }
+                KeyCode::PageDown => {
+                    app.detail_scroll = app.detail_scroll.saturating_add(8);
+                    KeyResult::Continue
+                }
                 _ => KeyResult::Continue,
             }
         }
@@ -384,9 +402,10 @@ fn handle_mouse(
     };
     if !matches!(app.mode, Mode::List) {
         if matches!(m.kind, MouseEventKind::Down(_)) {
-            if h.popup.contains(pos) {
-                open_popup_url(snap, app, m.row.saturating_sub(h.popup.y));
-            } else {
+            // Only the popup area dismisses; listener rows are opened via the
+            // explicit `o` key (honest HTTP assumption), not a brittle
+            // popup-line offset.
+            if !h.popup.contains(pos) {
                 app.mode = Mode::List;
                 app.frozen_docker.clear();
             }
@@ -410,6 +429,7 @@ fn handle_mouse(
                     app.selected = i;
                     app.focus = Focus::Runtime;
                     if again && matches!(m.kind, MouseEventKind::Down(_)) {
+                        app.detail_scroll = 0;
                         app.mode = Mode::Details;
                     }
                 }
@@ -531,7 +551,10 @@ fn on_enter(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
             app.ov_sel = 0;
             app.reset_runtime();
         }
-        Some(_) => app.mode = Mode::Details,
+        Some(_) => {
+            app.detail_scroll = 0;
+            app.mode = Mode::Details;
+        }
         None => {}
     }
     KeyResult::Continue
@@ -595,12 +618,6 @@ fn open_selected_url(snap: &RuntimeSnapshot, app: &App, index: usize) {
     }
 }
 
-/// URL fact rows sit right under the popup header block: 1 row of padding,
-/// then col_header + item_line + blank.
-fn open_popup_url(snap: &RuntimeSnapshot, app: &App, popup_line: u16) {
-    open_selected_url(snap, app, popup_line.saturating_sub(4) as usize);
-}
-
 fn open_url(url: &str) {
     let cmd = if cfg!(target_os = "macos") {
         "open"
@@ -649,7 +666,8 @@ mod tests {
     use crate::model::{self, ProcessInfo, Project, RuntimeSnapshot};
 
     use super::draw::{
-        confirm_lines, details_lines, docker_confirm_lines, help_lines, window_title,
+        confirm_lines, details_lines, docker_confirm_lines, help_lines, hint, overview_lines,
+        runtime_summary, window_title,
     };
     use super::rows::{fmt_age, fmt_bytes, truncate};
 
@@ -792,7 +810,20 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("http://127.0.0.1:5555"), "{text}");
+        // A listener is an observed TCP socket, not a fabricated URL.
+        assert!(text.contains(":5555"), "{text}");
+        assert!(text.contains("127.0.0.1"), "{text}");
+        assert!(text.contains("pid 100"), "{text}");
+        assert!(
+            !text.contains("url"),
+            "listener must not be labeled url:\n{text}"
+        );
+        assert!(!text.contains("http://"), "no fabricated URL:\n{text}");
+        // The explicit HTTP open convenience still constructs a URL.
+        assert_eq!(
+            snap.logical_items[0].ports[0].url(),
+            "http://127.0.0.1:5555"
+        );
     }
 
     #[test]
@@ -1071,5 +1102,356 @@ mod tests {
         assert!(text.contains("old_web"), "{text}");
         assert!(text.contains("old_pg"), "{text}");
         assert!(text.contains("PERSISTENT DATA"), "{text}");
+    }
+
+    // ── Node PID 90167 regression fixture ──────────────────────────────
+    // A real dogfooding case: a node process with PPID 1, four localhost TCP
+    // listeners, ParentExited suspicion score 40, and a long command.
+    fn node_fixture() -> RuntimeSnapshot {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let process = ProcessInfo {
+            pid: 90167,
+            parent_pid: Some(1),
+            name: "node".into(),
+            command: vec![
+                "/Library/Application Support/OpenCode/open-code".into(),
+                "server".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--experimental-strip-types".into(),
+                "--source-map".into(),
+                "index.mjs".into(),
+            ],
+            executable: None,
+            cwd: Some("/".into()),
+            cpu_percent: 0.0,
+            memory_bytes: 16 << 20,
+            start_time: now - (2 * 3600 + 47 * 60),
+            tty: None,
+        };
+        let port = |p: u16| model::ListeningPort {
+            protocol: model::Protocol::Tcp,
+            address: "127.0.0.1".parse().unwrap(),
+            port: p,
+            pid: 90167,
+        };
+        let item = model::RuntimeItem {
+            category: model::Category::DevServer,
+            display_name: "node".into(),
+            root_pid: Some(90167),
+            process_ids: vec![90167],
+            memory_bytes: 16 << 20,
+            cpu_percent: 0.0,
+            state: model::RuntimeState::Suspicious,
+            suspicion: Some(model::Suspicion {
+                score: 40,
+                reasons: vec![model::SuspicionReason::ParentExited],
+            }),
+            ports: vec![port(45623), port(49206), port(53674), port(53675)],
+            project: None,
+            children: vec![],
+        };
+        RuntimeSnapshot {
+            processes: vec![process],
+            logical_items: vec![item],
+            docker: Arc::new(model::DockerSnapshot::default()),
+            total_memory_bytes: 32 << 30,
+            used_memory_bytes: 7 << 30,
+            cpu_percent: 1.0,
+            sessions: vec![],
+            version: 1,
+        }
+    }
+
+    fn join_lines(lines: Vec<ratatui::text::Line<'static>>) -> String {
+        lines
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render_runtime_at(snap: &RuntimeSnapshot, w: u16, h: u16) -> String {
+        let mut app = App::new();
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, snap, &mut app)).unwrap();
+        format!("{:?}", terminal.backend().buffer())
+    }
+
+    fn render_details_at(snap: &RuntimeSnapshot, w: u16, h: u16) -> String {
+        let mut app = App::new();
+        app.mode = Mode::Details;
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, snap, &mut app)).unwrap();
+        format!("{:?}", terminal.backend().buffer())
+    }
+
+    /// Listeners are observed TCP sockets, never presented as URLs; all four
+    /// survive with address + owning PID; not claiming four HTTP servers.
+    #[test]
+    fn node_details_listeners_are_not_urls() {
+        let snap = node_fixture();
+        let text = join_lines(details_lines(&snap, &App::new(), 80));
+        assert!(
+            !text.contains("url"),
+            "listeners must not be labeled url:\n{text}"
+        );
+        for p in [45623u16, 49206, 53674, 53675] {
+            assert!(
+                text.contains(&format!(":{p}")),
+                "missing listener :{p}:\n{text}"
+            );
+        }
+        assert!(text.contains("127.0.0.1"), "missing address:\n{text}");
+        assert!(text.contains("pid 90167"), "missing pid ownership:\n{text}");
+        assert!(
+            !text.contains("http://"),
+            "must not fabricate URLs:\n{text}"
+        );
+    }
+
+    #[test]
+    fn node_details_long_values_wrap_not_truncate() {
+        let snap = node_fixture();
+        let text = join_lines(details_lines(&snap, &App::new(), 80));
+        assert!(
+            text.contains("--experimental-strip-types"),
+            "long command truncated:\n{text}"
+        );
+        assert!(
+            text.contains("/Library/Application Support/OpenCode"),
+            "long path truncated:\n{text}"
+        );
+        assert!(text.contains("parent exited / re-parented"), "{text}");
+        assert!(
+            text.contains("The original parent is gone"),
+            "shared explanation missing:\n{text}"
+        );
+        assert!(text.contains("leftover candidate"), "{text}");
+        assert!(text.contains("40 / 100"), "{text}");
+    }
+
+    #[test]
+    fn node_what_is_multilistener() {
+        let snap = node_fixture();
+        let rendered = render_runtime_at(&snap, 100, 24);
+        assert!(
+            rendered.contains("srv ×4"),
+            "multi-listener WHAT:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn what_single_listener_shows_port() {
+        let mut snap = node_fixture();
+        snap.logical_items[0].ports.truncate(1);
+        snap.logical_items[0].ports[0].port = 5173;
+        let rendered = render_runtime_at(&snap, 100, 24);
+        assert!(rendered.contains("srv :5173"), "{rendered}");
+    }
+
+    #[test]
+    fn details_popup_renders_at_small_terminal() {
+        let snap = node_fixture();
+        let mut app = App::new();
+        app.mode = Mode::Details;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        // Top of the details hierarchy is visible at once.
+        assert!(rendered.contains("leftover candidate"), "{rendered}");
+        assert!(rendered.contains("40 / 100"), "{rendered}");
+        assert!(rendered.contains("node"), "{rendered}");
+        // Content taller than the popup → scrollable: the listeners are not
+        // visible yet, but scrolling brings them in.
+        app.detail_scroll = 20;
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let scrolled = format!("{:?}", terminal.backend().buffer());
+        assert!(scrolled.contains("listening sockets"), "{scrolled}");
+        assert!(scrolled.contains("45623"), "{scrolled}");
+    }
+
+    #[test]
+    fn details_popup_renders_at_medium_terminal() {
+        let snap = node_fixture();
+        let rendered = render_details_at(&snap, 140, 35);
+        assert!(rendered.contains("listening sockets"), "{rendered}");
+        assert!(
+            rendered.contains("53675"),
+            "last listener reachable:\n{rendered}"
+        );
+        assert!(rendered.contains("leftover candidate"), "{rendered}");
+    }
+
+    #[test]
+    fn details_scroll_increments_and_clamps() {
+        let snap = node_fixture();
+        let mut app = App::new();
+        app.mode = Mode::Details;
+        let (tx, _rx) = mpsc::channel();
+        for _ in 0..10 {
+            handle_key(KeyCode::Down, &snap, &mut app, &tx);
+        }
+        assert_eq!(app.detail_scroll, 10);
+        handle_key(KeyCode::Up, &snap, &mut app, &tx);
+        assert_eq!(app.detail_scroll, 9);
+        for _ in 0..20 {
+            handle_key(KeyCode::Up, &snap, &mut app, &tx);
+        }
+        assert_eq!(app.detail_scroll, 0, "must not go below zero");
+        // A large scroll clamps to content height when rendered (no panic).
+        app.detail_scroll = 999;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        assert!(
+            (app.detail_scroll as usize) < 999,
+            "scroll was clamped to content height, not left at 999: {}",
+            app.detail_scroll
+        );
+    }
+
+    #[test]
+    fn details_footer_describes_http_honestly() {
+        let snap = node_fixture();
+        let mut app = App::new();
+        app.mode = Mode::Details;
+        let h = hint(&app, &snap);
+        assert!(h.contains("j/k scroll"), "{h}");
+        assert!(h.contains("try HTTP"), "footer must say 'try HTTP': {h}");
+        assert!(h.contains("kill"), "{h}");
+        assert_eq!(
+            snap.logical_items[0].ports[0].url(),
+            "http://127.0.0.1:45623"
+        );
+    }
+
+    #[test]
+    fn help_describes_http_assumption() {
+        let text = join_lines(help_lines());
+        assert!(text.contains("as HTTP"), "{text}");
+    }
+
+    // ── Overview / sidebar semantics ───────────────────────────────────
+    fn overview_fixture() -> RuntimeSnapshot {
+        let mut snap = node_fixture();
+        let res = |name: &str| model::DockerResource {
+            kind: model::DockerKind::Container,
+            id: name.into(),
+            name: name.into(),
+            detail: "exited".into(),
+            size_bytes: 1 << 30,
+            compose: None,
+            persistent: false,
+            anonymous: false,
+            created: 0,
+        };
+        snap.docker = Arc::new(model::DockerSnapshot {
+            ok: true,
+            note: String::new(),
+            disk_bytes: 9 << 30,
+            reclaimable_bytes: 103 << 20,
+            resources: vec![res("a"), res("b")],
+        });
+        snap
+    }
+
+    #[test]
+    fn overview_shows_name_and_count_only() {
+        let snap = overview_fixture();
+        let text = join_lines(overview_lines(&snap, &App::new(), 44));
+        // Names and counts stay.
+        assert!(text.contains("Leftovers"), "{text}");
+        assert!(text.contains("Docker"), "{text}");
+        assert!(text.contains("Dev servers"), "{text}");
+        assert!(text.contains(" 1"), "leftover count:\n{text}");
+        assert!(text.contains(" 2"), "docker count:\n{text}");
+        // Metrics were removed from the sidebar — no RAM / disk / reclaim.
+        assert!(!text.contains("RAM"), "no memory in sidebar:\n{text}");
+        assert!(!text.contains("16M"), "no byte metric in sidebar:\n{text}");
+        assert!(!text.contains("9.0G"), "no docker disk in sidebar:\n{text}");
+        assert!(!text.contains("reclaim"), "no reclaim in sidebar:\n{text}");
+        assert!(!text.contains("dis…"), "no chopped summary:\n{text}");
+    }
+
+    #[test]
+    fn overview_narrow_keeps_name_and_count() {
+        let snap = overview_fixture();
+        let text = join_lines(overview_lines(&snap, &App::new(), 26));
+        assert!(text.contains("Leftovers"), "{text}");
+        assert!(text.contains("Docker"), "{text}");
+        assert!(text.contains("Dev servers"), "{text}");
+        assert!(text.contains(" 1"), "counts stay visible:\n{text}");
+        assert!(!text.contains("RAM"), "no memory in sidebar:\n{text}");
+    }
+
+    #[test]
+    fn overview_rows_never_exceed_pane_width() {
+        let snap = overview_fixture();
+        for w in [44usize, 34, 26, 20] {
+            let mut app = App::new();
+            app.focus = Focus::Overview;
+            app.ov_sel = 2;
+            for line in overview_lines(&snap, &app, w) {
+                let s = line.to_string();
+                assert!(
+                    s.chars().count() <= w,
+                    "overview row {s:?} exceeds width {w}"
+                );
+            }
+        }
+    }
+
+    // ── Bottom-of-pane RAM/CPU summary ─────────────────────────────────
+    #[test]
+    fn runtime_summary_shows_item_totals() {
+        let snap = node_fixture();
+        let rs = visible_rows(&snap, Section::All, None, "");
+        let line = runtime_summary(&rs, 60).to_string();
+        assert!(line.contains("1 item"), "{line}");
+        assert!(line.contains("16M RAM"), "{line}");
+        assert!(line.contains("CPU"), "{line}");
+        // Right-aligned: the value fills the pane width, hugging the right edge.
+        assert!(line.ends_with("0.0% CPU"), "right-aligned tail:\n{line}");
+        assert_eq!(line.chars().count(), 60, "padded to pane width:\n{line}");
+    }
+
+    #[test]
+    fn runtime_summary_aggregates_multiple_items() {
+        let mut snap = node_fixture();
+        snap.logical_items.push(model::RuntimeItem {
+            category: model::Category::Database,
+            display_name: "postgres".into(),
+            root_pid: Some(9999),
+            process_ids: vec![9999],
+            memory_bytes: 48 << 20,
+            cpu_percent: 3.0,
+            state: model::RuntimeState::Persistent,
+            suspicion: None,
+            ports: vec![],
+            project: None,
+            children: vec![],
+        });
+        let rs = visible_rows(&snap, Section::All, None, "");
+        let line = runtime_summary(&rs, 60).to_string();
+        assert!(line.contains("2 items"), "{line}");
+        assert!(line.contains("64M RAM"), "16M + 48M:\n{line}");
+        assert!(line.contains("3.0% CPU"), "{line}");
+    }
+
+    #[test]
+    fn runtime_summary_renders_in_pane() {
+        let snap = node_fixture();
+        let rendered = render_runtime_at(&snap, 100, 24);
+        assert!(
+            rendered.contains("1 item · 16M RAM"),
+            "summary strip visible in pane:\n{rendered}"
+        );
     }
 }
