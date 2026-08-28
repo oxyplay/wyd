@@ -2,7 +2,7 @@
 
 All notable changes to wyd.
 
-## [Unreleased]
+## [0.8.0] - 2026-08-28
 
 ### Added
 - **`wyd --demo` (TUI + CLI):** the same deterministic synthetic dataset as
@@ -42,7 +42,8 @@ All notable changes to wyd.
 - **Overview sidebar:** TUI shows name + count only; web shows RAM/CPU metrics
   as small icons with alt text. Docker reclaimable disk is shown against
   Docker, never folded into the Leftovers metric.
-- **Web sidebar narrower; aggregation line right-aligned.**
+- **TUI Overview sidebar narrowed** (name + count need less room, so the
+  Runtime table keeps the window); the Runtime bottom summary is right-aligned.
 - **`wyd web` local CPU fix:** the local provider keeps one persistent process
   scanner, so CPU is a real delta across the 2s polls instead of always 0
   (sysinfo needs two samples).

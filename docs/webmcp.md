@@ -15,10 +15,12 @@ than building a separate backend.
         │       └── DemoProvider   ──> deterministic synthetic snapshot
         │
         ├── HTTP API (loopback TcpListener)
-        │       /api/health · /api/snapshot · /api/overview
+        │       /api/health · /api/snapshot
         │       /api/sessions · /api/items · /api/leftovers
         │       /api/explain/<pid> · /api/proposal · /api/confirm
-        │       /api/kill (PID + start-time revalidated)
+        │       /api/kill (force) · /api/docker/stop · /api/docker/remove
+        │       /api/docker/prune   (PID + start-time revalidated; all
+        │                            mutating routes CSRF-guarded)
         │
         └── embedded static assets (web/index.html, web/app.js, web/styles.css)
                 │
