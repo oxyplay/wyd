@@ -144,6 +144,35 @@ function dispatch(action) {
       state.selection = { kind: 'item', data: action.item };
       state.confirmPid = null;
       render();
+      revealFocused();
+      break;
+    case 'focus-item': {
+      const item = action.item;
+      state.section = 'runtime';
+      state.selectedCategory = item && item.status === 'suspicious' ? 'suspicious' : null;
+      state.project = null;
+      state.selection = { kind: 'item', data: item };
+      state.confirmPid = null;
+      render();
+      revealFocused();
+      break;
+    }
+    case 'focus-session': {
+      state.section = 'sessions';
+      state.selectedCategory = null;
+      state.project = null;
+      state.selection = { kind: 'session', data: action.session };
+      state.confirmPid = null;
+      render();
+      revealFocused();
+      break;
+    }
+    case 'show-leftovers':
+      state.selectedCategory = 'suspicious';
+      state.section = 'runtime';
+      state.project = null;
+      state.selection = null;
+      render();
       break;
     case 'query':
       state.query = action.value;
@@ -245,6 +274,7 @@ function dispatch(action) {
     case 'proposal':
       state.proposal = { ...action.proposal, id: action.id };
       render();
+      revealProposal();
       break;
     case 'clear-proposal':
       state.proposal = null;
@@ -268,14 +298,12 @@ function render() {
   renderOverview();
   renderMain();
   renderProposal();
-  // drawer follows selection state
   const drawer = $('details-drawer');
-  if (state.selection) {
-    renderDetails();
-    drawer.classList.add('open');
-  } else {
-    drawer.classList.remove('open');
-  }
+  const has = !!state.selection;
+  if (has) renderDetails();
+  drawer.classList.toggle('open', has);
+  drawer.hidden = !has;
+  drawer.setAttribute('aria-hidden', has ? 'false' : 'true');
 }
 
 function renderOverview() {
@@ -563,6 +591,7 @@ function renderSessions() {
     .sort((a, b) => (b.active - a.active) || (b.started_at - a.started_at));
   if (!rows.length) { body.innerHTML = `<div class="muted" style="padding:16px 8px">No sessions.</div>`; return; }
   for (const s of rows) {
+    const selected = state.selection?.kind === 'session' && state.selection.data?.id === s.id;
     secRow(body, {
       nameTitle: `${s.agent} ${s.id}`,
       name: `<span>${escapeHtml(s.agent)}</span>`,
@@ -571,6 +600,8 @@ function renderSessions() {
       from: escapeHtml(shortenPath(s.project)) || '—',
       meta: `${s.active ? 'active' : 'ended'} · ${fmtAge(s.age_seconds)} · ${escapeHtml(String(s.id).slice(0, 8))}`,
       metaCls: s.active ? 'sec-ok' : 'sec-muted',
+      cls: selected ? 'selected' : '',
+      onClick: () => dispatch({ type: 'focus-session', session: s }),
     });
   }
 }
@@ -706,6 +737,30 @@ function renderDetails() {
     return;
   }
 
+  if (sel.kind === 'session') {
+    const s = sel.data;
+    const res = sessionResources(s);
+    const leftover = res.filter(r => r.status === 'suspicious');
+    body.innerHTML = `
+      <div class="verdict ${s.active ? 'verdict-good' : 'verdict-warn'}">
+        <span class="verdict-label">${s.active ? 'Active session' : 'Ended session'}</span>
+        <span class="verdict-text">${escapeHtml(s.agent)}</span>
+      </div>
+      <div class="kv">
+        <div class="k">Project</div><div class="v">${escapeHtml(s.project || '—')}</div>
+        <div class="k">Id</div><div class="v">${escapeHtml(s.id)}</div>
+        <div class="k">Age</div><div class="v">${fmtAge(s.age_seconds)}</div>
+        <div class="k">Resources</div><div class="v">${res.length} · ${leftover.length} leftover</div>
+      </div>
+      ${res.length ? `
+        <div class="evidence">
+          <div class="evidence-label">Still running</div>
+          <ul>${res.map(r => `<li>${escapeHtml(r.title || r.name)}${r.status === 'suspicious' ? ' · leftover' : ''}</li>`).join('')}</ul>
+        </div>` : '<p class="hint">No runtime resources attributed to this session.</p>'}
+    `;
+    return;
+  }
+
   const i = sel.data;
   const reasons = (i.reasons || []);
   const explanations = (i.explanations || []);
@@ -718,12 +773,24 @@ function renderDetails() {
     : i.status === 'persistent' ? 'neutral'
     : 'good';
 
-  // evidence from explain_process if available
   const evidence = (i.evidence || []);
   const evidenceBlock = evidence.length ? `
     <div class="evidence">
       <div class="evidence-label">Provenance</div>
       <ul>${evidence.map(e => `<li>${escapeHtml(e.kind)}${e.value ? ': ' + escapeHtml(e.value) : ''}</li>`).join('')}</ul>
+    </div>
+  ` : '';
+
+  const owner = i.session;
+  const ownerId = i.session_id || i.owner_session || owner?.id || '';
+  const ownerEnded = owner && (owner.active === false || owner.ended_at);
+  const ownerBlock = owner ? `
+    <div class="evidence">
+      <div class="evidence-label">Owning session</div>
+      <ul>
+        <li>${escapeHtml(owner.agent || 'unknown')}${ownerEnded ? ' · ended' : owner.active ? ' · active' : ''}${owner.project ? ' · ' + escapeHtml(owner.project) : ''}</li>
+        ${ownerId ? `<li>id ${escapeHtml(String(ownerId))}</li>` : ''}
+      </ul>
     </div>
   ` : '';
 
@@ -783,13 +850,14 @@ function renderDetails() {
       </div>
     ` : ''}
     ${evidenceBlock}
+    ${ownerBlock}
     ${listenerBlock}
     ${identityBlock}
     <div class="kv">
       <div class="k">Category</div><div class="v">${escapeHtml(i.category)}</div>
       <div class="k">Status</div><div class="v">${escapeHtml(i.status)}</div>
       <div class="k">Project</div><div class="v">${escapeHtml(i.project || '—')}</div>
-      <div class="k">Session</div><div class="v">${escapeHtml((i.session_id || '').slice(0, 16)) || 'unattributed'}</div>
+      <div class="k">Session</div><div class="v">${escapeHtml(String(ownerId).slice(0, 16)) || 'unattributed'}</div>
     </div>
     <div class="details-actions">
       <button class="btn-ask" id="copy-prompt">Copy investigation prompt</button>
@@ -962,17 +1030,111 @@ document.getElementById('theme-toggle').addEventListener('click', () => {
   applyTheme(!dark);
 });
 
+// ── lookup helpers for agent tools ──
+
+function findSession(id) {
+  if (id == null || id === '') return null;
+  const sid = String(id).toLowerCase();
+  return state.sessions.find(s => String(s.id).toLowerCase() === sid)
+    || state.sessions.find(s => String(s.id).toLowerCase().endsWith(sid))
+    || null;
+}
+
+function findItem(id) {
+  const items = flatten(state.items);
+  const raw = String(id);
+  const exact = items.find(i =>
+    i.name === raw || i.title === raw || String(i.root_pid) === raw || String(i.session_id) === raw
+  );
+  if (exact) return exact;
+  const q = raw.toLowerCase();
+  const loose = items.filter(i =>
+    (i.name || '').toLowerCase().includes(q) || (i.title || '').toLowerCase().includes(q)
+  );
+  if (loose.length === 1) return loose[0];
+  return loose.find(i => i.status === 'suspicious') || loose[0] || null;
+}
+
+function collectPids(item, into = []) {
+  if (item.root_pid != null) into.push(item.root_pid);
+  for (const c of item.children || []) collectPids(c, into);
+  return into;
+}
+
+function sessionResources(session) {
+  if (!session) return [];
+  const all = flatten(state.items);
+  const bySid = all.filter(i => i.session_id && i.session_id === session.id);
+  if (bySid.length) return bySid;
+  const trees = state.items.filter(i =>
+    (i.category || '').toLowerCase().includes('agent') &&
+    (i.name || '').toLowerCase() === (session.agent || '').toLowerCase()
+  );
+  const pids = new Set();
+  trees.forEach(t => collectPids(t).forEach(p => pids.add(p)));
+  return all.filter(i => pids.has(i.root_pid));
+}
+
+function leftoverItems({ agent, project } = {}) {
+  let out = flatten(state.items).filter(i => i.status === 'suspicious');
+  if (agent) {
+    const q = agent.toLowerCase();
+    const sessionIds = new Set(
+      state.sessions.filter(s => (s.agent || '').toLowerCase().includes(q)).map(s => s.id)
+    );
+    const pids = new Set();
+    state.items
+      .filter(i => (i.name || '').toLowerCase().includes(q))
+      .forEach(t => collectPids(t).forEach(p => pids.add(p)));
+    out = out.filter(i =>
+      sessionIds.has(i.session_id) || pids.has(i.root_pid) ||
+      (i.name || '').toLowerCase().includes(q)
+    );
+  }
+  if (project) {
+    const q = project.toLowerCase();
+    out = out.filter(i => (i.project || '').toLowerCase().includes(q));
+  }
+  return out;
+}
+
+function revealFocused() {
+  requestAnimationFrame(() => {
+    const row = document.querySelector('.rt-row.selected, .sec-row.selected');
+    if (!row) return;
+    row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    row.classList.add('pulse');
+    setTimeout(() => row.classList.remove('pulse'), 1400);
+  });
+}
+
+function revealProposal() {
+  requestAnimationFrame(() => {
+    const dock = $('proposal');
+    if (!dock || dock.classList.contains('empty')) return;
+    dock.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    dock.classList.add('pulse');
+    setTimeout(() => dock.classList.remove('pulse'), 1400);
+  });
+}
+
 // ── WebMCP tools ──
 
 async function registerWebMcpTools() {
-  const reg = (navigator.modelContext || document.modelContext);
-  if (!reg || typeof reg.registerTool !== 'function') return;
-
   const tools = [
     {
       name: 'list_sessions',
-      description: 'List known coding-agent runtime sessions tracked by wyd.',
-      inputSchema: { type: 'object', properties: { state: { type: 'string', enum: ['active', 'ended'] }, agent: { type: 'string' }, project: { type: 'string' } } },
+      title: 'List sessions',
+      description: 'List coding-agent runtime sessions tracked by wyd. Filter by state (active or ended), agent name (e.g. opencode), or project. Ended sessions are the ones that leave leftovers running.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          state: { type: 'string', enum: ['active', 'ended'], description: 'Filter by session state' },
+          agent: { type: 'string', description: 'Agent name substring, e.g. opencode' },
+          project: { type: 'string', description: 'Project path substring' },
+        },
+      },
+      annotations: { readOnlyHint: true },
       execute: ({ state: st, agent, project } = {}) => {
         let out = state.sessions.slice();
         if (st) out = out.filter(s => st === 'active' ? s.active : !s.active);
@@ -983,62 +1145,107 @@ async function registerWebMcpTools() {
     },
     {
       name: 'get_session',
-      description: 'Return one session by id, with its resources.',
-      inputSchema: { type: 'object', properties: { session_id: { type: 'string' } }, required: ['session_id'] },
+      title: 'Get session',
+      description: 'Get one session by id and the runtime resources it still owns. Focuses that session in the dashboard the human is looking at.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          session_id: { type: 'string', description: 'Session id from list_sessions' },
+        },
+        required: ['session_id'],
+      },
+      annotations: { readOnlyHint: true },
       execute: ({ session_id }) => {
-        const s = state.sessions.find(x => x.id === session_id);
+        const s = findSession(session_id);
         if (!s) return { error: 'no such session' };
-        const res = flatten(state.items).filter(i => i.session_id === session_id);
+        const res = sessionResources(s);
+        dispatch({ type: 'focus-session', session: s });
         return { session: s, resources: res };
       },
     },
     {
       name: 'list_leftovers',
-      description: 'List runtime resources considered leftover, with reasons.',
-      inputSchema: { type: 'object', properties: { agent: { type: 'string' }, project: { type: 'string' } } },
+      title: 'List leftovers',
+      description: 'List leftover runtime resources (orphaned after an agent session ended), with reasons. Switches the dashboard to the Leftovers view. Filter by agent or project.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', description: 'Agent name substring, e.g. opencode' },
+          project: { type: 'string', description: 'Project path substring' },
+        },
+      },
+      annotations: { readOnlyHint: true },
       execute: ({ agent, project } = {}) => {
-        let out = flatten(state.items).filter(i => i.status === 'suspicious');
-        if (agent) out = out.filter(i => (i.category || '').toLowerCase().includes(agent.toLowerCase()));
-        if (project) out = out.filter(i => (i.project || '').toLowerCase().includes(project.toLowerCase()));
+        dispatch({ type: 'show-leftovers' });
+        const out = leftoverItems({ agent, project });
         return { leftovers: out, count: out.length };
       },
     },
     {
       name: 'explain_process',
-      description: 'Return ownership / provenance for a process by pid (equivalent to `wyd why`).',
-      inputSchema: { type: 'object', properties: { pid: { type: 'number' } }, required: ['pid'] },
+      title: 'Explain process',
+      description: 'Explain why wyd attributes a process to a session (equivalent to `wyd why`). Opens the details drawer with provenance evidence. Pass the process pid (e.g. Chromium 4102).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pid: { type: 'number', description: 'Process pid to explain' },
+        },
+        required: ['pid'],
+      },
+      annotations: { readOnlyHint: true },
       execute: async ({ pid }) => {
         try {
           const data = await api(`/api/explain/${pid}`);
-          const item = flatten(state.items).find(i => i.root_pid === pid);
-          if (item) dispatch({ type: 'select', item: { ...item, ...data } });
+          const item = flatten(state.items).find(i => i.root_pid === pid) || findItem(String(pid));
+          if (item) dispatch({ type: 'focus-item', item: { ...item, ...data } });
           return data;
         } catch (e) { return { error: e.message }; }
       },
     },
     {
       name: 'focus_resource',
-      description: 'Highlight and select a runtime resource or session in the visible UI.',
-      inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['session', 'item'] }, id: { type: 'string' } }, required: ['kind', 'id'] },
+      title: 'Focus resource',
+      description: 'Highlight a session or resource in the dashboard the human is looking at. kind=session uses the session id; kind=item uses a resource name or pid.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['session', 'item'], description: 'What to focus' },
+          id: { type: 'string', description: 'Session id, resource name, or pid' },
+        },
+        required: ['kind', 'id'],
+      },
+      annotations: { readOnlyHint: true },
       execute: ({ kind, id }) => {
         if (kind === 'session') {
-          const s = state.sessions.find(x => x.id === id);
-          if (s) { state.selectedCategory = null; state.query = ''; }
-        } else {
-          const item = flatten(state.items).find(i => i.name === id || String(i.root_pid) === id);
-          if (item) dispatch({ type: 'select', item });
+          const s = findSession(id);
+          if (!s) return { ok: false, error: 'no such session' };
+          dispatch({ type: 'focus-session', session: s });
+          return { ok: true, focused: { kind, id: s.id, agent: s.agent } };
         }
-        render();
-        return { ok: true };
+        const item = findItem(id);
+        if (!item) return { ok: false, error: 'no such resource' };
+        dispatch({ type: 'focus-item', item });
+        return { ok: true, focused: { kind, id: item.name, pid: item.root_pid } };
       },
     },
     {
       name: 'propose_cleanup',
-      description: 'Generate a cleanup proposal. Never performs side effects. Updates the visible proposal panel.',
-      inputSchema: { type: 'object', properties: { scope: { type: 'string', enum: ['leftovers', 'agent'], default: 'leftovers' }, agent: { type: 'string' } } },
+      title: 'Propose cleanup',
+      description: 'Build a cleanup proposal of leftover resources. Never kills anything. Fills the Cleanup proposal panel so the human can confirm. Persistent services (postgres, redis, mysql) are excluded.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          scope: { type: 'string', enum: ['leftovers', 'agent'], default: 'leftovers', description: 'What to propose cleaning' },
+          agent: { type: 'string', description: 'When scope=agent, the agent name' },
+        },
+      },
+      annotations: { readOnlyHint: true },
       execute: async ({ scope = 'leftovers', agent } = {}) => {
         const body = { scope, id: agent || '' };
         const out = await api('/api/proposal', { method: 'POST', json: body });
+        state.selectedCategory = 'suspicious';
+        state.section = 'runtime';
+        state.project = null;
         dispatch({ type: 'proposal', id: out.id, proposal: out.proposal });
         return {
           id: out.id,
@@ -1051,11 +1258,34 @@ async function registerWebMcpTools() {
     },
   ];
 
-  for (const t of tools) {
-    try { await reg.registerTool(t); }
-    catch (e) { console.warn('tool register failed', t.name, e); }
-  }
-  console.info(`wyd web: registered ${tools.length} WebMCP tools.`);
+  window.wydWebMcp = {
+    names: tools.map(t => t.name),
+    invoke(name, args = {}) {
+      const t = tools.find(x => x.name === name);
+      if (!t) return Promise.reject(new Error('unknown tool: ' + name));
+      return Promise.resolve(t.execute(args));
+    },
+  };
+
+  let registered = false;
+  const tryReg = async () => {
+    const reg = document.modelContext || navigator.modelContext;
+    if (!reg || typeof reg.registerTool !== 'function') return false;
+    if (registered) return true;
+    registered = true;
+    for (const t of tools) {
+      try { await reg.registerTool(t); }
+      catch (e) { console.warn('tool register failed', t.name, e); }
+    }
+    console.info(`wyd web: registered ${tools.length} WebMCP tools.`);
+    return true;
+  };
+
+  if (await tryReg()) return;
+  const started = Date.now();
+  const iv = setInterval(async () => {
+    if (await tryReg() || Date.now() - started > 15000) clearInterval(iv);
+  }, 300);
 }
 
 // ── boot ──

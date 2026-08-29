@@ -89,34 +89,25 @@ Registered in the MCP Registry:
 
 - MCP Registry name: `mcp-name: io.github.oxyplay/wyd`
 
-## WebMCP (browser)
+## WebMCP
 
-`wyd web` is a loopback HTTP dashboard plus a WebMCP tool surface, so a
-**browser** agent can investigate runtime provenance in the same UI the
-human sees — not just a coding agent over stdio.
+Try the hosted demo: **https://demo.wyd.sh**
+
+wyd exposes six WebMCP tools so a browser agent can investigate leftovers in
+the same UI the human sees: `list_sessions`, `get_session`, `list_leftovers`,
+`explain_process`, `focus_resource`, `propose_cleanup`. Nothing is killed from
+a tool call — the human confirms cleanup.
 
 ```bash
-wyd web              # real local runtime (loopback only)
-wyd web --demo       # deterministic synthetic dataset, no host data
+wyd web         # local runtime (loopback)
+wyd web --demo  # synthetic dataset, no host data
 ```
 
-- **Overview** sidebar: categories with counts; RAM/CPU metrics shown as small
-  icons (with alt text), reclaimable Docker disk shown against Docker, never
-  the Leftovers total.
-- **Runtime** tree: agent → MCP → browser/dev-server hierarchy with RAM/CPU/status/age,
-  plus **Ports**, **Projects**, **Docker** and **Sessions** sections (Docker
-  resources can be stopped / removed / pruned right from the UI).
-- **Details** drawer: verdict, score, why-it's-flagged reasons with a shared
-  plain-language explanation, process identity (PID/PPID/cwd/command/tty),
-  listening sockets (address/port/protocol/pid — not assumed URLs), provenance
-  evidence, `Open as HTTP`, `Terminate` and `Force kill` (PID + start-time
-  revalidated, human-confirmed) and *Copy investigation prompt*.
-- **Light + dark** themes, responsive columns.
-- Loopback-only by default; `--allow-lan` is explicit and discouraged.
+WebMCP support was added during the OpenAI WebMCP Challenge on top of the
+existing wyd CLI/TUI runtime inspector.
 
-`wyd mcp` (stdio) and `wyd web` (browser WebMCP) read the same store and
-expose the same session/ownership primitives — they're entry points for
-different clients. See [docs/webmcp.md](docs/webmcp.md).
+See [docs/webmcp.md](docs/webmcp.md).
+
 
 ## Keys
 

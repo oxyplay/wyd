@@ -61,8 +61,8 @@ The page banner reads `Demo data — synthetic, not your machine.`
 
 ## WebMCP tools
 
-Registered through `document.modelContext.registerTool` (or
-`navigator.modelContext`). Each tool reads/writes the shared `appState` so
+Registered through `document.modelContext.registerTool` (Chrome ≥149;
+`navigator.modelContext` is accepted as a fallback). Each tool reads/writes the shared `appState` so
 the visible UI reflects every agent action.
 
 | Tool | Purpose | UI side effect |
@@ -117,11 +117,11 @@ Both read the same `RuntimeStore`; they exist for different clients.
 
 ## Supported environments
 
-WebMCP requires the host browser to expose `modelContext`:
+WebMCP requires the host browser to expose `document.modelContext`:
 
 - ChatGPT desktop app's built-in browser (Work / Codex).
-- Chrome ≥149 with the WebMCP origin trial flag
-  (`--enable-features=WebMCP`).
+- Chrome ≥149 with the WebMCP origin trial or
+  `chrome://flags/#enable-webmcp-testing`.
 
 When the API is unavailable the dashboard still works as a regular local
 web app; registration is skipped and the human can drive everything

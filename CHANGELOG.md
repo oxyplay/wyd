@@ -2,6 +2,20 @@
 
 All notable changes to wyd.
 
+## [0.8.1] - 2026-08-29
+
+### Added
+- Compact README WebMCP block pointing at the hosted demo (`https://demo.wyd.sh`)
+  and the six browser tools.
+
+### Fixed
+- WebMCP tools actually drive the shared UI: `explain_process` opens the
+  resource, `get_session` / `focus_resource` highlight it, `list_leftovers`
+  switches Overview to Leftovers, `propose_cleanup` fills the cleanup panel.
+- Demo items now carry `session_id`, so `get_session` returns that session's
+  leftovers (OpenCode → chrome-devtools-mcp / Chromium ×8 / vite).
+- Details drawer never opened: HTML `hidden` overrode `.open`.
+
 ## [0.8.0] - 2026-08-28
 
 ### Added

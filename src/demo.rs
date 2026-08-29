@@ -228,6 +228,25 @@ pub fn snapshot() -> RuntimeSnapshot {
         project: p_wyd.clone(),
         children: vec![],
     });
+    let vite_wyd = RuntimeItem {
+        category: Category::DevServer,
+        display_name: "vite :5173".into(),
+        root_pid: Some(4103),
+        process_ids: vec![4103],
+        memory_bytes: 118 << 20,
+        cpu_percent: 0.0,
+        state: RuntimeState::Suspicious,
+        suspicion: suspicious(
+            60,
+            vec![
+                SuspicionReason::SessionOwnerEnded,
+                SuspicionReason::LongRunningDevServer,
+            ],
+        ),
+        ports: vec![port(5173)],
+        project: p_wyd.clone(),
+        children: vec![],
+    };
 
     // ── claude (ended): playwright-mcp + Chromium + filesystem + next ──
     let mut playwright = RuntimeItem {
@@ -574,7 +593,7 @@ pub fn snapshot() -> RuntimeSnapshot {
             suspicion: suspicious(70, vec![SuspicionReason::SessionOwnerEnded]),
             ports: vec![],
             project: p_wyd.clone(),
-            children: vec![opencode_mcp],
+            children: vec![opencode_mcp, vite_wyd],
         },
         RuntimeItem {
             category: Category::Agent,

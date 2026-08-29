@@ -540,9 +540,8 @@ fn leftovers_response(provider: &dyn RuntimeProvider) -> HttpResponse {
 }
 
 /// Build a root_pid -> session_id map for attaching ownership to items.
-/// For the local provider this reads the durable store; the demo provider has
-/// no live store so it returns `None` (demo items carry their own session_id
-/// when relevant).
+/// Local mode reads the durable store. Demo mode has no store, so ownership
+/// is derived from the agent tree (same mapping `demo::explain` uses).
 fn session_map(provider: &dyn RuntimeProvider) -> Option<HashMap<u32, u64>> {
     match provider.mode() {
         "local" => {
@@ -571,8 +570,41 @@ fn session_map(provider: &dyn RuntimeProvider) -> Option<HashMap<u32, u64>> {
             }
             Some(map)
         }
+        "demo" => Some(demo_session_map(provider)),
         _ => None,
     }
+}
+
+fn demo_session_map(provider: &dyn RuntimeProvider) -> HashMap<u32, u64> {
+    let snap = provider.snapshot();
+    let agent_sid: HashMap<String, u64> = provider
+        .sessions()
+        .into_iter()
+        .map(|s| (s.agent, s.id.as_u64()))
+        .collect();
+    let mut map = HashMap::new();
+    fn walk(
+        item: &crate::model::RuntimeItem,
+        inherited: Option<u64>,
+        agent_sid: &HashMap<String, u64>,
+        map: &mut HashMap<u32, u64>,
+    ) {
+        let sid = if item.category == crate::model::Category::Agent {
+            agent_sid.get(&item.display_name).copied().or(inherited)
+        } else {
+            inherited
+        };
+        if let (Some(pid), Some(sid)) = (item.root_pid, sid) {
+            map.insert(pid, sid);
+        }
+        for c in &item.children {
+            walk(c, sid, agent_sid, map);
+        }
+    }
+    for item in &snap.logical_items {
+        walk(item, None, &agent_sid, &mut map);
+    }
+    map
 }
 
 /// Build a nested tree of runtime items (children are real child nodes,
@@ -1342,5 +1374,44 @@ mod tests {
             let v: Value = serde_json::from_slice(&resp.body).unwrap();
             assert_eq!(v["simulated"], true, "route {route:?}");
         }
+    }
+
+    #[test]
+    fn demo_items_carry_session_id() {
+        let resp = snapshot_response(&DemoProvider);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        let items = v["data"]["items"].as_array().unwrap();
+        fn find<'a>(items: &'a [Value], name: &str) -> Option<&'a Value> {
+            for i in items {
+                if i["name"].as_str() == Some(name) {
+                    return Some(i);
+                }
+                if let Some(ch) = i["children"].as_array()
+                    && let Some(found) = find(ch, name)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let oc = find(items, "opencode").expect("opencode item");
+        let cr = find(items, "Chromium x8").expect("chromium leftover");
+        let sid = oc["session_id"].as_str().expect("opencode session_id");
+        assert_eq!(sid.len(), 16);
+        assert_eq!(cr["session_id"].as_str(), Some(sid));
+        let sessions = v["data"]["sessions"].as_array().unwrap();
+        let oc_sess = sessions.iter().find(|s| s["agent"] == "opencode").unwrap();
+        assert_eq!(oc_sess["id"].as_str(), Some(sid));
+        assert_eq!(oc_sess["active"], false);
+    }
+
+    #[test]
+    fn demo_explain_chromium_names_opencode_session() {
+        let exp = DemoProvider.explain(4102).expect("chromium explain");
+        assert_eq!(exp["name"], "Chromium x8");
+        assert_eq!(exp["verdict"], "owned");
+        assert_eq!(exp["session"]["agent"], "opencode");
+        assert_eq!(exp["session"]["active"], false);
+        assert!(exp["evidence"].as_array().unwrap().len() >= 2);
     }
 }

@@ -224,6 +224,14 @@ button, input { font-family: inherit; }
 }
 .rt-row:hover { background: var(--surface-2); }
 .rt-row.selected { background: var(--accent-soft); }
+.rt-row.pulse, .sec-row.pulse, .proposal.pulse {
+  animation: wyd-pulse 1.2s ease-out;
+}
+@keyframes wyd-pulse {
+  0% { box-shadow: inset 0 0 0 2px var(--accent); }
+  100% { box-shadow: inset 0 0 0 0 transparent; }
+}
+
 .rt-row .cell { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .rt-row .c-name { display: flex; align-items: center; gap: 6px; font-weight: 500; color: var(--ink-strong); }
 .rt-row .c-name .tree-guide { color: var(--line-strong); font-size: 12px; flex-shrink: 0; }
@@ -554,6 +562,10 @@ button:focus-visible, [tabindex]:focus-visible, a:focus-visible, input:focus-vis
   border-top-color: var(--line);
 }
 .proposal.empty .proposal-title { color: var(--muted); }
+.proposal:not(.empty) {
+  border-top-color: var(--accent);
+}
+.proposal:not(.empty) .proposal-title { color: var(--ink-strong); }
 
 
 /* ───────── theme toggle ───────── */
