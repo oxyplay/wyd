@@ -103,6 +103,14 @@ wyd web         # local runtime (loopback)
 wyd web --demo  # synthetic dataset, no host data
 ```
 
+### Quick test
+
+Paste this into a browser agent on the [demo](https://demo.wyd.sh) (or local `wyd web`):
+
+```text
+Find an ended OpenCode session, show me what it left running, explain Chromium PID 4102, and prepare a cleanup proposal. Do not execute cleanup.
+```
+
 WebMCP support was added during the OpenAI WebMCP Challenge on top of the
 existing wyd CLI/TUI runtime inspector.
 

@@ -725,7 +725,7 @@ pub fn explain(pid: u32) -> Option<Value> {
         "name": item.display_name,
         "owner_session": owner_hex,
         "exact": true,
-        "verdict": "owned",
+        "ownership": "owned",
         "resolver_version": 1,
         "evidence": [
             { "kind": "cwd match", "value": cwd_value },

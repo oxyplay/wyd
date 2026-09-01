@@ -2,6 +2,19 @@
 
 All notable changes to wyd.
 
+## [0.9.0] - 2026-09-01
+
+### Added
+- README WebMCP section: a one-prompt Quick test for browser agents.
+
+### Fixed
+- Demo `explain` no longer overloads the `verdict` field: attribution is
+  reported as `ownership` (`owned`) and the details drawer shows it under an
+  OWNERSHIP header, separate from the lifecycle VERDICT row (leftover
+  candidate / persistent / active). Previously `explain_process` overwrote the
+  lifecycle verdict with `owned`, so a resource could look "Owned" and
+  "leftover candidate" under the same label.
+
 ## [0.8.1] - 2026-08-29
 
 ### Added

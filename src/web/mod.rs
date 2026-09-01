@@ -1409,7 +1409,7 @@ mod tests {
     fn demo_explain_chromium_names_opencode_session() {
         let exp = DemoProvider.explain(4102).expect("chromium explain");
         assert_eq!(exp["name"], "Chromium x8");
-        assert_eq!(exp["verdict"], "owned");
+        assert_eq!(exp["ownership"], "owned");
         assert_eq!(exp["session"]["agent"], "opencode");
         assert_eq!(exp["session"]["active"], false);
         assert!(exp["evidence"].as_array().unwrap().len() >= 2);

@@ -764,6 +764,12 @@ function renderDetails() {
   const i = sel.data;
   const reasons = (i.reasons || []);
   const explanations = (i.explanations || []);
+  // Two distinct axes, deliberately separate rows:
+  // - Ownership: attribution — which session owns this resource (from explain).
+  // - Verdict: lifecycle — how wyd flags it (leftover candidate / persistent / active).
+  const ownership = i.ownership
+    ? i.ownership.charAt(0).toUpperCase() + i.ownership.slice(1)
+    : null;
   const verdict = i.verdict
     ? i.verdict.charAt(0).toUpperCase() + i.verdict.slice(1)
     : (reasons.length
@@ -829,6 +835,12 @@ function renderDetails() {
   ` : '';
 
   body.innerHTML = `
+    ${ownership ? `
+    <div class="verdict verdict-good">
+      <span class="verdict-label">Ownership</span>
+      <span class="verdict-text">${escapeHtml(ownership)}</span>
+    </div>
+    ` : ''}
     <div class="verdict verdict-${verdictTone}">
       <span class="verdict-label">Verdict</span>
       <span class="verdict-text">${escapeHtml(verdict)}</span>
