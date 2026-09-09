@@ -10,6 +10,7 @@ mod platform;
 mod scanner;
 mod server;
 mod store;
+mod trace;
 mod tui;
 mod web;
 use std::io;

@@ -12,6 +12,7 @@ use crate::classify::ownership::resolver::{AttributionDecision, Evidence, Eviden
 use crate::model::boot::{BootEpoch, BootId};
 use crate::model::process::ProcessIdentity;
 use crate::model::session::RuntimeSessionId;
+use crate::trace;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -19,6 +20,36 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 1;
+
+/// One deferred trace line from inside a transaction. `reselect` names the
+/// primary key to re-read after commit for the post-image; when absent,
+/// `new` carries the post-image directly.
+struct PendingEmit {
+    table: &'static str,
+    session: String,
+    key: String,
+    op: &'static str,
+    old: Option<serde_json::Value>,
+    new: Option<serde_json::Value>,
+    reselect: Option<(&'static str, serde_json::Value)>,
+}
+
+fn flush_emits(conn: &Connection, pend: Vec<PendingEmit>) {
+    for p in pend {
+        let new = match p.reselect {
+            Some((col, pk)) => trace::fetch_row(conn, p.table, col, &pk),
+            None => p.new,
+        };
+        trace::emit(
+            p.table,
+            &p.session,
+            &p.key,
+            p.op,
+            p.old.as_ref(),
+            new.as_ref(),
+        );
+    }
+}
 
 /// Local SQLite store for runtime ownership provenance.
 pub struct RuntimeStore {
@@ -241,10 +272,38 @@ impl RuntimeStore {
             )
             .optional()?;
         if let Some(b) = existing {
+            let old = trace::enabled()
+                .then(|| {
+                    trace::fetch_row(
+                        &self.conn,
+                        "boots",
+                        "boot_id",
+                        &serde_json::json!(trace::hex(&b)),
+                    )
+                })
+                .flatten();
             self.conn.execute(
                 "UPDATE boots SET last_seen = ?1 WHERE boot_id = ?2",
                 params![now as i64, b],
             )?;
+            if trace::enabled() {
+                let new = serde_json::json!({
+                    "boot_id": trace::hex(&b),
+                    "platform_epoch": trace::hex(&bytes),
+                    "first_seen": old.as_ref()
+                        .and_then(|o| o.get("first_seen").cloned())
+                        .unwrap_or(serde_json::Value::Null),
+                    "last_seen": now as i64,
+                });
+                trace::emit(
+                    "boots",
+                    "",
+                    &trace::hex(&b),
+                    "update",
+                    old.as_ref(),
+                    Some(&new),
+                );
+            }
             return Ok(bytes_to_boot(&b));
         }
         let id = BootId::random();
@@ -254,17 +313,34 @@ impl RuntimeStore {
              VALUES (?1, ?2, ?3, ?3)",
             params![ib, bytes, now as i64],
         )?;
+        if trace::enabled() {
+            let new = serde_json::json!({
+                "boot_id": trace::hex(&ib),
+                "platform_epoch": trace::hex(&bytes),
+                "first_seen": now as i64,
+                "last_seen": now as i64,
+            });
+            trace::emit("boots", "", &trace::hex(&ib), "create", None, Some(&new));
+        }
         Ok(id)
     }
 
     /// Persist the exact-observed sessions and owned resources of one pass.
     pub fn apply_ownership(&mut self, result: &OwnershipResult, now: u64) -> io::Result<()> {
+        let tracing = trace::enabled();
+        let mut pend: Vec<PendingEmit> = Vec::new();
         let tx = self.conn.transaction().map_err(err)?;
         for s in &result.sessions {
+            let sid = s.id.as_u64() as i64;
             let project = s
                 .project
                 .as_ref()
                 .map(|p| p.root.to_string_lossy().to_string());
+            let old = if tracing {
+                trace::fetch_row(&tx, "sessions", "session_id", &serde_json::json!(sid))
+            } else {
+                None
+            };
             tx.execute(
                 "INSERT INTO sessions
                    (session_id, boot_id, agent, root_pid, root_start_time,
@@ -275,7 +351,7 @@ impl RuntimeStore {
                     ended_at = excluded.ended_at,
                     project = COALESCE(excluded.project, sessions.project)",
                 params![
-                    s.id.as_u64() as i64,
+                    sid,
                     s.root.boot_id.to_le_bytes().to_vec(),
                     s.agent,
                     s.root.pid as i64,
@@ -287,9 +363,48 @@ impl RuntimeStore {
                 ],
             )
             .map_err(err)?;
+            if tracing {
+                pend.push(PendingEmit {
+                    table: "sessions",
+                    session: sid.to_string(),
+                    key: sid.to_string(),
+                    op: if old.is_some() { "update" } else { "create" },
+                    old,
+                    new: None,
+                    reselect: Some(("session_id", serde_json::json!(sid))),
+                });
+            }
         }
 
         for o in &result.owned {
+            let rid = o.resource.as_u64() as i64;
+            let res_old = if tracing {
+                trace::fetch_row(&tx, "resources", "resource_id", &serde_json::json!(rid))
+            } else {
+                None
+            };
+            let old_members: Vec<serde_json::Value> = if tracing {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT resource_id, boot_id, pid, start_time
+                         FROM resource_members WHERE resource_id = ?1",
+                    )
+                    .map_err(err)?;
+                let rows = stmt
+                    .query_map(params![rid], |r| {
+                        let boot: Vec<u8> = r.get(1)?;
+                        Ok(serde_json::json!({
+                            "resource_id": r.get::<_, i64>(0)?,
+                            "boot_id": trace::hex(&boot),
+                            "pid": r.get::<_, i64>(2)?,
+                            "start_time": r.get::<_, i64>(3)?,
+                        }))
+                    })
+                    .map_err(err)?;
+                rows.filter_map(|r| r.ok()).collect()
+            } else {
+                Vec::new()
+            };
             tx.execute(
                 "INSERT INTO resources
                    (resource_id, kind, root_boot_id, root_pid, root_start_time,
@@ -298,7 +413,7 @@ impl RuntimeStore {
                  ON CONFLICT(resource_id) DO UPDATE SET
                     last_seen_at = excluded.last_seen_at",
                 params![
-                    o.resource.as_u64() as i64,
+                    rid,
                     format!("{:?}", o.kind),
                     o.root.boot_id.to_le_bytes().to_vec(),
                     o.root.pid as i64,
@@ -307,10 +422,40 @@ impl RuntimeStore {
                 ],
             )
             .map_err(err)?;
+            if tracing {
+                pend.push(PendingEmit {
+                    table: "resources",
+                    session: String::new(),
+                    key: rid.to_string(),
+                    op: if res_old.is_some() {
+                        "update"
+                    } else {
+                        "create"
+                    },
+                    old: res_old,
+                    new: None,
+                    reselect: Some(("resource_id", serde_json::json!(rid))),
+                });
+                for m in old_members {
+                    pend.push(PendingEmit {
+                        table: "resource_members",
+                        session: String::new(),
+                        key: format!(
+                            "{}:{}",
+                            rid,
+                            m.get("boot_id").and_then(|v| v.as_str()).unwrap_or("?")
+                        ),
+                        op: "delete",
+                        old: Some(m),
+                        new: None,
+                        reselect: None,
+                    });
+                }
+            }
 
             tx.execute(
                 "DELETE FROM resource_members WHERE resource_id = ?1",
-                params![o.resource.as_u64() as i64],
+                params![rid],
             )
             .map_err(err)?;
             for m in &o.members {
@@ -318,24 +463,67 @@ impl RuntimeStore {
                     "INSERT INTO resource_members (resource_id, boot_id, pid, start_time)
                      VALUES (?1, ?2, ?3, ?4)",
                     params![
-                        o.resource.as_u64() as i64,
+                        rid,
                         m.boot_id.to_le_bytes().to_vec(),
                         m.pid as i64,
                         m.start_time as i64,
                     ],
                 )
                 .map_err(err)?;
+                if tracing {
+                    pend.push(PendingEmit {
+                        table: "resource_members",
+                        session: String::new(),
+                        key: format!("{rid}:{}", trace::hex(&m.boot_id.to_le_bytes())),
+                        op: "create",
+                        old: None,
+                        new: Some(serde_json::json!({
+                            "resource_id": rid,
+                            "boot_id": trace::hex(&m.boot_id.to_le_bytes()),
+                            "pid": m.pid as i64,
+                            "start_time": m.start_time as i64,
+                        })),
+                        reselect: None,
+                    });
+                }
             }
 
+            let own_sid = o.session.as_u64() as i64;
+            let own_old = if tracing {
+                trace::fetch_row(
+                    &tx,
+                    "exact_ownership",
+                    "resource_id",
+                    &serde_json::json!(rid),
+                )
+            } else {
+                None
+            };
             tx.execute(
                 "INSERT INTO exact_ownership (resource_id, session_id)
                  VALUES (?1, ?2)
                  ON CONFLICT(resource_id) DO UPDATE SET session_id = excluded.session_id",
-                params![o.resource.as_u64() as i64, o.session.as_u64() as i64],
+                params![rid, own_sid],
             )
             .map_err(err)?;
+            if tracing {
+                pend.push(PendingEmit {
+                    table: "exact_ownership",
+                    session: own_sid.to_string(),
+                    key: rid.to_string(),
+                    op: if own_old.is_some() {
+                        "update"
+                    } else {
+                        "create"
+                    },
+                    old: own_old,
+                    new: None,
+                    reselect: Some(("resource_id", serde_json::json!(rid))),
+                });
+            }
         }
         tx.commit().map_err(err)?;
+        flush_emits(&self.conn, pend);
         Ok(())
     }
 
@@ -398,6 +586,8 @@ impl RuntimeStore {
         live_roots: &std::collections::HashSet<ProcessIdentity>,
         now: u64,
     ) -> io::Result<()> {
+        let tracing = trace::enabled();
+        let mut pend: Vec<PendingEmit> = Vec::new();
         let tx = self.conn.transaction().map_err(err)?;
         let mut stmt = tx
             .prepare(
@@ -419,14 +609,31 @@ impl RuntimeStore {
                 start_time: start as u64,
             };
             if !live_roots.contains(&root) {
+                let old = if tracing {
+                    trace::fetch_row(&tx, "sessions", "session_id", &serde_json::json!(id))
+                } else {
+                    None
+                };
                 tx.execute(
                     "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
                     params![now as i64, id],
                 )
                 .map_err(err)?;
+                if tracing {
+                    pend.push(PendingEmit {
+                        table: "sessions",
+                        session: id.to_string(),
+                        key: id.to_string(),
+                        op: "update",
+                        old,
+                        new: None,
+                        reselect: Some(("session_id", serde_json::json!(id))),
+                    });
+                }
             }
         }
         tx.commit().map_err(err)?;
+        flush_emits(&self.conn, pend);
         Ok(())
     }
 
@@ -444,6 +651,8 @@ impl RuntimeStore {
         live: &HashSet<ProcessIdentity>,
     ) -> io::Result<()> {
         let cutoff = now.saturating_sub(retention_secs) as i64;
+        let tracing = trace::enabled();
+        let mut pend: Vec<PendingEmit> = Vec::new();
         let tx = self.conn.transaction().map_err(err)?;
 
         // Which resources have a live member or root?
@@ -500,16 +709,77 @@ impl RuntimeStore {
             if protected.contains(&sid) {
                 continue;
             }
+            let old_sess = if tracing {
+                trace::fetch_row(&tx, "sessions", "session_id", &serde_json::json!(sid))
+            } else {
+                None
+            };
             tx.execute("DELETE FROM sessions WHERE session_id = ?1", params![sid])
                 .map_err(err)?;
+            if tracing {
+                pend.push(PendingEmit {
+                    table: "sessions",
+                    session: sid.to_string(),
+                    key: sid.to_string(),
+                    op: "delete",
+                    old: old_sess,
+                    new: None,
+                    reselect: None,
+                });
+            }
+            let old_edges: Vec<serde_json::Value> = if tracing {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT resource_id, session_id FROM exact_ownership WHERE session_id = ?1",
+                    )
+                    .map_err(err)?;
+                let rows = stmt
+                    .query_map(params![sid], |r| {
+                        Ok(serde_json::json!({
+                            "resource_id": r.get::<_, i64>(0)?,
+                            "session_id": r.get::<_, i64>(1)?,
+                        }))
+                    })
+                    .map_err(err)?;
+                rows.filter_map(|r| r.ok()).collect()
+            } else {
+                Vec::new()
+            };
             tx.execute(
                 "DELETE FROM exact_ownership WHERE session_id = ?1",
                 params![sid],
             )
             .map_err(err)?;
+            if tracing {
+                for e in old_edges {
+                    pend.push(PendingEmit {
+                        table: "exact_ownership",
+                        session: sid.to_string(),
+                        key: e
+                            .get("resource_id")
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                        op: "delete",
+                        old: Some(e),
+                        new: None,
+                        reselect: None,
+                    });
+                }
+            }
         }
 
         // Old orphaned resources (no ownership edge) and their members.
+        let orphan_resources: Vec<i64> = if tracing {
+            scalars(
+                &tx,
+                "SELECT resource_id FROM resources
+                 WHERE resource_id NOT IN (SELECT resource_id FROM exact_ownership)
+                   AND last_seen_at < ?1",
+                Some(&cutoff),
+            )?
+        } else {
+            Vec::new()
+        };
         tx.execute(
             "DELETE FROM resources
              WHERE resource_id NOT IN (SELECT resource_id FROM exact_ownership)
@@ -517,6 +787,19 @@ impl RuntimeStore {
             params![cutoff],
         )
         .map_err(err)?;
+        if tracing {
+            for rid in orphan_resources {
+                pend.push(PendingEmit {
+                    table: "resources",
+                    session: String::new(),
+                    key: rid.to_string(),
+                    op: "delete",
+                    old: None,
+                    new: None,
+                    reselect: None,
+                });
+            }
+        }
         tx.execute(
             "DELETE FROM resource_members
              WHERE resource_id NOT IN (SELECT resource_id FROM resources)",
@@ -531,6 +814,7 @@ impl RuntimeStore {
         )
         .map_err(err)?;
         tx.commit().map_err(err)?;
+        flush_emits(&self.conn, pend);
         Ok(())
     }
 
@@ -544,6 +828,8 @@ impl RuntimeStore {
         d: &AttributionDecision,
         now: u64,
     ) -> io::Result<()> {
+        let tracing = trace::enabled();
+        let mut pend: Vec<PendingEmit> = Vec::new();
         let tx = self.conn.transaction().map_err(err)?;
         tx.execute(
             "INSERT INTO attribution_decisions
@@ -559,6 +845,17 @@ impl RuntimeStore {
         )
         .map_err(err)?;
         let decision_id = tx.last_insert_rowid();
+        if tracing {
+            pend.push(PendingEmit {
+                table: "attribution_decisions",
+                session: d.winner.map(|w| w.as_u64().to_string()).unwrap_or_default(),
+                key: decision_id.to_string(),
+                op: "create",
+                old: None,
+                new: None,
+                reselect: Some(("decision_id", serde_json::json!(decision_id))),
+            });
+        }
         for c in &d.candidates {
             let sid = c.session.as_u64() as i64;
             tx.execute(
@@ -580,7 +877,49 @@ impl RuntimeStore {
                 ],
             )
             .map_err(err)?;
+            if tracing {
+                pend.push(PendingEmit {
+                    table: "attribution_candidates",
+                    session: sid.to_string(),
+                    key: format!("{decision_id}:{sid}"),
+                    op: "create",
+                    old: None,
+                    new: Some(serde_json::json!({
+                        "decision_id": decision_id,
+                        "session_id": sid,
+                        "anchor_kind": format!("{:?}", c.anchor),
+                        "anchor_score": c.anchor_score as i64,
+                        "project_score": c.project_support as i64,
+                        "temporal_score": c.temporal_support as i64,
+                        "relationship_score": c.relationship_support as i64,
+                        "total_score": c.total as i64,
+                        "rejected_reason": c.rejected.map(|r| format!("{:?}", r)),
+                    })),
+                    reselect: None,
+                });
+            }
             for e in &c.evidence {
+                let ev_old = if tracing {
+                    let existing: Option<String> = tx
+                        .query_row(
+                            "SELECT value FROM evidence
+                             WHERE decision_id = ?1 AND session_id = ?2 AND kind = ?3",
+                            params![decision_id, sid, e.kind.as_str()],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(err)?;
+                    existing.map(|value| {
+                        serde_json::json!({
+                            "decision_id": decision_id,
+                            "session_id": sid,
+                            "kind": e.kind.as_str(),
+                            "value": value,
+                        })
+                    })
+                } else {
+                    None
+                };
                 tx.execute(
                     "INSERT INTO evidence (decision_id, session_id, kind, value)
                      VALUES (?1, ?2, ?3, ?4)
@@ -589,9 +928,27 @@ impl RuntimeStore {
                     params![decision_id, sid, e.kind.as_str(), e.value],
                 )
                 .map_err(err)?;
+                if tracing {
+                    let new = serde_json::json!({
+                        "decision_id": decision_id,
+                        "session_id": sid,
+                        "kind": e.kind.as_str(),
+                        "value": e.value,
+                    });
+                    pend.push(PendingEmit {
+                        table: "evidence",
+                        session: sid.to_string(),
+                        key: format!("{decision_id}:{sid}:{}", e.kind.as_str()),
+                        op: if ev_old.is_some() { "update" } else { "create" },
+                        old: ev_old,
+                        new: Some(new),
+                        reselect: None,
+                    });
+                }
             }
         }
         tx.commit().map_err(err)?;
+        flush_emits(&self.conn, pend);
         Ok(())
     }
 
@@ -704,14 +1061,16 @@ impl RuntimeStore {
             },
             agent,
         );
-        self.conn
+        let sid = id.as_u64() as i64;
+        let inserted = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO sessions
                    (session_id, boot_id, agent, root_pid, root_start_time,
                     started_at, last_seen_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    id.as_u64() as i64,
+                    sid,
                     boot.to_le_bytes().to_vec(),
                     agent,
                     pid as i64,
@@ -721,6 +1080,22 @@ impl RuntimeStore {
                 ],
             )
             .map_err(err)?;
+        if trace::enabled() && inserted > 0 {
+            let new = trace::fetch_row(
+                &self.conn,
+                "sessions",
+                "session_id",
+                &serde_json::json!(sid),
+            );
+            trace::emit(
+                "sessions",
+                &sid.to_string(),
+                &sid.to_string(),
+                "create",
+                None,
+                new.as_ref(),
+            );
+        }
         Ok(id)
     }
 
@@ -746,6 +1121,23 @@ impl RuntimeStore {
                 ],
             )
             .map_err(err)?;
+        if trace::enabled() {
+            let new = serde_json::json!({
+                "vendor": vendor,
+                "vendor_session_id": vendor_session_id,
+                "session_id": session_id.as_u64() as i64,
+                "vendor_started_at": now as i64,
+                "vendor_ended_at": serde_json::Value::Null,
+            });
+            trace::emit(
+                "session_aliases",
+                &(session_id.as_u64().to_string()),
+                &format!("{vendor}:{vendor_session_id}"),
+                "create",
+                None,
+                Some(&new),
+            );
+        }
         Ok(())
     }
 
@@ -759,6 +1151,28 @@ impl RuntimeStore {
         vendor_session_id: &str,
         now: u64,
     ) -> io::Result<()> {
+        let old = if trace::enabled() {
+            self.conn
+                .query_row(
+                    "SELECT vendor, vendor_session_id, session_id, vendor_started_at, vendor_ended_at
+                     FROM session_aliases
+                     WHERE vendor = ?1 AND vendor_session_id = ?2",
+                    params![vendor, vendor_session_id],
+                    |r| {
+                        Ok(serde_json::json!({
+                            "vendor": r.get::<_, String>(0)?,
+                            "vendor_session_id": r.get::<_, String>(1)?,
+                            "session_id": r.get::<_, i64>(2)?,
+                            "vendor_started_at": r.get::<_, Option<i64>>(3)?,
+                            "vendor_ended_at": r.get::<_, Option<i64>>(4)?,
+                        }))
+                    },
+                )
+                .optional()
+                .map_err(err)?
+        } else {
+            None
+        };
         self.conn
             .execute(
                 "UPDATE session_aliases SET vendor_ended_at = ?1
@@ -766,6 +1180,19 @@ impl RuntimeStore {
                 params![now as i64, vendor, vendor_session_id],
             )
             .map_err(err)?;
+        if trace::enabled() {
+            let Some(old) = old else { return Ok(()) };
+            let mut new = old.clone();
+            new["vendor_ended_at"] = serde_json::json!(now as i64);
+            trace::emit(
+                "session_aliases",
+                &new["session_id"].to_string(),
+                &format!("{vendor}:{vendor_session_id}"),
+                "update",
+                Some(&old),
+                Some(&new),
+            );
+        }
         Ok(())
     }
 
