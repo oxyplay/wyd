@@ -52,6 +52,28 @@ const QUEUE_TICK: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
 const PARENT_CGROUP: &str = "wyd.slice";
 
+/// Monotonic and wall anchors taken once, at supervisor start. Logical time
+/// is the larger of the two, so a suspend (which pauses the monotonic clock)
+/// cannot hide a deadline while a clock jump can only make it earlier.
+#[derive(Debug)]
+struct Clock {
+    mono: Instant,
+    wall: SystemTime,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self {
+            mono: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    fn now(&self) -> Duration {
+        elapsed(&self.mono, &self.wall)
+    }
+}
+
 /// What a cgroup actually accepted, in a platform-neutral shape.
 #[derive(Debug, Clone, Default)]
 struct CgroupApplied {
@@ -353,8 +375,8 @@ struct RunSlot {
     logs: Arc<Mutex<LogState>>,
     /// Caller environment, held in memory until the run is admitted.
     env: Mutex<Vec<(String, String)>>,
-    /// When the request entered the queue, for the live reported wait.
-    queued_at: Mutex<Option<Instant>>,
+    /// Logical time when the request entered the queue.
+    queued_at: Mutex<Option<Duration>>,
     /// Final queue wait, kept after the live slot is replaced by a
     /// read-from-storage slot.
     queue_wait_ms: Mutex<u64>,
@@ -394,13 +416,9 @@ impl RunSlot {
         std::mem::take(&mut *self.env.lock())
     }
 
-    fn queue_wait_ms(&self) -> u64 {
-        match self
-            .queued_at
-            .lock()
-            .map(|t| t.elapsed().as_millis() as u64)
-        {
-            Some(live) => live,
+    fn queue_wait_ms(&self, now: Duration) -> u64 {
+        match *self.queued_at.lock() {
+            Some(queued_at) => now.saturating_sub(queued_at).as_millis() as u64,
             None => *self.queue_wait_ms.lock(),
         }
     }
@@ -415,6 +433,7 @@ pub struct Supervisor {
     /// Aggregate cgroup every run is nested in, so the budget is also a
     /// kernel limit and not only an admission policy. A no-op off Linux.
     parent_cgroup: RunCgroup,
+    clock: Clock,
     paths: RunPaths,
     budget: Arc<GlobalBudget>,
     boot_id: BootId,
@@ -554,6 +573,7 @@ impl Supervisor {
             db: Mutex::new(db),
             registry: Mutex::new(HashMap::new()),
             scheduler: Mutex::new(Scheduler::new(limits)),
+            clock: Clock::new(),
             parent_cgroup,
             paths,
             budget: Arc::new(GlobalBudget::new(DEFAULT_TOTAL_LOG_LIMIT, used)),
@@ -698,7 +718,7 @@ impl Supervisor {
             &project,
             memory,
             slot.spec.resources.queue_timeout,
-            Instant::now(),
+            self.clock.now(),
         );
         match decision {
             Admission::Start { .. } => {
@@ -706,11 +726,11 @@ impl Supervisor {
                 Ok(())
             }
             Admission::Queued { position } => {
-                *slot.queued_at.lock() = Some(Instant::now());
+                *slot.queued_at.lock() = Some(self.clock.now());
                 let reason = self
                     .scheduler
                     .lock()
-                    .queue_entries(Instant::now())
+                    .queue_entries(self.clock.now())
                     .into_iter()
                     .find(|e| e.run_id == slot.id.to_string())
                     .map(|e| e.reason)
@@ -830,7 +850,7 @@ impl Supervisor {
                     thread::sleep(QUEUE_TICK);
                     // Collect first: holding the scheduler lock across
                     // `finish` (which takes it again) would deadlock.
-                    let expired = sup.scheduler.lock().expire(Instant::now());
+                    let expired = sup.scheduler.lock().expire(sup.clock.now());
                     for id in expired {
                         let slot = sup.registry.lock().get(&id).cloned();
                         if let Some(slot) = slot.filter(|s| !s.is_terminal()) {
@@ -923,7 +943,7 @@ impl Supervisor {
                     let usage = *slot.usage.lock();
                     view.queue = QueueInfo {
                         position: self.scheduler.lock().position(r.id),
-                        waiting_ms: slot.queue_wait_ms(),
+                        waiting_ms: slot.queue_wait_ms(self.clock.now()),
                         reason: slot.inner.lock().detail.clone(),
                     };
                     view.observed_memory_bytes = usage.map(|u| u.memory_bytes);
@@ -967,7 +987,7 @@ impl Supervisor {
     /// Read-only view of admission capacity. Reserved bytes are a budget, not
     /// a measurement of RAM in use.
     pub fn capacity(&self) -> Capacity {
-        let now = Instant::now();
+        let now = self.clock.now();
         let sched = self.scheduler.lock();
         Capacity {
             limits: sched.limits().summary(),
@@ -1120,7 +1140,7 @@ impl Supervisor {
             let created_at = record.as_ref().map(|r| r.created_at).unwrap_or(0);
             let supervisor = record.as_ref().and_then(|r| r.supervisor.clone());
             let queue_position = self.scheduler.lock().position(id);
-            let queue_wait_ms = slot.queue_wait_ms();
+            let queue_wait_ms = slot.queue_wait_ms(self.clock.now());
             let slot_detail = slot.inner.lock().detail.clone();
             let usage = *slot.usage.lock();
             let limit_event = slot.limit_event.lock().clone();
@@ -1370,7 +1390,7 @@ impl Supervisor {
                 .map(|(quota, period)| (quota.saturating_mul(1000) / period.max(1)) as u32);
             effective.processes = applied.pids_max.map(|v| v as u32);
         }
-        let queue_wait = slot.queue_wait_ms();
+        let queue_wait = slot.queue_wait_ms(self.clock.now());
         *slot.queue_wait_ms.lock() = queue_wait;
         self.db
             .lock()
@@ -1633,7 +1653,7 @@ impl Supervisor {
         slot.cv.notify_all();
         // Persist the resource story even for a run that never spawned, so a
         // queue timeout or a refusal still shows its request and its wait.
-        let wait = slot.queue_wait_ms();
+        let wait = slot.queue_wait_ms(self.clock.now());
         let effective = self.effective_limits(&slot.spec);
         {
             let mut db = self.db.lock();
@@ -1654,7 +1674,10 @@ impl Supervisor {
         // still be alive, and pretending the capacity is free would let the
         // next run bypass the budget.
         let hold = cleanup != CleanupState::Complete;
-        let admitted = self.scheduler.lock().release(slot.id, hold, Instant::now());
+        let admitted = self
+            .scheduler
+            .lock()
+            .release(slot.id, hold, self.clock.now());
         for id in admitted {
             let next = self.registry.lock().get(&id).cloned();
             if let Some(next) = next {

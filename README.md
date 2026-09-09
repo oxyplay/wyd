@@ -236,7 +236,11 @@ Managed runs are local processes on macOS and Linux and nothing more:
   memory, CPU and process-count limits depend on the backend: macOS only
   monitors, Linux enforces them through a delegated cgroup v2 subtree when one
   is available — otherwise the capability reports `unavailable` and a `hard`
-  request is refused rather than approximated.
+  request is refused rather than approximated. Hard limits on macOS need a
+  Linux execution backend (a container/VM); until that exists, run
+  resource-limited commands in a container. The plan's next step for this,
+  and for a real suspend/resume test, is docs/managed-runs-plan.md → «Что
+  делать дальше».
 - Reservations are a budget, not measured RAM: `reserved_memory_bytes` says
   what runs may use, `observed_memory_bytes` says what one run was seen using.
 

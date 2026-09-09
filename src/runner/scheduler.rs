@@ -1,8 +1,10 @@
 //! Admission control: slots, memory reservations and a bounded, fair queue.
 //!
-//! Pure state machine — no OS calls, no clock of its own (`Instant`s are
-//! passed in), so every rule is testable and the supervisor stays the only
-//! component that grants capacity. Clients never decide admission themselves.
+//! Pure state machine — no OS calls and no clock of its own. Callers pass a
+//! **logical** time (elapsed since the supervisor started), which the
+//! supervisor computes as `max(monotonic, wall)` so a deadline still expires
+//! after the machine sleeps. Using a raw `Instant` here would silently pause
+//! every queue deadline during suspend.
 //!
 //! Ordering is FIFO inside a project and round-robin between projects, with
 //! one exception: a request that has waited past `starvation_after` is
@@ -11,7 +13,7 @@
 
 use crate::model::run::{LimitSummary, ProjectUsage, QueueEntry, RunId};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Capacity rules in force. Changes affect admission of new runs; a run
 /// already admitted keeps its slot until it finishes.
@@ -94,8 +96,10 @@ struct Queued {
     id: RunId,
     project: String,
     memory_bytes: u64,
-    enqueued_at: Instant,
-    deadline: Instant,
+    /// Logical time when the request entered the queue.
+    enqueued_at: Duration,
+    /// Logical time after which the request gives up.
+    deadline: Duration,
 }
 
 struct Running {
@@ -144,7 +148,7 @@ impl Scheduler {
         project: &str,
         memory_bytes: u64,
         queue_timeout: Option<Duration>,
-        now: Instant,
+        now: Duration,
     ) -> Admission {
         if memory_bytes > self.limits.memory_budget_bytes {
             return Admission::Rejected(RejectReason::Impossible {
@@ -180,7 +184,7 @@ impl Scheduler {
     /// Release a slot, optionally holding the reservation because the
     /// cleanup was not complete. Returns the ids admitted as a result, in the
     /// order they were admitted; the caller starts them.
-    pub fn release(&mut self, id: RunId, hold: bool, now: Instant) -> Vec<RunId> {
+    pub fn release(&mut self, id: RunId, hold: bool, now: Duration) -> Vec<RunId> {
         let held = if hold {
             self.running.iter().find(|r| r.id == id).map(|r| Running {
                 id: r.id,
@@ -213,7 +217,7 @@ impl Scheduler {
     }
 
     /// Queued requests whose deadline has passed, removed from the queue.
-    pub fn expire(&mut self, now: Instant) -> Vec<RunId> {
+    pub fn expire(&mut self, now: Duration) -> Vec<RunId> {
         let mut expired = Vec::new();
         self.queue.retain(|q| {
             if now >= q.deadline {
@@ -278,7 +282,7 @@ impl Scheduler {
     }
 
     /// The queue as reported to clients, with a reason but no invented ETA.
-    pub fn queue_entries(&self, now: Instant) -> Vec<QueueEntry> {
+    pub fn queue_entries(&self, now: Duration) -> Vec<QueueEntry> {
         self.queue
             .iter()
             .enumerate()
@@ -286,7 +290,7 @@ impl Scheduler {
                 run_id: q.id.to_string(),
                 project: q.project.clone(),
                 position: i + 1,
-                waiting_ms: now.saturating_duration_since(q.enqueued_at).as_millis() as u64,
+                waiting_ms: now.saturating_sub(q.enqueued_at).as_millis() as u64,
                 memory_bytes: q.memory_bytes,
                 reason: if self.project_slots_free(&q.project) == 0 {
                     format!(
@@ -319,7 +323,7 @@ impl Scheduler {
     /// A starved request wins first. Otherwise a project with no running run
     /// is preferred, so one busy project cannot monopolize the queue; within
     /// that choice the oldest request goes first.
-    fn pick_next(&mut self, now: Instant) -> Option<RunId> {
+    fn pick_next(&mut self, now: Duration) -> Option<RunId> {
         let index = self.candidate_index(now)?;
         let next = self.queue.remove(index)?;
         self.running.push(Running {
@@ -330,7 +334,7 @@ impl Scheduler {
         Some(next.id)
     }
 
-    fn candidate_index(&self, now: Instant) -> Option<usize> {
+    fn candidate_index(&self, now: Duration) -> Option<usize> {
         if self.slots_free() == 0 {
             return None;
         }
@@ -339,7 +343,7 @@ impl Scheduler {
                 && self.reserved() + q.memory_bytes <= self.limits.memory_budget_bytes
         };
         let starved = self.queue.iter().enumerate().find(|(_, q)| {
-            fits(q) && now.saturating_duration_since(q.enqueued_at) >= self.limits.starvation_after
+            fits(q) && now.saturating_sub(q.enqueued_at) >= self.limits.starvation_after
         });
         if let Some((i, _)) = starved {
             return Some(i);
@@ -384,8 +388,8 @@ mod tests {
         }
     }
 
-    fn sched() -> (Scheduler, Instant) {
-        (Scheduler::new(limits()), Instant::now())
+    fn sched() -> (Scheduler, Duration) {
+        (Scheduler::new(limits()), Duration::ZERO)
     }
 
     #[test]
@@ -550,5 +554,18 @@ mod tests {
             "{}",
             entries[0].reason
         );
+    }
+    /// Logical time keeps moving while the machine sleeps (the supervisor
+    /// feeds `max(monotonic, wall)`), so a suspend longer than the queue
+    /// timeout must expire the request on wake, not extend its wait.
+    #[test]
+    fn a_suspend_longer_than_the_queue_timeout_expires_the_request() {
+        let (mut s, t) = sched();
+        s.submit(RunId(1), "a", 100, None, t);
+        s.submit(RunId(2), "b", 100, None, t);
+        s.submit(RunId(3), "c", 100, None, t);
+        let after_sleep = t + Duration::from_secs(3600);
+        assert_eq!(s.expire(after_sleep), vec![RunId(3)]);
+        assert_eq!(s.queued_count(), 0);
     }
 }
