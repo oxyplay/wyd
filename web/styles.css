@@ -708,3 +708,47 @@ html[data-theme="dark"] .toast {
   background: #0d0d0d;
   border: 1px solid var(--line-strong);
 }
+
+/* ───────── capacity panel (sidebar) ───────── */
+
+.capacity {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 12px;
+}
+.capacity-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  font-weight: 600; color: var(--muted); margin-bottom: 6px;
+}
+.capacity-grid {
+  display: grid; grid-template-columns: auto 1fr; gap: 3px 10px;
+  font-variant-numeric: tabular-nums;
+}
+.capacity-grid .ck { color: var(--muted); }
+.capacity-over { margin-top: 6px; color: var(--warn); font-weight: 600; }
+.capacity-queue { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+.capacity-q { font-size: 11px; color: var(--ink-strong); font-variant-numeric: tabular-nums; }
+.capacity-note { margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.capacity-caps { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.capacity-caps li { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; }
+.cap-k { color: var(--muted); }
+
+/* Three capability states, deliberately distinct: monitored is observed and
+   acted on by wyd, never a kernel guarantee. */
+.cap-available .cap-v { color: var(--good); }
+.cap-monitored .cap-v { color: var(--warn); font-weight: 600; }
+.cap-unavailable .cap-v { color: var(--muted); }
+.cap-available .cap-v::before { content: '✓ '; }
+.cap-monitored .cap-v::before { content: '≈ '; }
+.cap-unavailable .cap-v::before { content: '✕ '; }
+
+/* run rows and details: queue, reservation vs observation, limit events */
+.sec-row.run-queued .sec-what { color: var(--accent); font-weight: 600; }
+.sec-queue { color: var(--accent) !important; }
+.resource-note { margin-top: 6px; font-size: 11px; }
+.observation { border-left: 3px solid var(--good); }
+.queue-block { border-left: 3px solid var(--accent); }
+.limit-event { border-left: 3px solid var(--warn); }

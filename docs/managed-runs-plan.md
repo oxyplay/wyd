@@ -1,35 +1,42 @@
 # План: управляемые запуски и ресурсные бюджеты wyd
 
-Статус: **этап 1 реализован** (2026-09-09). Этап 2 (очередь и бюджеты
-ресурсов) — не начат; разделы ниже остаются спецификацией.
+Статус: **этап 1 реализован** (2026-09-09), **этап 2 реализован** (2026-09-09).
+Разделы ниже — спецификация; отклонения от неё зафиксированы в «Что уже в
+продукте», «Что осталось» и в статусе §2.
 
 ## Что уже в продукте
 
 | Область | Где |
 | --- | --- |
 | Контракт Run, состояния, cleanup, capabilities | `src/model/run.rs` |
+| Scheduler: слоты, резервации, ограниченная очередь, starvation bypass | `src/runner/scheduler.rs` |
 | Процесс-группы, идентичность, остановка | `src/platform/pgroup.rs` |
 | Таблицы `runs`/`run_processes`/`run_events`, дедуп `request_id`, retention | `src/store.rs` (схема v2) |
 | Supervisor, логи с курсорами, recovery, локальный клиент | `src/runner/` |
-| Локальный API, поток на клиента, лимиты, graceful shutdown | `src/server.rs` |
-| `wyd run` / `runs` / `logs` / `cancel`, `--json` | `src/main.rs` |
-| MCP: `list_runs`/`get_run`/`read_run_output`, `start_run`/`cancel_run` за `--allow-run` | `src/mcp.rs` |
-| Runs в TUI, web-роуты + подтверждаемая отмена, demo | `src/tui/`, `src/web/`, `web/` |
+| `[runs]` admission limits в config.toml | `src/config.rs` |
+| Локальный API (`get_capacity`, `set_limits`), поток на клиента, лимиты, graceful shutdown | `src/server.rs` |
+| `wyd run` / `runs` / `logs` / `cancel` / `capacity [--set]`, `--json` | `src/main.rs` |
+| MCP: `list_runs`/`get_run`/`read_run_output`/`get_capacity`, `start_run`/`cancel_run` за `--allow-run` | `src/mcp.rs` |
+| Runs и очередь в TUI, web-роуты (`/api/runs*`, `/api/capacity`) + подтверждаемая отмена, demo | `src/tui/`, `src/web/`, `web/` |
 | README, `docs/webmcp.md`, AGENTS.md Status | — |
 
 Команды:
 
 ```text
 wyd run --timeout 120s -- npm test
+wyd run --memory 512 --enforce monitored --queue-timeout 60s -- npm test
 wyd runs [--json]        wyd logs <id> [--follow] [--stream stderr]
 wyd cancel <id>          wyd mcp --allow-run
+wyd capacity [--json] [--set key=value ...]
 ```
 
 Чтения (`runs`, `logs`, MCP `list_runs`/`get_run`/`read_run_output`) идут
-из стора и файлов логов и работают без демона. Запуск и отмена требуют
-supervisor: он стартует по требованию (flock + handshake) и выходит после
-5 минут простоя. SIGTERM/SIGINT сначала останавливает активные запуски
-(grace 10 с), затем снимает сокет и выходит.
+из стора и файлов логов и работают без демона. `capacity` — исключение:
+`wyd capacity` и web-провайдер без демона отдают настроенные лимиты с нулевой
+загрузкой, а MCP `get_capacity` поднимает supervisor по требованию. Запуск и
+отмена требуют supervisor: он стартует по требованию (flock + handshake) и
+выходит после 5 минут простоя. SIGTERM/SIGINT сначала останавливает активные
+запуски (grace 10 с), затем снимает сокет и выходит.
 
 ## Результаты platform spike (§1.3)
 
@@ -55,12 +62,20 @@ supervisor: он стартует по требованию (flock + handshake) 
   запускались только на macOS). Нужна машина под Linux.
 - **Sleep/resume** проверяется только логикой подстраховки, без реального
   теста сна.
-- **Этап 2** целиком: scheduler, reservations, cgroup v2 delegation,
-  macOS monitored-режим, `get_capacity`, UI очереди.
+- **Linux cgroup v2 backend не реализован.** `aggregate_memory_limit`,
+  `cpu_quota` и `process_limit` возвращают `Unavailable` с объяснением;
+  hard-запрос отклоняется до spawn, а не исполняется без лимита.
+- **macOS hard limits недоступны by design.** Память — `Monitored`
+  (сумма RSS по process group, сэмпл каждые 200 ms), hard-запрос
+  отклоняется до spawn. CPU/processes — advisory, бэкенда нет.
+- **Измерения** — только один прогон на одной машине, debug-сборка (§2.7);
+  как обещание скорости их публиковать нельзя.
+- **Filesystem/network isolation и одноразовые среды** — отдельный
+  дальнейший этап, в 1–2 не входят.
 
 ## Исходное предложение
 
-Дальше — спецификация, по которой делался этап 1 и будет делаться этап 2.
+Дальше — спецификация, по которой делались этапы 1 и 2.
 
 ## Цель
 
@@ -344,7 +359,36 @@ cargo fmt --check. Проверить macOS и Linux; недоступный pla
 
 ## Этап 2. Очередь и бюджеты ресурсов
 
-Статус: **не начат**. Ниже — спецификация, не описание продукта.
+Статус: **реализован** (2026-09-09) в объёме ниже; §2.1–2.5 остаются
+спецификацией, фактические отклонения отмечены. Не реализовано: Linux
+cgroup v2 backend, macOS hard limits, реальный sleep/resume-тест, Linux-прогон.
+
+Реализовано:
+
+- `src/runner/scheduler.rs` — детерминированный state machine без OS-кода:
+  FIFO внутри проекта, round-robin между проектами, starvation bypass после
+  `starvation_after_secs`, атомарные слоты и резервации, лимит очереди,
+  немедленный отказ impossible-заявки, отдельный queue deadline.
+- `EffectiveLimits` и трёхзначный `Capability` (`Available`/`Monitored`/
+  `Unavailable`) в `RunView.requested`/`effective`; hard-запрос проверяется
+  `check_capabilities` до spawn.
+- macOS: `monitored`-остановка при превышении порога (`resource_limit`,
+  exit 137, `limit_event` с числом); измерение — сумма RSS по process group
+  каждые 200 ms.
+- `get_capacity`/`set_limits` в локальном API и `Client::capacity()/set_limits()`;
+  `start_run` принимает `memory_mb`/`enforcement`/`queue_timeout_ms`/
+  `cpu_millicores`/`processes`.
+- `[runs]` в config.toml и `wyd capacity [--json] [--set key=value]`.
+- MCP `get_capacity`; WebMCP `get_capacity` и `GET /api/capacity`; очередь,
+  резервации и наблюдаемое потребление показаны в TUI и web раздельно.
+
+Не реализовано и не должно подаваться как реализованное:
+
+- **Linux cgroup v2** — `aggregate_memory_limit`/`cpu_quota`/`process_limit`
+  = `Unavailable`; hard-запрос отклоняется до spawn.
+- **macOS hard limits** — недоступны by design; `aggregate_memory_limit` =
+  `Monitored`, hard-запрос отклоняется до spawn.
+- **`cpu_millicores`/`processes`** — только запрос и отображение; бэкенда нет.
 
 ### 2.1. Цель и область действия
 
@@ -445,6 +489,23 @@ macOS: monitored policy явно обозначена, unsupported hard request 
 теста, реакция cancel, CPU сканирования, рост диска после 100 запусков,
 потребление при нескольких fixtures. Сравнивать одинаковую нагрузку на одной машине;
 не публиковать обещания скорости до измерений.
+
+### 2.7. Измерения (2026-09-09, macOS, M-series, debug-сборка)
+
+Один прогон на одной машине, `HOME` в `/tmp`, `max_parallel=4`,
+`max_parallel_per_project=2`, бюджет 2048 MiB, default reservation 256 MiB.
+Это **не** обещание скорости: debug-сборка и одна конфигурация.
+
+| Метрика | Значение |
+| --- | --- |
+| spawn latency, тривиальная команда через CLI round trip (10 запусков) | медиана 110 ms, максимум 190 ms |
+| idle supervisor | 22–25 MB RSS, 0.2% CPU (collector каждые 2 s) |
+| cancel → finished, замер на сокете (без старта CLI) | 77 ms, `outcome=cancelled`, `cleanup=complete` |
+| 3 параллельных fixture (`sleep 3`) | supervisor RSS 26 MB; `running=2 queued=1 reserved=512 MiB` (per-project cap: все три в одном cwd) |
+| 100 завершённых runs | +2.6 MiB на диске, `state.db` 152 KiB, каталог логов ~0 (команды без вывода) |
+
+Linux-измерений нет: cgroup v2 enforcement не реализован, capability
+`Unavailable`. macOS hard limits недоступны by design и отклоняются до spawn.
 
 ## Дальнейший этап: одноразовые среды
 

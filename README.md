@@ -83,10 +83,11 @@ wyd mcp --allow-run     # also allows starting and cancelling runs
 
 Starts the local MCP server. Read tools are always available:
 `list_sessions` (recorded agent sessions), `explain` (which session owns a
-process, by pid), `list_runs`, `get_run` and `read_run_output`. `--allow-run`
-adds `start_run` and `cancel_run` for that connection only — without it those
-calls are rejected with a message to restart with `--allow-run`. No network,
-no account — the answers come from the local provenance store.
+process, by pid), `list_runs`, `get_run`, `read_run_output` and
+`get_capacity`. `--allow-run` adds `start_run` and `cancel_run` for that
+connection only — without it those calls are rejected with a message to
+restart with `--allow-run`. No network, no account — the answers come from the
+local provenance store.
 
 Registered in the MCP Registry:
 
@@ -108,6 +109,37 @@ instead of the captured output; repeating a `--request-id` within 24 hours
 reuses that run instead of starting a second one, and the same id with a
 different command is rejected.
 
+Runs share one admission budget, so several agents on one machine do not all
+start at once. `wyd run` takes a per-run resource request:
+
+```bash
+wyd run --memory 512 --enforce monitored --queue-timeout 60s -- npm test
+```
+
+| Flag | Meaning |
+|---|---|
+| `--memory <MiB>` | Reserved against the run budget; with `--enforce monitored` it is also the stop threshold. |
+| `--enforce none\|monitored\|hard` | Default `none`. `monitored` stops the run when observed usage crosses `--memory`; `hard` is a kernel limit and is refused before spawn when the backend cannot deliver it — never silently downgraded. |
+| `--queue-timeout <dur>` | How long the request may wait for a slot; overrides `queue_timeout_secs` for this run. Separate from `--timeout`, which starts only at spawn. A queued request that waits too long ends `timed_out` with a queue-timeout detail; it does not consume the execution timeout. |
+| `--cpu <millicores>` | CPU request. Advisory: no backend enforces it yet. |
+| `--processes <n>` | Process-count request. Advisory: no backend enforces it yet. |
+
+A run stopped by a monitored memory threshold ends `outcome=resource_limit`
+and exits `137`, with a `limit_event` naming the observed number.
+
+**Reservations are a budget, not measured RAM.** `reserved_memory_bytes` is
+the sum of what admitted runs reserved; it is not what they are using.
+Measured usage is reported separately as `observed_memory_bytes`, which on
+macOS is the sum of RSS over the run's process group sampled every 200 ms.
+Shared pages can be counted more than once and a brief peak can be missed, so
+it is an observation, not a guarantee.
+
+On macOS there is no hard memory limit: `aggregate_memory_limit` is
+`monitored`, and `--enforce hard` is refused before the run is created rather
+than downgraded. On Linux the cgroup v2 backend is **not implemented**:
+`aggregate_memory_limit`, `cpu_quota` and `process_limit` report `unavailable`,
+so a hard request is refused there too.
+
 Inspect or stop it afterwards:
 
 ```bash
@@ -117,23 +149,57 @@ wyd logs <id> --follow    # retained stdout (--stream stderr for the other)
 wyd cancel <id>           # idempotent
 ```
 
+`wyd capacity` shows the admission limits and what is in use; `--json` adds
+the capability states (`monitored` vs `available` vs `unavailable`):
+
+```bash
+wyd capacity                                              # slots, queue, reservations
+wyd capacity --json                                       # the full Capacity record, incl. capabilities
+wyd capacity --set max_parallel=2 --set queue_timeout_secs=30
+```
+
+`--set` is repeatable and takes `key=value` for any `[runs]` key:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_parallel` | 4 | Runs admitted at once. |
+| `max_parallel_per_project` | 2 | Runs admitted at once per project root. |
+| `max_queued` | 32 | Queue length; a request beyond it is rejected, not hung. |
+| `queue_timeout_secs` | 600 | How long a request may wait for a slot. |
+| `memory_budget_mb` | 8192 | Total memory that may be reserved by running runs. |
+| `default_run_memory_mb` | 512 | Reservation for a run that asks for no amount. |
+| `starvation_after_secs` | 60 | A request bypassed this long wins the next slot. |
+
+Changing a limit governs admission from then on; **active runs are not killed**
+for it. When the new cap is lower than the number of runs already admitted,
+the temporary exceedance is reported as `over_parallel_limit` instead of
+hidden. The same keys live under `[runs]` in `~/.config/wyd/config.toml`.
+
 The TUI shows the same runs read-only: select **Runs** in the Overview pane,
-`enter` opens a run's details. The web dashboard has the same view.
+`enter` opens a run's details. The Runs pane also shows the configured limits
+(live counts are marked unavailable there, because the TUI reads the store, not
+the supervisor socket) and, for a queued run, its position, wait and reason.
+The web dashboard has the same view plus a live capacity panel; neither can
+change a limit or start a command.
 
 The supervisor owns the run, not the client that started it: if the CLI or MCP
 connection drops, the run continues to its deadline and its result and logs are
 still there afterwards. Reads are durable and daemon-free — `wyd runs`,
 `wyd logs` and the MCP `list_runs`/`get_run`/`read_run_output` read the store
-and the retained log files, so they work with no supervisor alive. Starting or
-cancelling a run needs the supervisor, which starts on demand and exits after
-five idle minutes; the next `wyd run` or `wyd mcp --allow-run` brings it back.
-`SIGTERM`/`SIGINT` to the supervisor stops its active runs first (up to 10s)
-instead of abandoning them.
+and the retained log files, so they work with no supervisor alive. `wyd
+capacity` and the web dashboard's capacity panel report the configured `[runs]`
+limits with an empty queue when no supervisor is running, instead of starting
+one; the MCP `get_capacity` tool asks the supervisor and starts it on demand,
+like `start_run`. Starting or cancelling a run needs the supervisor, which
+starts on demand and exits after five idle minutes; the next `wyd run` or
+`wyd mcp --allow-run` brings it back. `SIGTERM`/`SIGINT` to the supervisor
+stops its active runs first (up to 10s) instead of abandoning them.
 
 Exit codes: the command's own code when it exits, `128+signal` when it is
 signaled, `124` on timeout, `130` on cancel, `125` when the command could not
-be spawned. The precise reason is always in the JSON (`outcome`, `exit_code`,
-`signal`, `cleanup`, `detail`).
+be spawned, `137` when a resource limit stopped it. The precise reason is
+always in the JSON (`outcome`, `exit_code`, `signal`, `cleanup`, `detail`,
+`limit_event`).
 
 Output is bounded per stream at 10 MiB and at 250 MiB total across retained
 runs — the head is kept and truncation is reported
@@ -143,7 +209,7 @@ wedge the supervisor. Finished runs and their logs are kept 7 days.
 
 ### What this is not
 
-Stage 1 manages local processes on macOS and Linux and nothing more:
+Managed runs are local processes on macOS and Linux and nothing more:
 
 - Cleanup covers the run's own process group. A command that leaves it —
   `setsid`, double fork, an external daemon — is not silently claimed as
@@ -152,6 +218,13 @@ Stage 1 manages local processes on macOS and Linux and nothing more:
   convenience, **not a sandbox**: the command can still write anywhere you can.
 - No filesystem, network or secret isolation, and no control over package
   installs. Run untrusted code in a container or VM, not here.
+- A monitored memory limit is a policy, not a guarantee: a brief peak between
+  two 200 ms samples is missed, and shared pages can be counted twice. Hard
+  memory, CPU and process-count limits are not available on this backend —
+  macOS monitors, and the Linux cgroup v2 backend is not implemented — so a
+  `hard` request is refused rather than approximated.
+- Reservations are a budget, not measured RAM: `reserved_memory_bytes` says
+  what runs may use, `observed_memory_bytes` says what one run was seen using.
 
 MCP setup: `wyd mcp` is read-only. `wyd mcp --allow-run` enables `start_run`
 and `cancel_run` for that connection; `start_run` is described as host
@@ -161,12 +234,14 @@ execution and is never sandboxed by wyd.
 
 Try the hosted demo: **https://demo.wyd.sh**
 
-wyd exposes ten WebMCP tools so a browser agent can investigate leftovers in
-the same UI the human sees: `list_sessions`, `get_session`, `list_leftovers`,
-`explain_process`, `focus_resource`, `propose_cleanup`, plus managed-run reads
-`list_runs`, `get_run`, `read_run_output` and the proposal-only
-`propose_cancel_run`. Nothing is killed from a tool call — the human confirms
-cleanup, and run cancel goes through the same confirmed proposal.
+wyd exposes eleven WebMCP tools so a browser agent can investigate leftovers
+in the same UI the human sees: `list_sessions`, `get_session`,
+`list_leftovers`, `explain_process`, `focus_resource`, `propose_cleanup`, plus
+managed-run reads `list_runs`, `get_run`, `read_run_output`, `get_capacity`
+and the proposal-only `propose_cancel_run`. Nothing is killed from a tool
+call — the human confirms cleanup, and run cancel goes through the same
+confirmed proposal. The web can read limits and queue state but cannot change
+limits or start a command.
 
 ```bash
 wyd web         # local runtime (loopback)
@@ -245,6 +320,15 @@ Field names stay stable until a major version bump. Empty `ports` / `reasons` / 
 ```toml
 [leftovers]
 server_age_hours = 8
+
+[runs]
+max_parallel = 4
+max_parallel_per_project = 2
+max_queued = 32
+queue_timeout_secs = 600
+memory_budget_mb = 8192
+default_run_memory_mb = 512
+starvation_after_secs = 60
 
 [persistent]
 commands = ["postgres", "redis-server"]

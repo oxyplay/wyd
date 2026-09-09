@@ -12,6 +12,9 @@ use super::rows::{self, Row, RunDetailData, Section, fmt_age, fmt_bytes, fmt_dur
 use super::{App, Focus, Mode};
 use crate::classify::short_path;
 use crate::config;
+use crate::model::run::{
+    Capability, Capacity, EffectiveLimits, Enforcement, ResourceRequest, RunState,
+};
 use crate::model::{
     DockerResource, ListeningPort, ProcessInfo, RuntimeItem, RuntimeSnapshot, RuntimeState,
 };
@@ -100,19 +103,26 @@ pub(super) struct Hits {
     pub popup: Rect,
 }
 
-pub(super) fn hits(area: Rect) -> Hits {
+pub(super) fn hits(area: Rect, section: Section) -> Hits {
     let [main, _] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
     let inner = Block::default().borders(Borders::ALL).inner(main);
     let [left, right] =
         Layout::horizontal([Constraint::Length(OVERVIEW_W), Constraint::Min(20)]).areas(inner);
     let overview = Block::default().borders(Borders::ALL).inner(left);
     let body = Block::default().borders(Borders::ALL).inner(right);
-    let [_, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+    let [_, list] =
+        Layout::vertical([Constraint::Length(head_height(section)), Constraint::Min(0)])
+            .areas(body);
     Hits {
         overview,
         list,
         popup: details_rect(inner),
     }
+}
+
+/// The Runs section needs a second header line for the configured-limit summary.
+fn head_height(section: Section) -> u16 {
+    if section == Section::Runs { 2 } else { 1 }
 }
 
 fn draw_popup(
@@ -228,20 +238,24 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
             let block = pane(app.section.title(), app.focus == Focus::Runtime);
             let body = block.inner(right);
             frame.render_widget(block, right);
+            let head_h = head_height(app.section);
             let [head, list, summary] = Layout::vertical([
-                Constraint::Length(1),
+                Constraint::Length(head_h),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .areas(body);
             let width = list.width as usize;
             follow_selected(app, list.height);
-            let head_line = if app.section == Section::Runs {
-                run_col_header()
+            let head_lines = if app.section == Section::Runs {
+                vec![
+                    capacity_line(width, app.capacity.as_ref()),
+                    run_col_header(),
+                ]
             } else {
-                col_header(width)
+                vec![col_header(width)]
             };
-            frame.render_widget(Paragraph::new(head_line), head);
+            frame.render_widget(Paragraph::new(head_lines), head);
             frame.render_widget(
                 Paragraph::new(runtime_lines(snap, app, &rs, width)).scroll((app.scroll, 0)),
                 list,
@@ -847,7 +861,43 @@ fn run_col_header() -> Line<'static> {
     .style(dim())
 }
 
-/// Compact run row: id, state, outcome, duration, project basename, session
+/// Admission limits for the Runs header. Live counts come from the supervisor
+/// when one is running; without one the configured limits are shown and the
+/// live counts are marked unavailable rather than guessed from a bounded run
+/// list.
+pub(super) fn capacity_line(width: usize, capacity: Option<&Capacity>) -> Line<'static> {
+    let r = &config::Config::global().runs;
+    let text = match capacity {
+        Some(c) => {
+            let over = if c.over_parallel_limit {
+                " · above the new limit (runs kept)"
+            } else {
+                ""
+            };
+            format!(
+                " slots  {}/{} used ({} per project) · queue {} waiting / ≤{} · reserved {} of {} (budget, not RAM){}",
+                c.running,
+                c.limits.max_parallel,
+                c.limits.max_parallel_per_project,
+                c.queued,
+                c.limits.max_queued,
+                fmt_bytes(c.reserved_memory_bytes),
+                fmt_bytes(c.limits.memory_budget_bytes),
+                over
+            )
+        }
+        None => format!(
+            " limits  {} slots ({} per project) · queue ≤{} · reserved budget {} · live counts unavailable",
+            r.max_parallel,
+            r.max_parallel_per_project,
+            r.max_queued,
+            fmt_bytes(r.memory_budget_mb.saturating_mul(1024 * 1024))
+        ),
+    };
+    Line::from(truncate(&text, width)).style(dim())
+}
+
+/// Compact run row: id, state, outcome, duration, project, session
 /// and the command. Outcome is shown as recorded — never blended with the
 /// heuristic leftover score used for runtime items.
 fn run_line(run: &RunView, marked: &HashSet<usize>, idx: usize, width: usize) -> Line<'static> {
@@ -894,11 +944,24 @@ fn run_line(run: &RunView, marked: &HashSet<usize>, idx: usize, width: usize) ->
             ),
             dim(),
         ),
-        Span::styled(
-            format!("{g}{}", truncate(&run.argv.join(" "), cmd_w)),
-            dim(),
-        ),
+        Span::styled(format!("{g}{}", truncate(&run_cmd(run), cmd_w)), dim()),
     ])
+}
+
+/// The command column. A queued run has no command worth reading yet, so the
+/// column carries the queue position, the wait and the reason instead — a
+/// waiting run is visible without opening details.
+fn run_cmd(run: &RunView) -> String {
+    if run.state != RunState::Queued {
+        return run.argv.join(" ");
+    }
+    let pos = run
+        .queue
+        .position
+        .map(|p| format!("q#{p}"))
+        .unwrap_or_else(|| "queued".into());
+    let reason = run.queue.reason.as_deref().unwrap_or("waiting for a slot");
+    format!("{pos} · wait {} · {reason}", fmt_dur(run.queue.waiting_ms))
 }
 
 pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Line<'static>> {
@@ -1188,6 +1251,101 @@ pub fn confirm_lines(app: &App, force: bool) -> Vec<Line<'static>> {
     ]
 }
 
+fn enforcement_str(e: Enforcement) -> &'static str {
+    match e {
+        Enforcement::None => "none",
+        Enforcement::Monitored => "monitored",
+        Enforcement::Hard => "hard",
+    }
+}
+
+/// What the caller asked for. Only the fields actually set are shown; an
+/// empty request reads `enforce none`.
+fn requested_text(r: &ResourceRequest) -> String {
+    let mut parts = vec![format!("enforce {}", enforcement_str(r.enforcement))];
+    if let Some(b) = r.memory_bytes {
+        parts.push(format!("mem {}", fmt_bytes(b)));
+    }
+    if let Some(c) = r.cpu_millicores {
+        parts.push(format!("cpu {c}m"));
+    }
+    if let Some(p) = r.processes {
+        parts.push(format!("procs {p}"));
+    }
+    if let Some(t) = r.queue_timeout {
+        parts.push(format!("queue wait ≤{}", fmt_dur(t.as_secs() * 1000)));
+    }
+    parts.join(" · ")
+}
+
+/// What the backend applied. Never merged with the request: the two are
+/// reported side by side so a refusal or downgrade is visible.
+fn effective_text(e: &EffectiveLimits) -> String {
+    let mut parts = vec![format!("enforce {}", enforcement_str(e.enforcement))];
+    if let Some(b) = e.memory_bytes {
+        parts.push(format!("mem {}", fmt_bytes(b)));
+    }
+    if !e.backend.is_empty() {
+        parts.push(format!("backend {}", e.backend));
+    }
+    parts.join(" · ")
+}
+
+/// Name the fields where the applied limits differ from the request, instead
+/// of showing two blocks that look identical when they are not.
+fn effective_diff(r: &ResourceRequest, e: &EffectiveLimits) -> Option<String> {
+    let mut parts = Vec::new();
+    if r.memory_bytes != e.memory_bytes {
+        parts.push(format!(
+            "memory {} → {}",
+            opt_bytes(r.memory_bytes),
+            opt_bytes(e.memory_bytes)
+        ));
+    }
+    if r.enforcement != e.enforcement {
+        parts.push(format!(
+            "enforcement {} → {}",
+            enforcement_str(r.enforcement),
+            enforcement_str(e.enforcement)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn opt_bytes(b: Option<u64>) -> String {
+    b.map(fmt_bytes).unwrap_or_else(|| "none".into())
+}
+
+/// Observed usage is a measurement of the run's process group — never the
+/// reservation and never a limit.
+fn observed_text(run: &RunView) -> String {
+    let mut parts = Vec::new();
+    if let Some(b) = run.observed_memory_bytes {
+        parts.push(format!("{} mem", fmt_bytes(b)));
+    }
+    if let Some(p) = run.observed_processes {
+        parts.push(format!("{p} procs"));
+    }
+    format!("{} — observation, not a limit", parts.join(" · "))
+}
+
+/// The backend's memory capability. `Monitored` is deliberately styled apart
+/// from `Available`: observation is not a kernel guarantee.
+pub(super) fn capability_line(label: &str, c: &Capability) -> Line<'static> {
+    let (text, style) = match c {
+        Capability::Available => ("available".to_string(), chrome()),
+        Capability::Monitored(m) => (format!("monitored — {m}"), warn()),
+        Capability::Unavailable(m) => (format!("unavailable — {m}"), dim()),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{:<DETAIL_LABEL_W$}", truncate(label, DETAIL_LABEL_W)),
+            dim(),
+        ),
+        Span::styled(text, style),
+    ])
+}
+
 /// Run detail: durable metadata plus recent event kinds. Log byte counts are
 /// metadata only — retained output is never read into the UI.
 fn run_details(run: Option<&RunView>, detail: Option<&RunDetailData>) -> Vec<Line<'static>> {
@@ -1242,18 +1400,48 @@ fn run_details(run: Option<&RunView>, detail: Option<&RunDetailData>) -> Vec<Lin
         detail_row("cleanup", run.cleanup.as_str()),
         detail_row("supervisor", run.supervisor.as_deref().unwrap_or("—")),
         Line::from(""),
-        detail_header("logs"),
-        detail_indent(&log_line(
-            "stdout",
-            run.logs.stdout_bytes,
-            run.logs.stdout_truncated,
-        )),
-        detail_indent(&log_line(
-            "stderr",
-            run.logs.stderr_bytes,
-            run.logs.stderr_truncated,
-        )),
+        detail_header("resources"),
+        detail_row("requested", &requested_text(&run.requested)),
+        detail_row("effective", &effective_text(&run.effective)),
     ];
+    if let Some(diff) = effective_diff(&run.requested, &run.effective) {
+        lines.push(detail_row("differs", &diff).style(warn()));
+    }
+    if let Some(bytes) = run.requested.memory_bytes.or(run.effective.memory_bytes) {
+        // A reservation is a budget held at admission — never measured RAM.
+        lines.push(detail_row(
+            "reserved",
+            &format!(
+                "{} admission budget — reservation, not measured memory",
+                fmt_bytes(bytes)
+            ),
+        ));
+    }
+    if let Some(metric) = &run.effective.metric {
+        lines.push(detail_row("metric", metric));
+    }
+    if run.observed_memory_bytes.is_some() || run.observed_processes.is_some() {
+        lines.push(detail_row("observed", &observed_text(run)));
+    }
+    lines.push(capability_line(
+        "memory",
+        &run.capabilities.aggregate_memory_limit,
+    ));
+    if let Some(event) = &run.limit_event {
+        lines.push(detail_row("limit event", event).style(warn()));
+    }
+    lines.push(Line::from(""));
+    lines.push(detail_header("logs"));
+    lines.push(detail_indent(&log_line(
+        "stdout",
+        run.logs.stdout_bytes,
+        run.logs.stdout_truncated,
+    )));
+    lines.push(detail_indent(&log_line(
+        "stderr",
+        run.logs.stderr_bytes,
+        run.logs.stderr_truncated,
+    )));
     if let Some(text) = &run.detail {
         lines.push(Line::from(""));
         lines.push(detail_header("detail"));

@@ -25,7 +25,8 @@ use crate::actions::process::{self, Identity, Signal};
 use crate::config;
 use crate::model::DockerResource;
 use crate::model::RuntimeSnapshot;
-use crate::model::run::RunId;
+use crate::model::run::Capacity;
+use crate::model::run::{RunId, RunState};
 use crate::runner::RunView;
 use crate::store::{RunFilter, RuntimeStore};
 
@@ -47,6 +48,8 @@ const RUN_EVENTS_SHOWN: usize = 40;
 struct RunFeed {
     version: u64,
     rows: Vec<RunView>,
+    /// Live admission capacity, when a supervisor is running.
+    capacity: Option<Capacity>,
     detail: Option<RunDetailData>,
     error: Option<String>,
     focus: Option<RunId>,
@@ -80,26 +83,52 @@ fn run_feed(feed: Feed) {
     loop {
         let focus = lock.lock().focus;
         let mut error = None;
-        let rows = match store.run_list(&RunFilter {
-            limit: Some(RUNS_LIMIT),
-            ..RunFilter::default()
-        }) {
-            Ok(records) => records
-                .iter()
-                .map(|r| {
-                    let mut v = RunView::from_record(r);
-                    // A running run has no result yet; show elapsed wall time.
+        // Prefer the supervisor when it is answering: it knows the observed
+        // usage, queue position and limit events the store does not keep.
+        let live = crate::server::serve_alive()
+            .then(|| {
+                crate::runner::client::Client::new()
+                    .list(serde_json::json!({ "limit": RUNS_LIMIT }))
+                    .ok()
+            })
+            .flatten();
+        let mut rows = match live {
+            Some(mut runs) => {
+                for v in &mut runs {
                     if v.duration_ms.is_none() && !v.state.is_terminal() {
                         v.duration_ms = Some(now_secs().saturating_sub(v.created_at) * 1000);
                     }
-                    v
-                })
-                .collect(),
-            Err(e) => {
-                error = Some(format!("run list: {e}"));
-                Vec::new()
+                }
+                runs
             }
+            None => match store.run_list(&RunFilter {
+                limit: Some(RUNS_LIMIT),
+                ..RunFilter::default()
+            }) {
+                Ok(records) => records
+                    .iter()
+                    .map(|r| {
+                        let mut v = RunView::from_record(r);
+                        // A running run has no result yet; show elapsed wall time.
+                        if v.duration_ms.is_none() && !v.state.is_terminal() {
+                            v.duration_ms = Some(now_secs().saturating_sub(v.created_at) * 1000);
+                        }
+                        v
+                    })
+                    .collect(),
+                Err(e) => {
+                    error = Some(format!("run list: {e}"));
+                    Vec::new()
+                }
+            },
         };
+        fill_queue(&mut rows, &store);
+        // Live counts live in the supervisor, not the store. Read them over
+        // the local socket only when a supervisor is actually answering, so
+        // the TUI keeps working standalone.
+        let capacity = crate::server::serve_alive()
+            .then(|| crate::runner::client::Client::new().capacity().ok())
+            .flatten();
         let detail = focus.and_then(|id| match load_detail(&store, id) {
             Ok(d) => d,
             Err(e) => {
@@ -111,6 +140,7 @@ fn run_feed(feed: Feed) {
             let mut f = lock.lock();
             f.version += 1;
             f.rows = rows;
+            f.capacity = capacity;
             f.detail = detail;
             f.error = error;
         }
@@ -137,6 +167,54 @@ fn load_detail(store: &RuntimeStore, id: RunId) -> io::Result<Option<RunDetailDa
         events = events.split_off(events.len() - RUN_EVENTS_SHOWN);
     }
     Ok(Some(RunDetailData { record, events }))
+}
+
+/// The store keeps only the final queue wait, and neither the position nor the
+/// reason (both live in the supervisor). Reconstruct the FIFO position and the
+/// elapsed wait from the bounded list, and read the reason the supervisor
+/// recorded once in the `queued` event, so a waiting run explains itself
+/// without opening details or talking to the supervisor.
+/// ponytail: exact while every queued run fits the bounded newest-200 list.
+fn fill_queue(rows: &mut [RunView], store: &RuntimeStore) {
+    let now = now_secs();
+    // The scheduler deque is FIFO by enqueue; position is its 1-based index.
+    // Key on creation time, run id breaking same-second ties.
+    // A live view from the supervisor already carries the authoritative
+    // position and wait; only reconstruct what the store cannot provide.
+    let mut queued: Vec<(u64, i64, usize)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.state == RunState::Queued && r.queue.position.is_none())
+        .map(|(i, r)| (r.created_at, r.run_id.parse::<i64>().unwrap_or(0), i))
+        .collect();
+    queued.sort_unstable();
+    for (pos, &(_, _, i)) in queued.iter().enumerate() {
+        let run = &mut rows[i];
+        run.queue.position = Some(pos + 1);
+        run.queue.waiting_ms = now.saturating_sub(run.created_at).saturating_mul(1000);
+        if run.queue.reason.is_none() {
+            let reason = queued_reason(store, &run.run_id);
+            run.queue.reason = reason;
+        }
+    }
+}
+
+/// The supervisor writes `queued at position N: <reason>` once. The position in
+/// that event is the position at enqueue and may be stale, so reuse only the
+/// reason text.
+fn queued_reason(store: &RuntimeStore, run_id: &str) -> Option<String> {
+    let id = RunId(run_id.parse().ok()?);
+    let events = store.run_events(id, 0).ok()?;
+    let detail = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "queued")?
+        .detail
+        .as_deref()?;
+    Some(match detail.split_once(": ") {
+        Some((_, reason)) => reason.to_string(),
+        None => detail.to_string(),
+    })
 }
 
 fn now_secs() -> u64 {
@@ -175,6 +253,7 @@ struct App {
     run_detail: Option<RunDetailData>,
     runs_version: u64,
     runs_error: Option<String>,
+    capacity: Option<Capacity>,
     feed: Feed,
 }
 
@@ -199,6 +278,7 @@ impl App {
             run_detail: None,
             runs_version: 0,
             runs_error: None,
+            capacity: None,
             feed: new_feed(),
         }
     }
@@ -239,6 +319,7 @@ impl App {
         self.runs = guard.rows.clone();
         self.run_detail = guard.detail.clone();
         self.runs_error = guard.error.clone();
+        self.capacity = guard.capacity.clone();
     }
 
     /// Point the feed at a run so its events load off the UI thread.
@@ -581,7 +662,7 @@ fn handle_mouse(
     app: &mut App,
     area: Rect,
 ) -> KeyResult {
-    let h = hits(area);
+    let h = hits(area, app.section);
     let pos = Position {
         x: m.column,
         y: m.row,
@@ -869,15 +950,15 @@ mod tests {
 
     use crate::classify::group;
     use crate::model::run::{
-        BackendCapabilities, CleanupState, LogState, RunOutcome, RunRecord, RunResult, RunSpec,
-        RunState,
+        Capability, CleanupState, EffectiveLimits, Enforcement, LogState, ResourceRequest,
+        RunOutcome, RunRecord, RunResult, RunSpec, RunState,
     };
     use crate::model::{self, ProcessInfo, Project, RuntimeSnapshot};
     use crate::store::RunEvent;
 
     use super::draw::{
-        confirm_lines, details_lines, docker_confirm_lines, help_lines, hint, overview_lines,
-        runtime_summary, window_title,
+        capability_line, capacity_line, confirm_lines, details_lines, docker_confirm_lines,
+        help_lines, hint, overview_lines, runtime_summary, window_title,
     };
     use super::rows::{fmt_age, fmt_bytes, fmt_dur, truncate};
 
@@ -1681,6 +1762,12 @@ mod tests {
     ) -> RunView {
         let finished = state.is_terminal();
         RunView {
+            requested: Default::default(),
+            effective: Default::default(),
+            queue: Default::default(),
+            observed_memory_bytes: None,
+            observed_processes: None,
+            limit_event: None,
             run_id: id.to_string(),
             request_id: format!("req-{id}"),
             argv: vec!["cargo".into(), "test".into(), "--all".into()],
@@ -1713,7 +1800,7 @@ mod tests {
                 stderr_truncated: false,
             },
             supervisor: Some("4242:boot".into()),
-            capabilities: BackendCapabilities::stage1(),
+            capabilities: crate::model::run::backend_capabilities(),
             events: Vec::new(),
         }
     }
@@ -1734,6 +1821,9 @@ mod tests {
             id: RunId(id),
             spec,
             state: RunState::Finished,
+            effective: Default::default(),
+            queue_wait_ms: 0,
+            limit_event: None,
             result: Some(RunResult {
                 outcome,
                 exit_code,
@@ -1902,5 +1992,147 @@ mod tests {
         let rendered = format!("{:?}", terminal.backend().buffer());
         assert!(rendered.contains("no runs"), "{rendered}");
         assert!(rendered.contains("Runs"), "sidebar row:\n{rendered}");
+    }
+
+    /// A queued run shows its 1-based position, the wait and a short reason in
+    /// the row itself, so waiting is visible without opening details.
+    #[test]
+    fn queued_run_row_shows_position_wait_and_reason() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        let mut view = run_view(4, RunState::Queued, None, CleanupState::Pending);
+        view.queue.position = Some(2);
+        view.queue.waiting_ms = 12_000;
+        view.queue.reason = Some("project at limit".into());
+        app.runs = vec![view];
+        app.section = Section::Runs;
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("queued"), "state:\n{rendered}");
+        assert!(rendered.contains("q#2"), "queue position:\n{rendered}");
+        assert!(rendered.contains("12.0s"), "queue wait:\n{rendered}");
+        assert!(
+            rendered.contains("project at limit"),
+            "queue reason:\n{rendered}"
+        );
+    }
+
+    /// Details report the request and what was applied side by side, name the
+    /// difference, and label observed usage as a measurement with its source.
+    #[test]
+    fn run_details_show_requested_effective_and_observation() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        let mut view = run_view(7, RunState::Running, None, CleanupState::Pending);
+        view.requested = ResourceRequest {
+            memory_bytes: Some(512 << 20),
+            cpu_millicores: Some(2000),
+            processes: Some(8),
+            enforcement: Enforcement::Hard,
+            queue_timeout: Some(Duration::from_secs(300)),
+        };
+        view.effective = EffectiveLimits {
+            memory_bytes: Some(512 << 20),
+            enforcement: Enforcement::Monitored,
+            metric: Some("sum of RSS over the process group, sampled every 200 ms".into()),
+            backend: "process_group".into(),
+        };
+        view.observed_memory_bytes = Some(900 << 20);
+        view.observed_processes = Some(5);
+        app.runs = vec![view];
+        app.section = Section::Runs;
+        app.mode = Mode::Details;
+        let text = join_lines(details_lines(&snap, &app, 120));
+        assert!(text.contains("requested"), "{text}");
+        assert!(text.contains("enforce hard"), "{text}");
+        assert!(text.contains("effective"), "{text}");
+        assert!(text.contains("enforce monitored"), "{text}");
+        assert!(text.contains("differs"), "difference is named:\n{text}");
+        assert!(text.contains("hard → monitored"), "{text}");
+        assert!(text.contains("sum of RSS"), "metric source:\n{text}");
+        assert!(text.contains("observation, not a limit"), "{text}");
+        assert!(text.contains("5 procs"), "{text}");
+    }
+
+    /// A reservation is a budget, never RAM; and `Monitored` must not render
+    /// like `Available`.
+    #[test]
+    fn reservation_is_not_ram_and_monitored_is_distinct() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        let mut view = run_view(3, RunState::Running, None, CleanupState::Pending);
+        view.requested.memory_bytes = Some(512 << 20);
+        view.effective.memory_bytes = Some(512 << 20);
+        view.effective.enforcement = Enforcement::Monitored;
+        view.capabilities.aggregate_memory_limit = Capability::Monitored("rss".into());
+        app.runs = vec![view];
+        app.section = Section::Runs;
+        app.mode = Mode::Details;
+        let lines = details_lines(&snap, &app, 120);
+        let reserved = lines
+            .iter()
+            .map(|l| l.to_string())
+            .find(|l| l.starts_with("reserved"))
+            .expect("reserved row");
+        assert!(reserved.contains("budget"), "{reserved}");
+        assert!(reserved.contains("not measured memory"), "{reserved}");
+        assert!(
+            !reserved.contains("RAM"),
+            "reservation labelled as RAM: {reserved}"
+        );
+
+        let available = capability_line("memory", &Capability::Available);
+        let monitored = capability_line("memory", &Capability::Monitored("rss".into()));
+        assert!(available.to_string().contains("available"));
+        assert!(monitored.to_string().contains("monitored"));
+        assert_ne!(
+            available.spans[1].style, monitored.spans[1].style,
+            "monitored must not render like available"
+        );
+    }
+    #[test]
+    fn capacity_line_shows_live_counts_only_when_a_supervisor_answers() {
+        let text = |line: &ratatui::text::Line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let live = Capacity {
+            limits: crate::model::run::LimitSummary {
+                max_parallel: 3,
+                max_parallel_per_project: 1,
+                max_queued: 8,
+                queue_timeout_secs: 60,
+                memory_budget_bytes: 2 * 1024 * 1024 * 1024,
+                default_run_memory_bytes: 256 * 1024 * 1024,
+                starvation_after_secs: 60,
+            },
+            running: 2,
+            queued: 1,
+            slots_free: 1,
+            over_parallel_limit: true,
+            reserved_memory_bytes: 512 * 1024 * 1024,
+            projects: Vec::new(),
+            queue: Vec::new(),
+            reservation_note: String::new(),
+            capabilities: crate::model::run::backend_capabilities(),
+        };
+        let rendered = text(&capacity_line(200, Some(&live)));
+        assert!(rendered.contains("2/3 used"), "{rendered}");
+        assert!(rendered.contains("1 waiting"), "{rendered}");
+        assert!(rendered.contains("budget, not RAM"), "{rendered}");
+        assert!(rendered.contains("above the new limit"), "{rendered}");
+        assert!(!rendered.contains("unavailable"), "{rendered}");
+
+        // Without a supervisor the configured limits are shown and the live
+        // counts are honestly marked unavailable.
+        let standalone = text(&capacity_line(200, None));
+        assert!(
+            standalone.contains("live counts unavailable"),
+            "{standalone}"
+        );
     }
 }

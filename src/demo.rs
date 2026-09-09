@@ -15,7 +15,10 @@ use crate::model::{
     Category, ListeningPort, ProcessInfo, Project, Protocol, RuntimeItem, RuntimeSnapshot,
     RuntimeState, Suspicion, SuspicionReason,
     docker::{DockerKind, DockerResource, DockerSnapshot},
-    run::{BackendCapabilities, CleanupState, LogState, RunOutcome, RunState},
+    run::{
+        Capacity, CleanupState, EffectiveLimits, Enforcement, LogState, ProjectUsage, QueueEntry,
+        QueueInfo, ResourceRequest, RunOutcome, RunState, backend_capabilities,
+    },
     session::{RuntimeSessionId, SessionInfo},
 };
 use crate::runner::RunView;
@@ -759,10 +762,22 @@ struct DemoRun {
     detail: Option<&'static str>,
     stdout: &'static str,
     stderr: &'static str,
+    /// Reserved against the memory budget at admission (None = supervisor
+    /// default). A reservation is a budget, never measured RAM.
+    memory_bytes: Option<u64>,
+    enforcement: Enforcement,
+    /// Present only while the request is waiting for a slot.
+    queue_position: Option<usize>,
+    queue_reason: Option<&'static str>,
+    /// Measurement of the run's process group, kept distinct from the
+    /// reservation above.
+    observed_memory_bytes: Option<u64>,
+    observed_processes: Option<usize>,
+    limit_event: Option<&'static str>,
 }
 
-/// One live run plus one per terminal outcome the Runs view must render.
-/// Nothing here starts, signals or inspects a process.
+/// Eight runs: two live, one queued, and one per terminal outcome including a
+/// resource-limit stop. Nothing here starts, signals or inspects a process.
 const RUNS: &[DemoRun] = &[
     DemoRun {
         id: 412,
@@ -783,6 +798,67 @@ const RUNS: &[DemoRun] = &[
         detail: None,
         stdout: "web: running 3 test files...\nweb: PASS src/app.test.ts\n",
         stderr: "",
+        memory_bytes: None,
+        enforcement: Enforcement::Monitored,
+        queue_position: None,
+        queue_reason: None,
+        observed_memory_bytes: Some(188_743_680),
+        observed_processes: Some(4),
+        limit_event: None,
+    },
+    DemoRun {
+        id: 407,
+        request_id: "run-b5d2-nextest",
+        argv: &["cargo", "nextest", "run", "--workspace"],
+        cwd: "/Users/me/Work/wyd",
+        project_root: "/Users/me/Work/wyd",
+        session_seed: Some("demo.codex.wyd"),
+        state: RunState::Queued,
+        outcome: None,
+        exit_code: None,
+        signal: None,
+        cleanup: CleanupState::Pending,
+        ago_created: 45,
+        ago_started: None,
+        ago_finished: None,
+        duration_ms: None,
+        detail: Some("waiting for a slot"),
+        stdout: "",
+        stderr: "",
+        memory_bytes: Some(512 * 1024 * 1024),
+        enforcement: Enforcement::None,
+        queue_position: Some(1),
+        queue_reason: Some("project /Users/me/Work/wyd is at its 2-run limit"),
+        observed_memory_bytes: None,
+        observed_processes: None,
+        limit_event: None,
+    },
+    DemoRun {
+        id: 405,
+        request_id: "run-3e8d-dev-server",
+        argv: &["pnpm", "run", "dev"],
+        cwd: "/Users/me/Work/wyd",
+        project_root: "/Users/me/Work/wyd",
+        session_seed: Some("demo.opencode.wyd"),
+        state: RunState::Running,
+        outcome: None,
+        exit_code: None,
+        signal: None,
+        cleanup: CleanupState::Pending,
+        ago_created: 300,
+        ago_started: Some(299),
+        ago_finished: None,
+        duration_ms: None,
+        detail: None,
+        stdout: "vite v6.0.0  ready in 412 ms\n  ➜  Local:   http://localhost:5173/\n",
+        stderr: "",
+        memory_bytes: None,
+        enforcement: Enforcement::Monitored,
+        queue_position: None,
+        queue_reason: None,
+        observed_memory_bytes: Some(402_653_184),
+        observed_processes: Some(7),
+        limit_event: None,
     },
     DemoRun {
         id: 411,
@@ -803,6 +879,42 @@ const RUNS: &[DemoRun] = &[
         detail: None,
         stdout: "   Compiling api v0.9.0\n    Finished test [ 41.2s]\n",
         stderr: "",
+        memory_bytes: None,
+        enforcement: Enforcement::None,
+        queue_position: None,
+        queue_reason: None,
+        observed_memory_bytes: None,
+        observed_processes: None,
+        limit_event: None,
+    },
+    DemoRun {
+        id: 406,
+        request_id: "run-77a1-site-build",
+        argv: &["node", "--max-old-space-size=256", "./scripts/build.mjs"],
+        cwd: "/Users/me/Work/site",
+        project_root: "/Users/me/Work/site",
+        session_seed: Some("demo.cursor.site"),
+        state: RunState::Finished,
+        outcome: Some(RunOutcome::ResourceLimit),
+        exit_code: Some(137),
+        signal: Some(9),
+        cleanup: CleanupState::Complete,
+        ago_created: 1800,
+        ago_started: Some(1799),
+        ago_finished: Some(1710),
+        duration_ms: Some(89_000),
+        detail: Some("stopped by the monitored memory threshold"),
+        stdout: "building site...\n",
+        stderr: "memory threshold crossed; stopping process group\n",
+        memory_bytes: Some(256 * 1024 * 1024),
+        enforcement: Enforcement::Monitored,
+        queue_position: None,
+        queue_reason: None,
+        observed_memory_bytes: Some(298_844_160),
+        observed_processes: Some(6),
+        limit_event: Some(
+            "observed 285.0 MiB over the 256 MiB monitored threshold (sum of RSS over the process group, sampled every 200 ms); run stopped",
+        ),
     },
     DemoRun {
         id: 410,
@@ -823,6 +935,13 @@ const RUNS: &[DemoRun] = &[
         detail: Some("exceeded 120s timeout; process group terminated"),
         stdout: "running e2e suite...\n",
         stderr: "timeout: no progress after 120s\n",
+        memory_bytes: None,
+        enforcement: Enforcement::None,
+        queue_position: None,
+        queue_reason: None,
+        observed_memory_bytes: None,
+        observed_processes: None,
+        limit_event: None,
     },
     DemoRun {
         id: 409,
@@ -843,6 +962,13 @@ const RUNS: &[DemoRun] = &[
         detail: Some("cancelled by operator"),
         stdout: "Serving HTTP on 127.0.0.1 port 8080...\n",
         stderr: "",
+        memory_bytes: None,
+        enforcement: Enforcement::None,
+        queue_position: None,
+        queue_reason: None,
+        observed_memory_bytes: None,
+        observed_processes: None,
+        limit_event: None,
     },
     DemoRun {
         id: 408,
@@ -863,8 +989,27 @@ const RUNS: &[DemoRun] = &[
         detail: Some("No such file or directory (os error 2)"),
         stdout: "",
         stderr: "",
+        memory_bytes: None,
+        enforcement: Enforcement::None,
+        queue_position: None,
+        queue_reason: None,
+        observed_memory_bytes: None,
+        observed_processes: None,
+        limit_event: None,
     },
 ];
+
+/// Reservation the supervisor applies when a run asks for no particular
+/// amount. Kept in step with `scheduler::Limits::default()`.
+const DEFAULT_RUN_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What the memory observation actually measures. The wording matches the
+/// backend capability so the UI never reads a measurement as a kernel limit.
+const OBSERVED_METRIC: &str = "sum of RSS over the run's process group, sampled every 200 ms; shared pages can be counted more than once";
+
+/// Why `reserved_memory_bytes` must not be read as RAM in use.
+const RESERVATION_NOTE: &str = "reserved_memory_bytes is a reservation (budget) held for admitted runs, not measured RAM; \
+     a run's observed_memory_bytes is the measurement";
 
 fn demo_view(r: &DemoRun, n: u64) -> RunView {
     let session_id = r.session_seed.map(|s| format!("{:016x}", stable_id(s)));
@@ -893,7 +1038,35 @@ fn demo_view(r: &DemoRun, n: u64) -> RunView {
             stderr_truncated: false,
         },
         supervisor: Some("demo:0".into()),
-        capabilities: BackendCapabilities::stage1(),
+        requested: ResourceRequest {
+            memory_bytes: r.memory_bytes,
+            cpu_millicores: None,
+            processes: None,
+            enforcement: r.enforcement,
+            queue_timeout: None,
+        },
+        effective: EffectiveLimits {
+            // A request with no explicit amount still gets the configured
+            // default reserved, so requested and effective legitimately differ.
+            memory_bytes: Some(r.memory_bytes.unwrap_or(DEFAULT_RUN_MEMORY_BYTES)),
+            enforcement: r.enforcement,
+            metric: (r.enforcement == Enforcement::Monitored).then(|| OBSERVED_METRIC.to_string()),
+            backend: "process_group".into(),
+        },
+        queue: QueueInfo {
+            position: r.queue_position,
+            // Only a waiting request has spent time in the queue.
+            waiting_ms: if r.state == RunState::Queued {
+                r.ago_created.saturating_mul(1000)
+            } else {
+                0
+            },
+            reason: r.queue_reason.map(str::to_string),
+        },
+        observed_memory_bytes: r.observed_memory_bytes,
+        observed_processes: r.observed_processes,
+        limit_event: r.limit_event.map(str::to_string),
+        capabilities: backend_capabilities(),
         events: Vec::new(),
     }
 }
@@ -907,6 +1080,71 @@ pub fn runs() -> Vec<RunView> {
 pub fn run(id: i64) -> Option<RunView> {
     let n = now();
     RUNS.iter().find(|r| r.id == id).map(|r| demo_view(r, n))
+}
+
+/// Synthetic capacity derived from the same `RUNS` the dashboard lists, so
+/// the two views cannot disagree. Limits are the built-in defaults; nothing
+/// here inspects the host.
+pub fn capacity() -> Capacity {
+    let limits = crate::runner::scheduler::Limits::default().summary();
+    let running: Vec<&DemoRun> = RUNS
+        .iter()
+        .filter(|r| r.state == RunState::Running)
+        .collect();
+    let queued: Vec<&DemoRun> = RUNS
+        .iter()
+        .filter(|r| r.state == RunState::Queued)
+        .collect();
+
+    let mut projects: Vec<ProjectUsage> = Vec::new();
+    for r in running.iter().copied() {
+        match projects.iter_mut().find(|p| p.project == r.project_root) {
+            Some(p) => {
+                p.running += 1;
+                p.reserved_memory_bytes += demo_memory(r);
+            }
+            None => projects.push(ProjectUsage {
+                project: r.project_root.to_string(),
+                running: 1,
+                reserved_memory_bytes: demo_memory(r),
+            }),
+        }
+    }
+    projects.sort_by(|a, b| a.project.cmp(&b.project));
+
+    let queue: Vec<QueueEntry> = queued
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, r)| QueueEntry {
+            run_id: r.id.to_string(),
+            project: r.project_root.to_string(),
+            position: r.queue_position.unwrap_or(i + 1),
+            waiting_ms: r.ago_created.saturating_mul(1000),
+            memory_bytes: demo_memory(r),
+            reason: r.queue_reason.unwrap_or("waiting for a slot").to_string(),
+        })
+        .collect();
+
+    let slots_free = limits.max_parallel.saturating_sub(running.len());
+    Capacity {
+        limits,
+        running: running.len(),
+        queued: queued.len(),
+        slots_free,
+        reserved_memory_bytes: running.iter().copied().map(demo_memory).sum(),
+        projects,
+        queue,
+        over_parallel_limit: false,
+        reservation_note: RESERVATION_NOTE.to_string(),
+        capabilities: backend_capabilities(),
+    }
+}
+
+/// Reservation a demo run holds; a run with no explicit amount gets the
+/// configured default, exactly like the real scheduler.
+fn demo_memory(r: &DemoRun) -> u64 {
+    r.memory_bytes.unwrap_or(DEFAULT_RUN_MEMORY_BYTES)
 }
 
 /// Synthetic output chunk with the same shape as `read_run_output`. Sliced

@@ -13,6 +13,7 @@ const state = {
   overview: null,
   docker: null,
   runs: [],         // managed runs (read-only)
+  capacity: null,   // admission capacity (read-only)
   runOutput: null,  // {run_id, stream, data, next_cursor, truncated, eof}
   cancelRun: null,  // pending cancel proposal {id, proposal}
   query: '',
@@ -90,6 +91,12 @@ async function api(path, opts = {}) {
 }
 
 async function poll() {
+  // Capacity and runs are separate read-only endpoints; keep both best-effort
+  // so an older daemon without them still renders everything else.
+  try {
+    const cap = await api('/api/capacity');
+    state.capacity = cap.capacity || null;
+  } catch (e) { /* capacity unavailable */ }
   try {
     const data = await api('/api/snapshot');
     state.mode = data.mode;
@@ -100,8 +107,6 @@ async function poll() {
     state.docker = data.docker || null;
     render();
   } catch (e) { console.error('poll', e); }
-  // Managed runs are a separate read-only endpoint; keep it best-effort so
-  // an older daemon without /api/runs still renders everything else.
   try {
     const runs = await api('/api/runs');
     state.runs = runs.runs || [];
@@ -347,6 +352,7 @@ function render() {
   $('topbar-meta').textContent = `v${state.version} · ${state.mode}`;
   document.body.classList.toggle('demo', state.mode === 'demo');
   renderOverview();
+  renderCapacity();
   renderMain();
   renderProposal();
   const drawer = $('details-drawer');
@@ -455,6 +461,38 @@ function renderOverview() {
     count: state.runs.length,
     onClick: () => dispatch({ type: 'section', section: 'runs' }),
   });
+}
+
+// Compact admission panel: slots, queue, reservations and capability states.
+// `reserved_memory_bytes` is a budget; it is never shown as RAM in use.
+function renderCapacity() {
+  const el = $('capacity');
+  if (!el) return;
+  const c = state.capacity;
+  if (!c) {
+    el.innerHTML = '<div class="capacity-title">Capacity</div><div class="muted">unavailable</div>';
+    return;
+  }
+  const lim = c.limits || {};
+  const caps = Object.keys(c.capabilities || {}).map(k => {
+    const st = capState(c.capabilities[k]);
+    return `<li class="cap-${st}"><span class="cap-k">${escapeHtml(k)}</span><span class="cap-v">${escapeHtml(capText(c.capabilities[k]))}</span></li>`;
+  }).join('');
+  const queue = (c.queue || []).map(e =>
+    `<div class="capacity-q">#${e.position} run ${escapeHtml(e.run_id)} · ${escapeHtml(basename(e.project))} · waiting ${Math.round((e.waiting_ms || 0) / 1000)}s · ${escapeHtml(e.reason)}</div>`
+  ).join('');
+  el.innerHTML = `
+    <div class="capacity-title">Capacity</div>
+    <div class="capacity-grid">
+      <span class="ck">Slots</span><span>${c.running} used · ${c.slots_free} free of ${lim.max_parallel}</span>
+      <span class="ck">Queue</span><span>${c.queued} waiting of ${lim.max_queued}</span>
+      <span class="ck">Reserved</span><span title="reservation (budget), not measured RAM">${fmtBytes(c.reserved_memory_bytes)} budget</span>
+    </div>
+    ${c.over_parallel_limit ? '<div class="capacity-over">over the parallel limit — temporary; active runs are not killed</div>' : ''}
+    ${queue ? `<div class="capacity-queue">${queue}</div>` : ''}
+    <div class="capacity-note">${escapeHtml(c.reservation_note || '')}</div>
+    ${caps ? `<ul class="capacity-caps">${caps}</ul>` : ''}
+  `;
 }
 
 // Build the display tree: reuse the backend tree, but pull orphan
@@ -672,12 +710,21 @@ function runDuration(r) {
 }
 
 function runMeta(r) {
+  if (r.state === 'queued') {
+    const q = r.queue || {};
+    const pos = q.position != null ? `#${q.position}` : null;
+    const wait = q.waiting_ms ? `waiting ${Math.round(q.waiting_ms / 1000)}s` : 'waiting';
+    return ['queued', pos, wait, q.reason].filter(Boolean).join(' · ');
+  }
   if (r.state === 'finished') {
     const code = r.exit_code != null ? `exit ${r.exit_code}`
       : (r.signal != null ? `signal ${r.signal}` : '');
-    return [r.outcome, code, runDuration(r), r.cleanup].filter(Boolean).join(' · ');
+    // A resource-limit stop is not a plain failure: name the cause.
+    const cause = r.outcome === 'resource_limit' ? 'stopped by monitored limit' : null;
+    return [r.outcome, code, runDuration(r), r.cleanup, cause].filter(Boolean).join(' · ');
   }
-  return `${r.state} · ${runDuration(r)}`;
+  const observed = r.observed_memory_bytes != null ? `observed ${fmtBytes(r.observed_memory_bytes)}` : null;
+  return [r.state, runDuration(r), observed].filter(Boolean).join(' · ');
 }
 
 function renderRuns() {
@@ -691,7 +738,9 @@ function renderRuns() {
   for (const r of rows) {
     const selected = state.selection?.kind === 'run' && String(state.selection.data?.run_id) === String(r.run_id);
     const live = r.state !== 'finished';
+    const queued = r.state === 'queued';
     const action = live ? '<button class="btn-ghost-sm" data-a="cancel">Cancel</button>' : '';
+    const cls = [selected ? 'selected' : '', queued ? 'run-queued' : ''].filter(Boolean).join(' ');
     secRow(body, {
       nameTitle: (r.argv || []).join(' '),
       name: `${icon('other')}<span>${escapeHtml(basename((r.argv || [])[0] || r.run_id))}</span>`,
@@ -699,9 +748,9 @@ function renderRuns() {
       fromTitle: r.project_root || r.cwd || '',
       from: escapeHtml(shortenPath(r.project_root || r.cwd)) || '—',
       meta: runMeta(r),
-      metaCls: live ? 'sec-ok' : (r.outcome === 'exited' && r.exit_code === 0 ? 'sec-muted' : 'sec-warn'),
+      metaCls: queued ? 'sec-queue' : (live ? 'sec-ok' : (r.outcome === 'exited' && r.exit_code === 0 ? 'sec-muted' : 'sec-warn')),
       action,
-      cls: selected ? 'selected' : '',
+      cls,
       onClick: () => dispatch({ type: 'select-run', run: r }),
     });
     const last = body.lastElementChild;
@@ -1032,29 +1081,88 @@ function renderDetails() {
   }
 }
 
+// Capabilities have three states; `monitored` is observed-and-acted-on by
+// wyd, not a kernel guarantee, so it must not read like `available`.
+function capState(v) {
+  if (v === 'available') return 'available';
+  if (v && typeof v === 'object' && v.monitored != null) return 'monitored';
+  return 'unavailable';
+}
 function capText(v) {
   if (v === 'available') return 'available';
-  if (v && typeof v === 'object' && v.unavailable) return v.unavailable;
+  if (v && typeof v === 'object' && v.monitored != null) return v.monitored;
+  if (v && typeof v === 'object' && v.unavailable != null) return v.unavailable;
   return 'unavailable';
 }
 
 function renderRunDetails(r) {
   const body = $('details-body');
   const live = r.state !== 'finished';
+  const queued = r.state === 'queued';
   const ok = r.outcome === 'exited' && r.exit_code === 0;
-  const tone = live ? 'good' : (ok ? 'good' : 'warn');
+  const tone = live ? (queued ? 'neutral' : 'good') : (ok ? 'good' : 'warn');
   const verdict = live
-    ? r.state
+    ? (queued ? 'queued — waiting for a slot' : r.state)
     : [r.outcome,
         r.exit_code != null ? `exit ${r.exit_code}` : null,
         r.signal != null ? `signal ${r.signal}` : null].filter(Boolean).join(' · ');
   const caps = r.capabilities || {};
   const capList = Object.keys(caps)
-    .map(k => `<li>${escapeHtml(k)}: ${escapeHtml(capText(caps[k]))}</li>`)
+    .map(k => {
+      const st = capState(caps[k]);
+      return `<li class="cap-${st}"><span class="cap-k">${escapeHtml(k)}</span><span class="cap-v">${escapeHtml(capText(caps[k]))}</span></li>`;
+    })
     .join('');
   const out = state.runOutput && String(state.runOutput.run_id) === String(r.run_id)
     ? state.runOutput : null;
   const pending = state.cancelRun && String(state.cancelRun.proposal.run_id) === String(r.run_id);
+
+  const req = r.requested || {};
+  const eff = r.effective || {};
+  const enf = (e) => (e && e !== 'none') ? e : 'none';
+  const memLabel = (b) => b != null ? `${fmtBytes(b)} (reservation/budget)` : 'not set';
+  const differs = (req.memory_bytes ?? null) !== (eff.memory_bytes ?? null)
+    || enf(req.enforcement) !== enf(eff.enforcement);
+
+  const q = r.queue || {};
+  const queueBlock = (queued || q.position != null) ? `
+    <div class="evidence queue-block">
+      <div class="evidence-label">Queue — not executing</div>
+      <div class="kv">
+        <div class="k">State</div><div class="v">queued</div>
+        ${q.position != null ? `<div class="k">Position</div><div class="v">#${q.position} (no ETA; the queue cannot predict when a slot frees)</div>` : ''}
+        <div class="k">Waiting</div><div class="v">${Math.round((q.waiting_ms || 0) / 1000)}s</div>
+        ${q.reason ? `<div class="k">Reason</div><div class="v">${escapeHtml(q.reason)}</div>` : ''}
+      </div>
+    </div>` : '';
+
+  const hasLimits = req.memory_bytes != null || eff.memory_bytes != null
+    || enf(req.enforcement) !== 'none' || enf(eff.enforcement) !== 'none';
+  const resourcesBlock = hasLimits ? `
+    <div class="evidence">
+      <div class="evidence-label">Resources${differs ? ' — requested and effective differ' : ''}</div>
+      <div class="kv">
+        <div class="k">Requested</div><div class="v">memory ${memLabel(req.memory_bytes)} · enforcement ${escapeHtml(enf(req.enforcement))}</div>
+        <div class="k">Effective</div><div class="v">memory ${memLabel(eff.memory_bytes)} · enforcement ${escapeHtml(enf(eff.enforcement))} · backend ${escapeHtml(eff.backend || '—')}</div>
+        ${eff.metric ? `<div class="k">Metric</div><div class="v">${escapeHtml(eff.metric)}</div>` : ''}
+      </div>
+      <div class="resource-note">Reservations are a budget held at admission, not measured RAM.</div>
+    </div>` : '';
+
+  const observationBlock = (r.observed_memory_bytes != null || r.observed_processes != null) ? `
+    <div class="evidence observation">
+      <div class="evidence-label">Observed — measurement, not a limit</div>
+      <ul>
+        ${r.observed_memory_bytes != null ? `<li>memory: ${fmtBytes(r.observed_memory_bytes)} — ${escapeHtml(eff.metric || 'sum of RSS over the run’s process group, sampled every 200 ms')}</li>` : ''}
+        ${r.observed_processes != null ? `<li>processes: ${r.observed_processes} in the process group</li>` : ''}
+      </ul>
+    </div>` : '';
+
+  const limitBlock = r.limit_event ? `
+    <div class="evidence limit-event">
+      <div class="evidence-label">Resource limit event</div>
+      <div>${escapeHtml(r.limit_event)}</div>
+    </div>` : '';
 
   const outputBlock = out ? `
     <div class="evidence">
@@ -1086,7 +1194,7 @@ function renderRunDetails(r) {
 
   body.innerHTML = `
     <div class="verdict verdict-${tone}">
-      <span class="verdict-label">${live ? 'Running' : 'Finished'}</span>
+      <span class="verdict-label">${live ? (queued ? 'Queued' : 'Running') : 'Finished'}</span>
       <span class="verdict-text">${escapeHtml(verdict || '—')}</span>
     </div>
     <div class="kv">
@@ -1099,6 +1207,10 @@ function renderRunDetails(r) {
       <div class="k">Cleanup</div><div class="v">${escapeHtml(r.cleanup || '—')}</div>
       ${r.detail ? `<div class="k">Detail</div><div class="v">${escapeHtml(r.detail)}</div>` : ''}
     </div>
+    ${queueBlock}
+    ${resourcesBlock}
+    ${observationBlock}
+    ${limitBlock}
     <div class="evidence">
       <div class="evidence-label">Output retained</div>
       <ul>
@@ -1545,6 +1657,19 @@ async function registerWebMcpTools() {
         state.runOutput = { run_id, ...chunk };
         render();
         return chunk;
+      },
+    },
+    {
+      name: 'get_capacity',
+      title: 'Get capacity',
+      description: 'Read-only admission capacity: parallel slots used/free, queue length and entries, the reserved memory budget (a reservation held at admission, never measured RAM), per-project usage, and backend capability states. It cannot change limits — that is the owner\'s call via `wyd capacity --set`.',
+      inputSchema: { type: 'object', properties: {} },
+      annotations: { readOnlyHint: true },
+      execute: async () => {
+        const out = await api('/api/capacity');
+        state.capacity = out.capacity || null;
+        render();
+        return { capacity: out.capacity };
       },
     },
     {

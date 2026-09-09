@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use crate::demo;
 use crate::model::{
     RuntimeSnapshot,
-    run::{RunId, RunState},
+    run::{Capacity, RunId, RunState},
     session::{RuntimeSessionId, SessionInfo},
 };
 use crate::runner::RunView;
@@ -69,6 +69,9 @@ pub trait RuntimeProvider: Send + Sync + 'static {
     /// view works with no supervisor running.
     fn runs(&self, filter: &RunFilter) -> Vec<RunView>;
     fn run(&self, id: RunId) -> Option<RunView>;
+    /// Read-only admission capacity: slots, queue and reservations. Never
+    /// mutates anything and never starts a run.
+    fn capacity(&self) -> Capacity;
     /// One bounded output chunk for a retained run.
     fn run_output(
         &self,
@@ -130,6 +133,20 @@ impl RuntimeProvider for LocalProvider {
             .flatten()
     }
     fn runs(&self, filter: &RunFilter) -> Vec<RunView> {
+        // A live supervisor knows things the store does not: observed memory,
+        // queue position and limit events. Ask it when it is answering, and
+        // fall back to the durable store otherwise.
+        if crate::server::serve_alive() {
+            let query = json!({
+                "state": filter.state.map(|s| s.as_str()),
+                "project": filter.project,
+                "session": filter.session.map(|s| s.to_string()),
+                "limit": filter.limit,
+            });
+            if let Ok(runs) = crate::runner::client::Client::new().list(query) {
+                return runs;
+            }
+        }
         let Ok(store) = self.open_store() else {
             return Vec::new();
         };
@@ -145,6 +162,31 @@ impl RuntimeProvider for LocalProvider {
             .ok()
             .flatten()
             .map(|r| RunView::from_record(&r))
+    }
+    fn capacity(&self) -> Capacity {
+        // The supervisor owns admission. With none alive there is nothing to
+        // ask, so report the configured limits with zero usage rather than
+        // starting a daemon or inventing runs.
+        if server::serve_alive()
+            && let Ok(c) = crate::runner::client::Client::new().capacity()
+        {
+            return c;
+        }
+        let limits = crate::config::Config::global().runs.limits().summary();
+        let slots_free = limits.max_parallel;
+        Capacity {
+            limits,
+            running: 0,
+            queued: 0,
+            slots_free,
+            reserved_memory_bytes: 0,
+            projects: Vec::new(),
+            queue: Vec::new(),
+            over_parallel_limit: false,
+            reservation_note: "no supervisor running: configured limits only, no reservations held"
+                .into(),
+            capabilities: crate::model::run::backend_capabilities(),
+        }
     }
     fn run_output(
         &self,
@@ -225,6 +267,9 @@ impl RuntimeProvider for DemoProvider {
     fn run(&self, id: RunId) -> Option<RunView> {
         demo::run(id.0)
     }
+    fn capacity(&self) -> Capacity {
+        demo::capacity()
+    }
     fn run_output(
         &self,
         id: RunId,
@@ -244,6 +289,7 @@ impl RuntimeProvider for DemoProvider {
 #[derive(Debug)]
 enum Route<'a> {
     Health,
+    Capacity,
     Snapshot,
     SessionsList,
     SessionGet { id: u64 },
@@ -448,6 +494,7 @@ fn match_route<'a>(method: &str, path: &'a str) -> Route<'a> {
     let p = path.split('?').next().unwrap_or(path);
     match (method, p) {
         ("GET", "/api/health") => Route::Health,
+        ("GET", "/api/capacity") => Route::Capacity,
         ("GET", "/api/snapshot") => Route::Snapshot,
         ("GET", "/api/sessions") => Route::SessionsList,
         ("GET", p) if p.starts_with("/api/sessions/") => {
@@ -565,6 +612,7 @@ fn build_response(
             }),
         ),
         Route::Snapshot => snapshot_response(provider),
+        Route::Capacity => capacity_response(provider),
         Route::SessionsList => HttpResponse::json(
             200,
             json!({ "ok": true, "data": { "sessions": sessions_json(provider) } }),
@@ -1306,6 +1354,15 @@ fn run_filter_from_query(req: &ParsedRequest) -> RunFilter {
     filter
 }
 
+/// Read-only admission view. Same `Capacity` shape as the socket's
+/// `get_capacity`; the web has no way to change limits (the CLI does).
+fn capacity_response(provider: &dyn RuntimeProvider) -> HttpResponse {
+    HttpResponse::json(
+        200,
+        json!({ "ok": true, "data": { "capacity": provider.capacity() } }),
+    )
+}
+
 fn runs_response(provider: &dyn RuntimeProvider, req: &ParsedRequest) -> HttpResponse {
     let runs = provider.runs(&run_filter_from_query(req));
     HttpResponse::json(200, json!({ "ok": true, "data": { "runs": runs } }))
@@ -1843,17 +1900,27 @@ mod tests {
     #[test]
     fn demo_runs_are_synthetic_and_cancel_is_simulated() {
         let runs = DemoProvider.runs(&RunFilter::default());
-        assert_eq!(runs.len(), 5);
+        assert_eq!(runs.len(), 8);
         let values: Vec<Value> = runs
             .iter()
             .map(|r| serde_json::to_value(r).unwrap())
             .collect();
         assert!(values.iter().any(|v| v["state"] == "running"));
+        assert!(
+            values.iter().any(|v| v["state"] == "queued"),
+            "demo needs a queued run to render the queue distinctly"
+        );
         let outcomes: Vec<&str> = values
             .iter()
             .filter_map(|v| v["outcome"].as_str())
             .collect();
-        for expected in ["exited", "timed_out", "cancelled", "spawn_failed"] {
+        for expected in [
+            "exited",
+            "timed_out",
+            "cancelled",
+            "spawn_failed",
+            "resource_limit",
+        ] {
             assert!(outcomes.contains(&expected), "missing outcome {expected}");
         }
 
@@ -1917,8 +1984,8 @@ mod tests {
         assert_eq!(resp.status, 200);
         let v: Value = serde_json::from_slice(&resp.body).unwrap();
         let runs = v["data"]["runs"].as_array().unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["state"], "running");
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r["state"] == "running"));
 
         let req = ParsedRequest {
             method: "GET".into(),
@@ -1984,5 +2051,162 @@ mod tests {
             &DemoProvider,
         );
         assert_eq!(resp.status, 409);
+    }
+
+    // ── Capacity ───────────────────────────────────────────────────────
+    #[test]
+    fn capacity_route_returns_contract_shape() {
+        assert!(matches!(
+            match_route("GET", "/api/capacity"),
+            Route::Capacity
+        ));
+        // Read-only: a bare POST is not a way to change limits.
+        assert!(matches!(
+            match_route("POST", "/api/capacity"),
+            Route::NotFound
+        ));
+
+        let state = demo_state();
+        let req = ParsedRequest {
+            method: "GET".into(),
+            path: "/api/capacity".into(),
+            ..Default::default()
+        };
+        let resp = build_response(&Route::Capacity, &req, &state, &DemoProvider);
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["ok"], true);
+        let data = &v["data"]["capacity"];
+        for key in [
+            "limits",
+            "running",
+            "queued",
+            "slots_free",
+            "reserved_memory_bytes",
+            "projects",
+            "queue",
+            "over_parallel_limit",
+            "reservation_note",
+            "capabilities",
+        ] {
+            assert!(data.get(key).is_some(), "capacity missing {key}");
+        }
+        // Round-trips into the core type, so the wire shape is the contract.
+        let _: Capacity = serde_json::from_value(data.clone()).unwrap();
+    }
+
+    #[test]
+    fn demo_capacity_matches_demo_runs() {
+        let cap = DemoProvider.capacity();
+        let runs = DemoProvider.runs(&RunFilter::default());
+        let running = runs.iter().filter(|r| r.state == RunState::Running).count();
+        let queued: Vec<&RunView> = runs
+            .iter()
+            .filter(|r| r.state == RunState::Queued)
+            .collect();
+
+        assert_eq!(cap.running, running);
+        assert_eq!(cap.queued, queued.len());
+        assert_eq!(cap.slots_free, cap.limits.max_parallel - running);
+        assert!(!cap.over_parallel_limit);
+        assert_eq!(cap.queue.len(), queued.len());
+        for q in &cap.queue {
+            let run = queued
+                .iter()
+                .find(|r| r.run_id == q.run_id)
+                .expect("every queue entry is a queued demo run");
+            assert_eq!(run.queue.position, Some(q.position));
+            assert_eq!(run.queue.waiting_ms, q.waiting_ms);
+            assert_eq!(run.queue.reason.as_deref(), Some(q.reason.as_str()));
+            assert!(q.memory_bytes > 0);
+        }
+        // Reservations cover admitted runs only; a queued request holds none.
+        let expected: u64 = runs
+            .iter()
+            .filter(|r| r.state == RunState::Running)
+            .map(|r| r.effective.memory_bytes.unwrap_or(0))
+            .sum();
+        assert_eq!(cap.reserved_memory_bytes, expected);
+        let projects: u64 = cap.projects.iter().map(|p| p.reserved_memory_bytes).sum();
+        assert_eq!(projects, cap.reserved_memory_bytes);
+    }
+
+    #[test]
+    fn reservation_is_never_rendered_as_measured_ram() {
+        let cap = DemoProvider.capacity();
+        assert!(cap.reservation_note.contains("not measured RAM"));
+        let v = serde_json::to_value(&cap).unwrap();
+        // The budget lives on Capacity; a measurement lives on a run. The
+        // names must not collapse into one "memory" number.
+        assert!(v.get("reserved_memory_bytes").is_some());
+        assert!(v.get("observed_memory_bytes").is_none());
+
+        let limited = DemoProvider
+            .run(RunId(406))
+            .expect("resource_limit demo run");
+        assert_eq!(
+            limited.outcome,
+            Some(crate::model::run::RunOutcome::ResourceLimit)
+        );
+        assert_eq!(
+            limited.effective.enforcement,
+            crate::model::run::Enforcement::Monitored
+        );
+        let observed = limited.observed_memory_bytes.expect("observation");
+        let reserved = limited.effective.memory_bytes.expect("reservation");
+        assert!(
+            observed > reserved,
+            "the monitored threshold is what stopped this run"
+        );
+        assert!(limited.observed_processes.is_some());
+        assert!(
+            limited
+                .limit_event
+                .as_deref()
+                .is_some_and(|e| e.contains("threshold") && e.contains("RSS")),
+            "limit_event must name the measurement, got {:?}",
+            limited.limit_event
+        );
+        let metric = limited.effective.metric.as_deref().unwrap_or("");
+        assert!(
+            metric.contains("RSS") && metric.contains("200 ms"),
+            "metric must name what is measured, got {metric:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn monitored_capability_is_distinct_from_available() {
+        let v = serde_json::to_value(DemoProvider.capacity()).unwrap();
+        let caps = &v["capabilities"];
+        assert_eq!(caps["queue"], "available");
+        let mem = &caps["aggregate_memory_limit"];
+        assert!(
+            mem.get("monitored").is_some(),
+            "macOS memory is monitored, not enforced: {mem}"
+        );
+        assert!(mem.get("available").is_none());
+        assert!(
+            caps["cpu_quota"].get("unavailable").is_some(),
+            "an unavailable capability carries its reason"
+        );
+    }
+
+    #[test]
+    fn webmcp_bundle_registers_read_only_get_capacity() {
+        let (_, js) = assets::lookup("/assets/app.js").expect("app.js asset");
+        let js = std::str::from_utf8(js).unwrap();
+        assert!(
+            js.contains("name: 'get_capacity'"),
+            "the shipped bundle must register get_capacity"
+        );
+        assert!(
+            js.contains("api('/api/capacity')"),
+            "get_capacity must read the capacity route"
+        );
+        assert!(
+            !js.contains("set_limits"),
+            "the web must never change admission limits"
+        );
     }
 }

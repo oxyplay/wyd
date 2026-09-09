@@ -20,6 +20,7 @@ than building a separate backend.
         │       /api/explain/<pid> · /api/proposal · /api/confirm
         │       /api/runs · /api/runs/<id> · /api/runs/<id>/output
         │       /api/runs/<id>/cancel/propose · /api/runs/<id>/cancel
+        │       /api/capacity
         │       /api/kill (force) · /api/docker/stop · /api/docker/remove
         │       /api/docker/prune   (PID + start-time revalidated; all
         │                            mutating routes CSRF-guarded)
@@ -58,8 +59,8 @@ address unless `--allow-lan` is passed. It also refuses to start if
   `filesystem-mcp`, `sequential-thinking`, `fetch-mcp`.
 - **Dev servers**: `vite :5173`, `next :3000`.
 - **Managed runs**: synthetic `RunView`s (running / exited / timed_out /
-  cancelled / spawn_failed). Demo never starts a process, and demo cancel is
-  simulated — no host action.
+  cancelled / spawn_failed) and a synthetic `Capacity` consistent with them.
+  Demo never starts a process, and demo cancel is simulated — no host action.
 - **Persistent** (excluded from cleanup): `postgres`, `redis`, `mysql`.
 
 The page banner reads `Demo data — synthetic, not your machine.`
@@ -81,6 +82,7 @@ the visible UI reflects every agent action.
 | `list_runs` | Managed runs with state/outcome/cleanup | none (read; populates Runs view) |
 | `get_run` | One run by id: result, cleanup, capabilities | none (read; opens run detail) |
 | `read_run_output` | Bounded stdout/stderr chunk from a cursor | none (read; fills output pane) |
+| `get_capacity` | Admission limits, running/queued counts, reservations, queue positions | none (read; fills the capacity panel) |
 | `propose_cancel_run` | Build a cancel proposal; **never cancels** | creates a pending cancel proposal in the Runs view |
 
 There is **no** destructive WebMCP tool. The human confirms every action:
@@ -100,12 +102,35 @@ and reads their retained output. It cannot start one.
 | `/api/runs/<id>/output` | GET | Bounded stdout/stderr chunk from a byte cursor |
 | `/api/runs/<id>/cancel/propose` | POST | Build a cancel proposal; never cancels |
 | `/api/runs/<id>/cancel` | POST | Apply a confirmed proposal |
+| `/api/capacity` | GET | Admission limits, running/queued counts, reservations, queue positions, capabilities |
 
-Every read is store-backed: list and detail come from
+Every run read is store-backed: list and detail come from
 `RuntimeStore::run_list`/`run_get` mapped through `RunView::from_record`, and
 output is read from the retained log file with `runner::logs::read_chunk`. No
-read path connects to the supervisor, executes a command, or signals anything,
-so the Runs view works with no daemon alive.
+run read path connects to the supervisor, executes a command, or signals
+anything, so the Runs view works with no daemon alive.
+
+`GET /api/capacity` is the one read that asks the supervisor: with one alive
+it returns its live `Capacity`; with none it reports the configured `[runs]`
+limits with `running=0`/`queued=0`, an empty queue and a `reservation_note`
+saying so — it never starts the daemon and never errors. In `--demo` it is
+synthetic, like the demo runs.
+
+The Runs view keeps the numbers apart:
+
+- `reserved_memory_bytes` is labelled a reservation/budget, never RAM in use;
+  `observed_memory_bytes`/`observed_processes` are labelled an observation and
+  name the metric (sum of RSS over the run's process group, sampled every
+  200 ms on macOS).
+- `effective` limits are shown when they differ from `requested`.
+- A `queued` run shows `queue.position`, `queue.waiting_ms` and
+  `queue.reason` — never an exact ETA.
+- A monitored threshold crossing shows `limit_event` and
+  `outcome=resource_limit`. `over_parallel_limit` is a temporary exceedance
+  after a limit was lowered; active runs are not killed for it.
+- The capacity panel shows slots used/free, queue length, reservations and
+  `reservation_note`, and capability states with `Monitored` rendered
+  distinctly from `Available`.
 
 For managed runs, cancel is the only host action, and it stays
 human-confirmed: `propose_cancel_run` and `/api/runs/<id>/cancel/propose` only
@@ -115,7 +140,10 @@ cancels.
 
 There is **no** route or tool that starts a command, so `--allow-lan` does not
 expose host execution. Host execution exists only on the local `wyd mcp
---allow-run` connection and `wyd run`.
+--allow-run` connection and `wyd run`. Likewise there is **no** route or tool
+that changes admission limits: the web reads capacity but cannot raise a
+budget or switch `hard` to `monitored`. Limits are changed locally with
+`wyd capacity --set` or the socket `set_limits`.
 
 ## Human ↔ agent in the same UI
 
@@ -137,6 +165,8 @@ expose host execution. Host execution exists only on the local `wyd mcp
 - No `Command` endpoint and no host-execution route: the dashboard observes
   managed runs and can propose a cancel, but never starts a command, and
   `--allow-lan` does not expose host execution.
+- No route changes admission limits: `/api/capacity` is read-only, so the web
+  cannot raise a budget or turn a `hard` request into `monitored`.
 - `/api/runs/<id>/cancel/propose` only builds a proposal; POST
   `/api/runs/<id>/cancel` applies it after the human confirms in the Runs
   view. A bare GET never cancels.
@@ -154,10 +184,11 @@ expose host execution. Host execution exists only on the local `wyd mcp
 
 - `wyd mcp` is a stdio MCP server — coding agents connect directly over
   stdin/stdout (JSON-RPC framing). Session/ownership queries plus managed-run
-  reads; `wyd mcp --allow-run` adds host execution (`start_run`, `cancel_run`).
+  reads (`list_runs`, `get_run`, `read_run_output`, `get_capacity`);
+  `wyd mcp --allow-run` adds host execution (`start_run`, `cancel_run`).
 - `wyd web` is an HTTP dashboard for browsers, with a WebMCP tool surface
-  running in the browser context. It reads the same runs but never starts one:
-  cancel is a human-confirmed proposal.
+  running in the browser context. It reads the same runs and capacity but never
+  starts one and never changes limits: cancel is a human-confirmed proposal.
 
 Both read the same `RuntimeStore`; they exist for different clients.
 
@@ -190,7 +221,7 @@ curl -s -X POST -H 'Content-Type: application/json' \
 ## Repo layout
 
 - `src/web/mod.rs` — `RuntimeProvider` trait, `LocalProvider`/`DemoProvider`,
-  loopback HTTP routes (including `/api/runs*`), WebState.
+  loopback HTTP routes (including `/api/runs*` and `/api/capacity`), WebState.
 - `src/web/proposal.rs` — pure proposal builder; no side effects.
 - `src/web/assets.rs` — embedded `web/*` files.
 - `web/index.html` — dashboard shell (Overview | Runs | Runtime tree | details drawer).
