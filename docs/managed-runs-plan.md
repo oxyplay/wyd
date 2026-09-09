@@ -58,8 +58,10 @@ wyd capacity [--json] [--set key=value ...]
 
 ## Что осталось
 
-- **Linux не прогнан вживую** (`/proc`-путь и `pgroup` написаны, тесты
-  запускались только на macOS). Нужна машина под Linux.
+- **Linux проверен в контейнере** (`rust:1-slim-bookworm`, 2026-09-09):
+  244 + 3 теста зелёные, `clippy -D warnings` и `fmt --check` чисто.
+  Это не полноценный desktop-Linux: реальное делегирование cgroup,
+  sleep/resume и поведение под systemd остаются непроверенными.
 - **Sleep/resume** проверяется только логикой подстраховки, без реального
   теста сна.
 - **Linux cgroup v2 backend не реализован.** `aggregate_memory_limit`,

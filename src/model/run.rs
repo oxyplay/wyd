@@ -606,14 +606,17 @@ mod tests {
             caps.filesystem_isolation,
             Capability::Unavailable(_)
         ));
-        // Memory is either a real kernel limit or explicitly monitored —
-        // never advertised as hard when it is only observed.
+        // Memory must never be advertised as a hard limit this build cannot
+        // deliver: macOS observes it, Linux has no cgroup backend yet.
+        #[cfg(target_os = "macos")]
         assert!(
-            matches!(
-                caps.aggregate_memory_limit,
-                Capability::Available | Capability::Monitored(_)
-            ),
-            "memory capability must be honest about monitoring"
+            matches!(caps.aggregate_memory_limit, Capability::Monitored(_)),
+            "macOS memory is monitored, not enforced"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            matches!(caps.aggregate_memory_limit, Capability::Unavailable(_)),
+            "without a cgroup v2 backend, hard memory must be unavailable"
         );
     }
 }
