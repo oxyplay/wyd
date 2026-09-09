@@ -76,16 +76,73 @@ impl CgroupRoot {
         &self.controllers
     }
 
-    /// Create the cgroup for one run and make the controllers available to
-    /// its children.
-    pub fn create(&self, name: &str) -> io::Result<Cgroup> {
-        let path = self.path.join(name);
+    /// Create a leaf cgroup directly under `dir` (one per run).
+    pub fn create_leaf(dir: &Path, name: &str) -> io::Result<Cgroup> {
+        let path = dir.join(name);
         std::fs::create_dir(&path)?;
         Ok(Cgroup { path })
+    }
+
+    /// Create a cgroup that will hold other cgroups (the aggregate one) and
+    /// enable the controllers for its children.
+    pub fn prepare_parent(&self, name: &str) -> io::Result<Cgroup> {
+        let path = self.path.join(name);
+        std::fs::create_dir(&path)?;
+        let cgroup = Cgroup { path };
+        cgroup.enable_controllers()?;
+        Ok(cgroup)
     }
 }
 
 impl Cgroup {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Create a leaf cgroup below this one (one per run).
+    pub fn create_child(&self, name: &str) -> io::Result<Cgroup> {
+        let path = self.path.join(name);
+        std::fs::create_dir(&path)?;
+        Ok(Cgroup { path })
+    }
+
+    /// Enable the controllers our runs need for this cgroup's children. Only
+    /// valid while this cgroup has no processes of its own.
+    pub fn enable_controllers(&self) -> io::Result<Vec<String>> {
+        let available = read_words(&self.path.join("cgroup.controllers"))?;
+        let missing: Vec<&str> = WANTED
+            .iter()
+            .copied()
+            .filter(|c| available.iter().any(|a| a == c))
+            .collect();
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
+        let enable: String = missing.iter().map(|c| format!("+{c} ")).collect();
+        write_str(&self.path, "cgroup.subtree_control", enable.trim())?;
+        read_words(&self.path.join("cgroup.subtree_control"))
+    }
+
+    /// Current `memory.max`, `None` when the controller is not present or the
+    /// value is `max` (unlimited).
+    pub fn memory_max(&self) -> Option<u64> {
+        std::fs::read_to_string(self.path.join("memory.max"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// CPU time charged to this cgroup and its descendants, in microseconds.
+    /// Only the cpu-quota test needs it so far.
+    #[cfg(test)]
+    pub fn cpu_usage_usec(&self) -> u64 {
+        read_kv(&self.path.join("cpu.stat"))
+            .ok()
+            .and_then(|kv| kv.get("usage_usec").copied())
+            .unwrap_or(0)
+    }
+
     /// Write every requested limit, returning what the kernel accepted.
     /// A controller that is not enabled for this cgroup is an error, not a
     /// silent skip: the caller asked for a hard limit.
@@ -279,8 +336,11 @@ fn qualify(dir: &Path) -> Result<Vec<String>, String> {
         if !available.iter().any(|c| missing.contains(&c.as_str())) {
             return Err(format!("controllers {:?} are not available here", missing));
         }
-        let enable: String = missing.iter().map(|c| format!("+{c} ")).collect();
-        write_str(dir, "cgroup.subtree_control", enable.trim())
+        let cgroup = Cgroup {
+            path: dir.to_path_buf(),
+        };
+        cgroup
+            .enable_controllers()
             .map_err(|e| format!("cannot enable {:?}: {e}", missing))?;
         enabled = read_words(&dir.join("cgroup.subtree_control")).unwrap_or_default();
         let still: Vec<&str> = WANTED
@@ -370,7 +430,7 @@ mod tests {
             return;
         };
         let name = format!("wyd-test-{}", std::process::id());
-        let cg = root.create(&name).expect("create run cgroup");
+        let cg = CgroupRoot::create_leaf(root.path(), &name).expect("create run cgroup");
         let applied = cg
             .apply(&CgroupLimits {
                 memory_max_bytes: Some(32 * 1024 * 1024),
@@ -427,5 +487,94 @@ mod tests {
         }
         assert!(!cg.populated().unwrap(), "cgroup.kill must empty the group");
         cg.remove().expect("remove empty cgroup");
+    }
+    /// Spawn `script` inside `cg` (attached between fork and exec).
+    fn spawn_attached(cg: &Cgroup, script: &str) -> std::process::Child {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let procs = cg.procs_cstr().unwrap();
+        // SAFETY: attach_self only calls async-signal-safe functions.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(move || attach_self(&procs));
+        }
+        cmd.spawn().unwrap()
+    }
+
+    /// The aggregate parent cap must hold even when a child has no limit of
+    /// its own: the budget is a kernel guarantee, not only an admission rule.
+    #[test]
+    fn a_parent_limit_caps_a_child_without_its_own() {
+        let Ok(root) = discover() else {
+            eprintln!("no delegated cgroup root; skipping the parent-limit test");
+            return;
+        };
+        let parent = root
+            .prepare_parent(&format!("wyd-parent-{}", std::process::id()))
+            .expect("prepare parent");
+        parent
+            .apply(&CgroupLimits {
+                memory_max_bytes: Some(32 * 1024 * 1024),
+                memory_swap_max_bytes: Some(0),
+                ..CgroupLimits::default()
+            })
+            .expect("cap the parent");
+        assert_eq!(parent.memory_max(), Some(32 * 1024 * 1024));
+
+        let child = parent.create_child("run").expect("child cgroup");
+        assert_eq!(
+            child.memory_max(),
+            None,
+            "the child has no limit of its own"
+        );
+        // tmpfs pages are charged to the cgroup, so this allocation must hit
+        // the parent's cap rather than the child's absent one.
+        let mut proc = spawn_attached(
+            &child,
+            "dd if=/dev/zero of=/dev/shm/wyd-parent-test bs=1M count=64 2>/dev/null",
+        );
+        let status = proc.wait().unwrap();
+        assert!(
+            !status.success(),
+            "the parent cap must stop the child, got {status}"
+        );
+        assert!(
+            parent.events().unwrap().oom_kill > 0,
+            "the kernel must report the OOM in the parent cgroup"
+        );
+        child.remove().ok();
+        parent.remove().ok();
+    }
+
+    /// A cpu.max quota must actually throttle: a busy loop at 0.2 core for
+    /// two seconds cannot consume two seconds of CPU.
+    #[test]
+    fn a_cpu_quota_throttles_the_cgroup() {
+        let Ok(root) = discover() else {
+            eprintln!("no delegated cgroup root; skipping the cpu-quota test");
+            return;
+        };
+        let cg = CgroupRoot::create_leaf(root.path(), &format!("wyd-cpu-{}", std::process::id()))
+            .expect("create cgroup");
+        cg.apply(&CgroupLimits {
+            cpu_max: Some((20_000, 100_000)),
+            ..CgroupLimits::default()
+        })
+        .expect("apply cpu.max");
+
+        let mut proc = spawn_attached(&cg, "while :; do :; done");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let used = cg.cpu_usage_usec();
+        cg.kill().ok();
+        proc.wait().unwrap();
+        // 0.2 core for ~2 s is 0.4 CPU-seconds; allow a generous margin for
+        // scheduling and for the loop not starting instantly.
+        assert!(
+            used < 1_200_000,
+            "0.2-core quota used {used} us of CPU in ~2 s"
+        );
+        cg.remove().ok();
     }
 }

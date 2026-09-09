@@ -48,6 +48,9 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 pub const MAX_WAIT_MS: u64 = 60_000;
 /// How often queued requests are checked for an expired queue deadline.
 const QUEUE_TICK: Duration = Duration::from_millis(250);
+/// Name of the aggregate cgroup under the delegated subtree.
+#[cfg(target_os = "linux")]
+const PARENT_CGROUP: &str = "wyd.slice";
 
 /// What a cgroup actually accepted, in a platform-neutral shape.
 #[derive(Debug, Clone, Default)]
@@ -113,6 +116,112 @@ impl RunCgroup {
         }
         Ok(())
     }
+
+    /// Create the child cgroup for one run. Without an aggregate parent the
+    /// run goes straight under the delegated root.
+    #[cfg(target_os = "linux")]
+    fn child(&self, name: &str) -> io::Result<crate::platform::cgroup::Cgroup> {
+        use crate::platform::cgroup::CgroupRoot;
+        match &self.inner {
+            Some(parent) => parent.create_child(name),
+            None => {
+                let root = crate::platform::cgroup_root()
+                    .ok_or_else(|| io::Error::other("no cgroup root"))?;
+                CgroupRoot::create_leaf(root.path(), name)
+            }
+        }
+    }
+
+    /// Update the kernel aggregate cap so it follows a runtime budget change.
+    fn set_memory_max(&self, bytes: u64) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            use crate::platform::cgroup::CgroupLimits;
+            return cg
+                .apply(&CgroupLimits {
+                    memory_max_bytes: Some(bytes),
+                    memory_swap_max_bytes: Some(0),
+                    ..CgroupLimits::default()
+                })
+                .map(|_| ());
+        }
+        let _ = bytes;
+        Ok(())
+    }
+
+    /// The kernel's aggregate memory cap, when there is one.
+    fn memory_max(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            return cg.memory_max();
+        }
+        None
+    }
+}
+
+/// The aggregate cgroup every run lives in: its `memory.max` is the run
+/// budget, so the kernel enforces the total even if admission is bypassed.
+/// A stale one from a crashed supervisor is removed and recreated so a
+/// changed budget takes effect.
+#[cfg(target_os = "linux")]
+fn prepare_parent_cgroup(limits: &scheduler::Limits) -> RunCgroup {
+    use crate::platform::cgroup::CgroupLimits;
+    let Some(root) = crate::platform::cgroup_root() else {
+        return RunCgroup::default();
+    };
+    eprintln!(
+        "wyd: cgroup v2 subtree {} (controllers: {})",
+        root.path().display(),
+        root.controllers().join(" ")
+    );
+    // Sweep what a crashed supervisor left behind: empty run cgroups first,
+    // then the aggregate cgroup itself so the current budget is applied.
+    if let Ok(entries) = std::fs::read_dir(root.path()) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy() == PARENT_CGROUP {
+                if let Ok(children) = std::fs::read_dir(entry.path()) {
+                    for child in children.flatten() {
+                        let path = child.path();
+                        if child.file_name().to_string_lossy().starts_with("run-")
+                            && std::fs::remove_dir(&path).is_ok()
+                        {
+                            eprintln!("wyd: removed stale cgroup {}", path.display());
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir(entry.path());
+            }
+        }
+    }
+    let parent = match root.prepare_parent(PARENT_CGROUP) {
+        Ok(parent) => parent,
+        Err(e) => {
+            eprintln!("wyd: cannot create the aggregate cgroup: {e}; runs get per-run limits only");
+            return RunCgroup::default();
+        }
+    };
+    let applied = parent.apply(&CgroupLimits {
+        memory_max_bytes: Some(limits.memory_budget_bytes),
+        // Swap would let a run exceed the budget without the kernel saying so.
+        memory_swap_max_bytes: Some(0),
+        ..CgroupLimits::default()
+    });
+    match applied {
+        Ok(_) => eprintln!(
+            "wyd: aggregate cgroup {} memory.max = {} MiB",
+            parent.path().display(),
+            limits.memory_budget_bytes / (1024 * 1024)
+        ),
+        Err(e) => eprintln!("wyd: aggregate memory cap not applied: {e}"),
+    }
+    RunCgroup {
+        inner: Some(parent),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_parent_cgroup(_limits: &scheduler::Limits) -> RunCgroup {
+    RunCgroup::default()
 }
 
 /// Project key used for per-project admission: the project root when known,
@@ -267,6 +376,9 @@ pub struct Supervisor {
     db: Mutex<RuntimeStore>,
     registry: Mutex<HashMap<RunId, Arc<RunSlot>>>,
     scheduler: Mutex<Scheduler>,
+    /// Aggregate cgroup every run is nested in, so the budget is also a
+    /// kernel limit and not only an admission policy. A no-op off Linux.
+    parent_cgroup: RunCgroup,
     paths: RunPaths,
     budget: Arc<GlobalBudget>,
     boot_id: BootId,
@@ -401,37 +513,18 @@ impl Supervisor {
         let boot_id = db.boot_id_for_epoch(epoch, now_secs())?;
         let used = scan_log_bytes(paths.root());
         let limits = crate::config::Config::global().runs.limits();
+        let parent_cgroup = prepare_parent_cgroup(&limits);
         let supervisor = Arc::new(Self {
             db: Mutex::new(db),
             registry: Mutex::new(HashMap::new()),
             scheduler: Mutex::new(Scheduler::new(limits)),
+            parent_cgroup,
             paths,
             budget: Arc::new(GlobalBudget::new(DEFAULT_TOTAL_LOG_LIMIT, used)),
             boot_id,
             identity: format!("{}:{}", std::process::id(), boot_id),
             capabilities: backend_capabilities(),
         });
-        #[cfg(target_os = "linux")]
-        if let Some(root) = crate::platform::cgroup_root() {
-            // Say where hard limits come from, so "why is memory unavailable?"
-            // has an answer without a debug build.
-            eprintln!(
-                "wyd: cgroup v2 subtree {} (controllers: {})",
-                root.path().display(),
-                root.controllers().join(" ")
-            );
-            // Empty run cgroups can survive a crashed supervisor; remove what
-            // is provably empty and leave the rest alone.
-            if let Ok(entries) = std::fs::read_dir(root.path()) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let is_run = entry.file_name().to_string_lossy().starts_with("run-");
-                    if is_run && std::fs::remove_dir(&path).is_ok() {
-                        eprintln!("wyd: removed stale cgroup {}", path.display());
-                    }
-                }
-            }
-        }
         supervisor.recover()?;
         supervisor.prune();
         supervisor.spawn_queue_tick();
@@ -640,10 +733,10 @@ impl Supervisor {
         cmd: &mut Command,
     ) -> io::Result<(RunCgroup, Option<CgroupApplied>)> {
         use crate::platform::cgroup::{CgroupLimits, attach_self};
-        let Some(root) = crate::platform::cgroup_root() else {
+        if crate::platform::cgroup_root().is_none() {
             return Ok((RunCgroup::default(), None));
-        };
-        let cg = root.create(&format!("run-{}", slot.id.0))?;
+        }
+        let inner = self.parent_cgroup.child(&format!("run-{}", slot.id.0))?;
         // Without a hard request the cgroup still earns its keep: membership
         // catches descendants that leave the process group. No limits are
         // written in that case.
@@ -662,8 +755,8 @@ impl Supervisor {
         } else {
             CgroupLimits::default()
         };
-        let applied = cg.apply(&limits)?;
-        let procs = cg.procs_cstr()?;
+        let applied = inner.apply(&limits)?;
+        let procs = inner.procs_cstr()?;
         // SAFETY: `attach_self` only calls async-signal-safe functions and the
         // path was validated before the fork.
         unsafe {
@@ -671,7 +764,7 @@ impl Supervisor {
             cmd.pre_exec(move || attach_self(&procs));
         }
         Ok((
-            RunCgroup { inner: Some(cg) },
+            RunCgroup { inner: Some(inner) },
             Some(CgroupApplied {
                 memory_max_bytes: applied.memory_max_bytes,
                 cpu_max: applied.cpu_max,
@@ -846,21 +939,38 @@ impl Supervisor {
             slots_free: sched.slots_free(),
             over_parallel_limit: sched.running_count() > sched.limits().max_parallel,
             reserved_memory_bytes: sched.reserved(),
+            aggregate_memory_max_bytes: self.parent_cgroup.memory_max(),
             projects: sched.projects(),
             queue: sched.queue_entries(now),
-            reservation_note: format!(
-                "reserved_memory_bytes is a budget held by {} running run(s) plus {} held for \
-                 incomplete cleanup; it is not measured RAM",
-                sched.running_count(),
-                sched.held_reservations()
-            ),
+            reservation_note: match self.parent_cgroup.memory_max() {
+                Some(cap) => format!(
+                    "reserved_memory_bytes is a budget held by {} running run(s) plus {} held for \
+                     incomplete cleanup; it is not measured RAM. The kernel also caps all runs \
+                     together at {cap} bytes (parent cgroup memory.max)",
+                    sched.running_count(),
+                    sched.held_reservations()
+                ),
+                None => format!(
+                    "reserved_memory_bytes is a budget held by {} running run(s) plus {} held for \
+                     incomplete cleanup; it is not measured RAM, and no kernel aggregate cap is \
+                     in place on this backend",
+                    sched.running_count(),
+                    sched.held_reservations()
+                ),
+            },
             capabilities: backend_capabilities(),
         }
     }
 
     /// Replace admission limits at runtime. Active runs keep running.
     pub fn set_limits(&self, limits: scheduler::Limits) -> Capacity {
+        let budget = limits.memory_budget_bytes;
         self.scheduler.lock().set_limits(limits);
+        // The kernel aggregate cap follows the budget, so a lowered budget is
+        // enforced by the kernel too, not only by admission.
+        if let Err(e) = self.parent_cgroup.set_memory_max(budget) {
+            eprintln!("wyd: could not update the aggregate memory cap: {e}");
+        }
         self.capacity()
     }
 

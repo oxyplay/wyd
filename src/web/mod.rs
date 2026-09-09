@@ -183,6 +183,7 @@ impl RuntimeProvider for LocalProvider {
             projects: Vec::new(),
             queue: Vec::new(),
             over_parallel_limit: false,
+            aggregate_memory_max_bytes: None,
             reservation_note: "no supervisor running: configured limits only, no reservations held"
                 .into(),
             capabilities: crate::model::run::backend_capabilities(),

@@ -267,7 +267,15 @@ mod tests {
         signal_group(pgid, libc::SIGKILL).unwrap();
         let mut child = child;
         child.wait().unwrap();
-        assert!(!group_alive(pgid), "group empty after group kill");
+        // A killed descendant can stay a zombie until its new parent reaps
+        // it, and a zombie still answers `kill(-pgid, 0)`. Poll briefly.
+        for _ in 0..100 {
+            if !group_alive(pgid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("group still alive after a group kill");
     }
 
     /// A worker that outlives its leader stays in the group, so a group kill

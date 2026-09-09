@@ -145,7 +145,10 @@ units. Put the supervisor in a unit with `Delegate=yes`, or point
 `WYD_CGROUP_ROOT` at a directory you own inside a delegated subtree, and
 restart the supervisor (capabilities are fixed at its start). Because cgroup
 membership is inherited by every descendant, a `setsid` child that escapes the
-process group is still inside the run's cgroup and is killed with it.
+process group is still inside the run's cgroup and is killed with it. Runs also
+live under one aggregate cgroup whose `memory.max` is the run budget, so the
+budget is a kernel cap on the total and not only an admission rule;
+`wyd capacity --set memory_budget_mb=…` updates it.
 
 Inspect or stop it afterwards:
 

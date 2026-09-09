@@ -94,6 +94,28 @@ run=$("$B" runs --json | python3 -c 'import json,sys;print(json.dumps(json.load(
 check "pids limit applied" "$(field "r['effective']['processes']" "$run")" "8"
 check "pids backend" "$(field "r['effective']['backend']" "$run")" "cgroup_v2"
 
+echo "-- the aggregate kernel cap must exist and follow the budget --"
+cap=$("$B" capacity --json)
+check "aggregate cap reported" "$(field "r.get('aggregate_memory_max_bytes')" "$cap")" "8589934592"
+# Lower the budget *and* the default reservation, or admission would reject
+# the run as impossible before the kernel cap could be tested.
+cap=$("$B" capacity --set memory_budget_mb=48 --set default_run_memory_mb=16 --json)
+check "cap follows a runtime budget change" "$(field "r.get('aggregate_memory_max_bytes')" "$cap")" "50331648"
+
+echo "-- the parent cap must hold without a per-run limit --"
+# No --memory: the run has no limit of its own, so only the parent cap can
+# stop it.
+"$B" run --timeout 20s -- \
+    dd if=/dev/zero of=/dev/shm/blob-parent bs=1M count=64 >/dev/null 2>&1
+code=$?
+check "exit code" "$code" "137"
+run=$("$B" runs --json | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)[0]))')
+check "outcome" "$(field "r['outcome']" "$run")" "resource_limit"
+grep -q "OOM-killed" <<<"$(field "r.get('limit_event') or ''" "$run")" ||
+    { echo "  FAIL parent OOM evidence missing"; fail=1; }
+# Restore the configured budget for the remaining checks.
+"$B" capacity --set memory_budget_mb=8192 --set default_run_memory_mb=512 >/dev/null
+
 echo "-- a setsid escapee must still die with the run --"
 "$B" run --timeout 10s -- sh -c 'setsid sleep 30 >/dev/null 2>&1 & echo $!; exit 0' >/dev/null 2>&1 || true
 sleep 0.5

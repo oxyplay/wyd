@@ -507,6 +507,10 @@ pub struct Capacity {
     /// `true` when runs already admitted exceed a newly lowered limit. The
     /// current runs are not killed for it; the UI says so instead.
     pub over_parallel_limit: bool,
+    /// Kernel-enforced aggregate memory cap shared by every run, when the
+    /// backend has one. Distinct from the admission budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate_memory_max_bytes: Option<u64>,
     /// How `reserved_memory_bytes` is defined, so nobody reads it as usage.
     pub reservation_note: String,
     pub capabilities: BackendCapabilities,

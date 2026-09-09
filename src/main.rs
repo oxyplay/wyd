@@ -598,11 +598,19 @@ fn run_capacity(json: bool, set: Vec<String>) -> io::Result<()> {
                 )
             })?;
             match key {
+                // The CLI takes MiB; the API takes bytes. The key must change
+                // with the unit, or the server silently ignores it.
                 "memory_budget_mb" => {
-                    limits.insert(key.into(), json!(value.saturating_mul(1024 * 1024)));
+                    limits.insert(
+                        "memory_budget_bytes".into(),
+                        json!(value.saturating_mul(1024 * 1024)),
+                    );
                 }
                 "default_run_memory_mb" => {
-                    limits.insert(key.into(), json!(value.saturating_mul(1024 * 1024)));
+                    limits.insert(
+                        "default_run_memory_bytes".into(),
+                        json!(value.saturating_mul(1024 * 1024)),
+                    );
                 }
                 "max_parallel"
                 | "max_parallel_per_project"
@@ -635,6 +643,7 @@ fn run_capacity(json: bool, set: Vec<String>) -> io::Result<()> {
             projects: Vec::new(),
             queue: Vec::new(),
             over_parallel_limit: false,
+            aggregate_memory_max_bytes: None,
             reservation_note: "no supervisor running; these are the configured limits".into(),
             capabilities: backend_capabilities(),
         }

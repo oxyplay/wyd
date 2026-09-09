@@ -874,8 +874,14 @@ pub(super) fn capacity_line(width: usize, capacity: Option<&Capacity>) -> Line<'
             } else {
                 ""
             };
+            // The kernel cap is separate from the admission budget and is
+            // shown as such when the backend has one.
+            let cap = match c.aggregate_memory_max_bytes {
+                Some(bytes) => format!(" · kernel cap {}", fmt_bytes(bytes)),
+                None => String::new(),
+            };
             format!(
-                " slots  {}/{} used ({} per project) · queue {} waiting / ≤{} · reserved {} of {} (budget, not RAM){}",
+                " slots  {}/{} used ({} per project) · queue {} waiting / ≤{} · reserved {} of {} (budget, not RAM){cap}{over}",
                 c.running,
                 c.limits.max_parallel,
                 c.limits.max_parallel_per_project,
@@ -883,7 +889,6 @@ pub(super) fn capacity_line(width: usize, capacity: Option<&Capacity>) -> Line<'
                 c.limits.max_queued,
                 fmt_bytes(c.reserved_memory_bytes),
                 fmt_bytes(c.limits.memory_budget_bytes),
-                over
             )
         }
         None => format!(

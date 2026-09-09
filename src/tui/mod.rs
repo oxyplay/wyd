@@ -2116,6 +2116,7 @@ mod tests {
             queued: 1,
             slots_free: 1,
             over_parallel_limit: true,
+            aggregate_memory_max_bytes: Some(2 * 1024 * 1024 * 1024),
             reserved_memory_bytes: 512 * 1024 * 1024,
             projects: Vec::new(),
             queue: Vec::new(),
@@ -2127,6 +2128,7 @@ mod tests {
         assert!(rendered.contains("1 waiting"), "{rendered}");
         assert!(rendered.contains("budget, not RAM"), "{rendered}");
         assert!(rendered.contains("above the new limit"), "{rendered}");
+        assert!(rendered.contains("kernel cap"), "{rendered}");
         assert!(!rendered.contains("unavailable"), "{rendered}");
 
         // Without a supervisor the configured limits are shown and the live

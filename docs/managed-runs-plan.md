@@ -60,7 +60,8 @@ wyd capacity [--json] [--set key=value ...]
 
 Проверено в контейнере (`scripts/linux-cgroup-e2e.sh`):
 
-- контроллеры включаются **по уровням**: `+memory +pids +cpu` в
+- контроллеры включаются **по уровням** (делегированный каталог →
+  `wyd.slice` → `run-N`): `+memory +pids +cpu` в
   `cgroup.subtree_control` каждого каталога, начиная с делегированного; в
   cgroup с процессами включить их нельзя («no internal processes»), и мы
   никогда не переносим чужие процессы, чтобы это обойти;
@@ -408,6 +409,12 @@ systemd user-менеджером.
   `cgroup.events`. Ребёнок входит в cgroup между fork и exec, поэтому
   `setsid`-потомок остаётся внутри и убивается вместе с запуском.
   Без делегирования capability = `Unavailable`, hard-запрос отклоняется.
+- **Агрегатный родительский cgroup** (`wyd.slice`): `memory.max` = бюджет
+  запусков, `memory.swap.max=0`, поэтому бюджет — ещё и kernel-лимит на
+  сумму, а не только политика допуска; `capacity --set memory_budget_mb`
+  обновляет и его. `get_capacity.aggregate_memory_max_bytes` показывает
+  значение. Проверено: потомок без собственного лимита всё равно упирается
+  в родительский кап (OOM), CPU-квота реально тормозит (`cpu.stat`).
 - **`cpu_millicores`/`processes`** — на Linux жёсткие (`cpu.max`,
   `pids.max`); на macOS только запрос и отображение.
 
