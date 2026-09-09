@@ -350,6 +350,12 @@ fn set_limits(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Valu
     if let Some(v) = raw.get("starvation_after_secs").and_then(Value::as_u64) {
         limits.starvation_after_secs = v;
     }
+    if let Some(v) = raw.get("cpu_budget_millicores") {
+        limits.cpu_budget_millicores = v.as_u64().map(|v| v as u32);
+    }
+    if let Some(v) = raw.get("pids_budget") {
+        limits.pids_budget = v.as_u64().map(|v| v as u32);
+    }
     let applied = supervisor.set_limits(crate::runner::scheduler::Limits {
         max_parallel: limits.max_parallel,
         max_parallel_per_project: limits.max_parallel_per_project,
@@ -358,6 +364,8 @@ fn set_limits(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Valu
         memory_budget_bytes: limits.memory_budget_bytes,
         default_run_memory_bytes: limits.default_run_memory_bytes,
         starvation_after: Duration::from_secs(limits.starvation_after_secs),
+        cpu_budget_millicores: limits.cpu_budget_millicores,
+        pids_budget: limits.pids_budget,
     });
     Ok(json!({ "capacity": applied }))
 }

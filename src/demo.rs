@@ -1139,6 +1139,8 @@ pub fn capacity() -> Capacity {
         queue,
         over_parallel_limit: false,
         aggregate_memory_max_bytes: None,
+        aggregate_cpu_millicores: None,
+        aggregate_pids_max: None,
         reservation_note: RESERVATION_NOTE.to_string(),
         capabilities: backend_capabilities(),
     }

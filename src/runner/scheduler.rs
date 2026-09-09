@@ -27,6 +27,11 @@ pub struct Limits {
     pub default_run_memory_bytes: u64,
     /// How long a request may be bypassed before it wins the next slot.
     pub starvation_after: Duration,
+    /// Aggregate CPU cap for all runs, in millicores. Admission does not use
+    /// it; the cgroup backend turns it into a kernel limit.
+    pub cpu_budget_millicores: Option<u32>,
+    /// Aggregate process-count cap for all runs.
+    pub pids_budget: Option<u32>,
 }
 
 impl Default for Limits {
@@ -40,6 +45,8 @@ impl Default for Limits {
             memory_budget_bytes: 8 * 1024 * 1024 * 1024,
             default_run_memory_bytes: 512 * 1024 * 1024,
             starvation_after: Duration::from_secs(60),
+            cpu_budget_millicores: None,
+            pids_budget: None,
         }
     }
 }
@@ -54,6 +61,8 @@ impl Limits {
             memory_budget_bytes: self.memory_budget_bytes,
             default_run_memory_bytes: self.default_run_memory_bytes,
             starvation_after_secs: self.starvation_after.as_secs(),
+            cpu_budget_millicores: self.cpu_budget_millicores,
+            pids_budget: self.pids_budget,
         }
     }
 }
@@ -370,6 +379,8 @@ mod tests {
             memory_budget_bytes: 1000,
             default_run_memory_bytes: 100,
             starvation_after: Duration::from_secs(30),
+            cpu_budget_millicores: None,
+            pids_budget: None,
         }
     }
 

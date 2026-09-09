@@ -102,6 +102,13 @@ check "aggregate cap reported" "$(field "r.get('aggregate_memory_max_bytes')" "$
 cap=$("$B" capacity --set memory_budget_mb=48 --set default_run_memory_mb=16 --json)
 check "cap follows a runtime budget change" "$(field "r.get('aggregate_memory_max_bytes')" "$cap")" "50331648"
 
+echo "-- aggregate cpu/pids caps must reach the kernel --"
+cap=$("$B" capacity --set cpu_budget_millicores=1500 --set pids_budget=512 --json)
+check "cpu cap reported" "$(field "r.get('aggregate_cpu_millicores')" "$cap")" "1500"
+check "pids cap reported" "$(field "r.get('aggregate_pids_max')" "$cap")" "512"
+check "kernel cpu.max" "$(cat /sys/fs/cgroup/wyd/wyd.slice/cpu.max)" "150000 100000"
+check "kernel pids.max" "$(cat /sys/fs/cgroup/wyd/wyd.slice/pids.max)" "512"
+
 echo "-- the parent cap must hold without a per-run limit --"
 # No --memory: the run has no limit of its own, so only the parent cap can
 # stop it.

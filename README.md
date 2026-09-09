@@ -148,7 +148,10 @@ membership is inherited by every descendant, a `setsid` child that escapes the
 process group is still inside the run's cgroup and is killed with it. Runs also
 live under one aggregate cgroup whose `memory.max` is the run budget, so the
 budget is a kernel cap on the total and not only an admission rule;
-`wyd capacity --set memory_budget_mb=…` updates it.
+`wyd capacity --set memory_budget_mb=…` updates it. Set
+`cpu_budget_millicores` and/or `pids_budget` in `[runs]` to cap the total CPU
+and process count of all runs the same way (`wyd capacity` reports them, and a
+change at runtime updates the kernel too).
 
 Inspect or stop it afterwards:
 

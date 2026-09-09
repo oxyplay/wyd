@@ -2111,12 +2111,16 @@ mod tests {
                 memory_budget_bytes: 2 * 1024 * 1024 * 1024,
                 default_run_memory_bytes: 256 * 1024 * 1024,
                 starvation_after_secs: 60,
+                cpu_budget_millicores: None,
+                pids_budget: None,
             },
             running: 2,
             queued: 1,
             slots_free: 1,
             over_parallel_limit: true,
             aggregate_memory_max_bytes: Some(2 * 1024 * 1024 * 1024),
+            aggregate_cpu_millicores: Some(2_000),
+            aggregate_pids_max: Some(256),
             reserved_memory_bytes: 512 * 1024 * 1024,
             projects: Vec::new(),
             queue: Vec::new(),
@@ -2129,6 +2133,8 @@ mod tests {
         assert!(rendered.contains("budget, not RAM"), "{rendered}");
         assert!(rendered.contains("above the new limit"), "{rendered}");
         assert!(rendered.contains("kernel cap"), "{rendered}");
+        assert!(rendered.contains("cpu 2000m"), "{rendered}");
+        assert!(rendered.contains("pids 256"), "{rendered}");
         assert!(!rendered.contains("unavailable"), "{rendered}");
 
         // Without a supervisor the configured limits are shown and the live

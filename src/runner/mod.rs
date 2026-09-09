@@ -132,21 +132,51 @@ impl RunCgroup {
         }
     }
 
-    /// Update the kernel aggregate cap so it follows a runtime budget change.
-    fn set_memory_max(&self, bytes: u64) -> io::Result<()> {
+    /// Update the kernel aggregate caps so they follow a runtime change.
+    /// A cap that was cleared is written as the controller's "max".
+    fn set_aggregate_caps(
+        &self,
+        memory_bytes: u64,
+        cpu_millicores: Option<u32>,
+        pids: Option<u32>,
+    ) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(cg) = &self.inner {
             use crate::platform::cgroup::CgroupLimits;
             return cg
                 .apply(&CgroupLimits {
-                    memory_max_bytes: Some(bytes),
+                    memory_max_bytes: Some(memory_bytes),
                     memory_swap_max_bytes: Some(0),
-                    ..CgroupLimits::default()
+                    cpu_max: cpu_millicores.map(|m| {
+                        (
+                            crate::platform::cgroup::quota_for_millicores(m),
+                            crate::platform::cgroup::CPU_PERIOD_US,
+                        )
+                    }),
+                    pids_max: pids.map(u64::from),
                 })
                 .map(|_| ());
         }
-        let _ = bytes;
+        let _ = (memory_bytes, cpu_millicores, pids);
         Ok(())
+    }
+
+    /// The aggregate cpu.max quota in millicores, when set.
+    fn cpu_millicores(&self) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            return cg.cpu_max_millicores();
+        }
+        None
+    }
+
+    /// The aggregate pids.max, when set.
+    fn pids_max(&self) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            return cg.pids_max();
+        }
+        None
     }
 
     /// The kernel's aggregate memory cap, when there is one.
@@ -204,7 +234,13 @@ fn prepare_parent_cgroup(limits: &scheduler::Limits) -> RunCgroup {
         memory_max_bytes: Some(limits.memory_budget_bytes),
         // Swap would let a run exceed the budget without the kernel saying so.
         memory_swap_max_bytes: Some(0),
-        ..CgroupLimits::default()
+        cpu_max: limits.cpu_budget_millicores.map(|m| {
+            (
+                crate::platform::cgroup::quota_for_millicores(m),
+                crate::platform::cgroup::CPU_PERIOD_US,
+            )
+        }),
+        pids_max: limits.pids_budget.map(u64::from),
     });
     match applied {
         Ok(_) => eprintln!(
@@ -745,11 +781,12 @@ impl Supervisor {
                 memory_max_bytes: slot.spec.resources.memory_bytes,
                 // A memory limit that swap can undo is not a hard limit.
                 memory_swap_max_bytes: slot.spec.resources.memory_bytes.map(|_| 0),
-                cpu_max: slot
-                    .spec
-                    .resources
-                    .cpu_millicores
-                    .map(|m| (u64::from(m) * 1000, 100_000)),
+                cpu_max: slot.spec.resources.cpu_millicores.map(|m| {
+                    (
+                        crate::platform::cgroup::quota_for_millicores(m),
+                        crate::platform::cgroup::CPU_PERIOD_US,
+                    )
+                }),
                 pids_max: slot.spec.resources.processes.map(u64::from),
             }
         } else {
@@ -940,15 +977,25 @@ impl Supervisor {
             over_parallel_limit: sched.running_count() > sched.limits().max_parallel,
             reserved_memory_bytes: sched.reserved(),
             aggregate_memory_max_bytes: self.parent_cgroup.memory_max(),
+            aggregate_cpu_millicores: self.parent_cgroup.cpu_millicores(),
+            aggregate_pids_max: self.parent_cgroup.pids_max(),
             projects: sched.projects(),
             queue: sched.queue_entries(now),
             reservation_note: match self.parent_cgroup.memory_max() {
                 Some(cap) => format!(
                     "reserved_memory_bytes is a budget held by {} running run(s) plus {} held for \
                      incomplete cleanup; it is not measured RAM. The kernel also caps all runs \
-                     together at {cap} bytes (parent cgroup memory.max)",
+                     together at {cap} bytes (parent cgroup memory.max){}{}",
                     sched.running_count(),
-                    sched.held_reservations()
+                    sched.held_reservations(),
+                    self.parent_cgroup
+                        .cpu_millicores()
+                        .map(|m| format!(", {m} millicores of CPU"))
+                        .unwrap_or_default(),
+                    self.parent_cgroup
+                        .pids_max()
+                        .map(|p| format!(" and {p} processes"))
+                        .unwrap_or_default(),
                 ),
                 None => format!(
                     "reserved_memory_bytes is a budget held by {} running run(s) plus {} held for \
@@ -965,11 +1012,13 @@ impl Supervisor {
     /// Replace admission limits at runtime. Active runs keep running.
     pub fn set_limits(&self, limits: scheduler::Limits) -> Capacity {
         let budget = limits.memory_budget_bytes;
+        let cpu = limits.cpu_budget_millicores;
+        let pids = limits.pids_budget;
         self.scheduler.lock().set_limits(limits);
         // The kernel aggregate cap follows the budget, so a lowered budget is
         // enforced by the kernel too, not only by admission.
-        if let Err(e) = self.parent_cgroup.set_memory_max(budget) {
-            eprintln!("wyd: could not update the aggregate memory cap: {e}");
+        if let Err(e) = self.parent_cgroup.set_aggregate_caps(budget, cpu, pids) {
+            eprintln!("wyd: could not update the aggregate caps: {e}");
         }
         self.capacity()
     }
@@ -2104,6 +2153,8 @@ mod tests {
             memory_budget_bytes: 100 * 1024 * 1024,
             default_run_memory_bytes: 10 * 1024 * 1024,
             starvation_after: Duration::from_secs(5),
+            cpu_budget_millicores: None,
+            pids_budget: None,
         }
     }
 

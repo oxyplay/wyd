@@ -79,10 +79,10 @@ wyd capacity [--json] [--set key=value ...]
 ## Что осталось
 
 - **Linux проверен в контейнере** (`rust:1-slim-bookworm`, 2026-09-09):
-  246 + 3 теста зелёные, `clippy -D warnings` и `fmt --check` чисто, плюс
-  сквозной прогон cgroup-бэкенда (`scripts/linux-cgroup-e2e.sh`). Это не
-  desktop-Linux: делегирование делалось вручную, как это делает systemd,
-  поведение под реальным systemd user-менеджером не проверялось.
+  тесты зелёные, `clippy -D warnings` и `fmt --check` чисто, плюс сквозные
+  прогоны `scripts/linux-cgroup-e2e.sh` (cgroup-бэкенд) и
+  `scripts/systemd-delegation-e2e.sh` (делегирование от настоящего systemd,
+  системный и user-менеджер). Это контейнер, а не desktop-Linux.
 - **Sleep/resume** проверяется только логикой подстраховки, без реального
   теста сна.
 - **macOS hard limits недоступны by design.** Память — `Monitored`
@@ -410,11 +410,17 @@ systemd user-менеджером.
   `setsid`-потомок остаётся внутри и убивается вместе с запуском.
   Без делегирования capability = `Unavailable`, hard-запрос отклоняется.
 - **Агрегатный родительский cgroup** (`wyd.slice`): `memory.max` = бюджет
-  запусков, `memory.swap.max=0`, поэтому бюджет — ещё и kernel-лимит на
-  сумму, а не только политика допуска; `capacity --set memory_budget_mb`
-  обновляет и его. `get_capacity.aggregate_memory_max_bytes` показывает
-  значение. Проверено: потомок без собственного лимита всё равно упирается
-  в родительский кап (OOM), CPU-квота реально тормозит (`cpu.stat`).
+  запусков, `memory.swap.max=0`, плюс `cpu.max`/`pids.max` из
+  `cpu_budget_millicores`/`pids_budget`, поэтому это kernel-лимиты на сумму,
+  а не только политика допуска; `capacity --set …` обновляет их на ходу.
+  `get_capacity.aggregate_*` показывает значения. Проверено: потомок без
+  собственного лимита упирается в родительский кап (OOM), CPU-квота реально
+  тормозит (`cpu.stat`), форк сверх `pids.max` отклоняется (`pids.events`).
+- **Делегирование от настоящего systemd** проверено скриптом
+  `scripts/systemd-delegation-e2e.sh` в контейнере с systemd PID 1: и
+  системный менеджер (`systemd-run --property=Delegate=yes`), и user-менеджер
+  с linger — capability `available`, агрегатный кап виден, hard-лимит
+  приводит к OOM (exit 137). Никакой ручной подготовки cgroup.
 - **`cpu_millicores`/`processes`** — на Linux жёсткие (`cpu.max`,
   `pids.max`); на macOS только запрос и отображение.
 

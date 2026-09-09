@@ -23,6 +23,15 @@ const CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
 /// Controllers a run wants, in the order they are enabled.
 const WANTED: [&str; 3] = ["memory", "pids", "cpu"];
 
+/// `cpu.max` period. One core is one full period of quota.
+pub const CPU_PERIOD_US: u64 = 100_000;
+
+/// `cpu.max` quota for a request in millicores: 1000 millicores is one core,
+/// i.e. one full period.
+pub fn quota_for_millicores(millicores: u32) -> u64 {
+    u64::from(millicores) * (CPU_PERIOD_US / 1000)
+}
+
 /// A writable delegated subtree whose children may carry limits.
 #[derive(Debug, Clone)]
 pub struct CgroupRoot {
@@ -123,6 +132,23 @@ impl Cgroup {
         read_words(&self.path.join("cgroup.subtree_control"))
     }
 
+    /// Current `cpu.max` quota in millicores, `None` when unlimited.
+    pub fn cpu_max_millicores(&self) -> Option<u32> {
+        let raw = std::fs::read_to_string(self.path.join("cpu.max")).ok()?;
+        let quota: u64 = raw.split_whitespace().next()?.parse().ok()?;
+        let period: u64 = raw.split_whitespace().nth(1)?.parse().ok()?;
+        Some((quota.saturating_mul(1000) / period.max(1)) as u32)
+    }
+
+    /// Current `pids.max`, `None` when unlimited.
+    pub fn pids_max(&self) -> Option<u32> {
+        std::fs::read_to_string(self.path.join("pids.max"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     /// Current `memory.max`, `None` when the controller is not present or the
     /// value is `max` (unlimited).
     pub fn memory_max(&self) -> Option<u64> {
@@ -131,6 +157,15 @@ impl Cgroup {
             .trim()
             .parse()
             .ok()
+    }
+
+    /// Times the pids controller refused a fork in this cgroup.
+    #[cfg(test)]
+    pub fn pids_max_hits(&self) -> u64 {
+        read_kv(&self.path.join("pids.events"))
+            .ok()
+            .and_then(|kv| kv.get("max").copied())
+            .unwrap_or(0)
     }
 
     /// CPU time charged to this cgroup and its descendants, in microseconds.
@@ -576,5 +611,57 @@ mod tests {
             "0.2-core quota used {used} us of CPU in ~2 s"
         );
         cg.remove().ok();
+    }
+    /// The aggregate caps must apply to children that have no limit of their
+    /// own: CPU is throttled and forks past the pids cap are refused.
+    #[test]
+    fn parent_cpu_and_pids_limits_apply_to_children() {
+        let Ok(root) = discover() else {
+            eprintln!("no delegated cgroup root; skipping the parent cpu/pids test");
+            return;
+        };
+        let parent = root
+            .prepare_parent(&format!("wyd-parent-cpupids-{}", std::process::id()))
+            .expect("prepare parent");
+        parent
+            .apply(&CgroupLimits {
+                cpu_max: Some((20_000, 100_000)),
+                pids_max: Some(8),
+                ..CgroupLimits::default()
+            })
+            .expect("cap the parent");
+        assert_eq!(parent.cpu_max_millicores(), Some(200));
+        assert_eq!(parent.pids_max(), Some(8));
+
+        let child = parent.create_child("run").expect("child cgroup");
+
+        let mut busy = spawn_attached(&child, "while :; do :; done");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let used = child.cpu_usage_usec();
+        parent.kill().ok();
+        busy.wait().unwrap();
+        assert!(
+            used < 1_200_000,
+            "a child with no cpu.max of its own used {used} us in ~2 s under a 0.2-core parent"
+        );
+
+        let mut forker = spawn_attached(
+            &child,
+            "i=0; while [ $i -lt 200 ]; do sleep 30 & i=$((i+1)); done; wait",
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let hits = parent.pids_max_hits();
+        parent.kill().ok();
+        forker.wait().unwrap();
+        assert!(hits > 0, "the parent pids cap was never reached");
+        child.remove().ok();
+        parent.remove().ok();
+    }
+
+    #[test]
+    fn millicores_map_to_a_full_period_per_core() {
+        assert_eq!(quota_for_millicores(1000), CPU_PERIOD_US, "one core");
+        assert_eq!(quota_for_millicores(1500), 150_000, "1.5 cores");
+        assert_eq!(quota_for_millicores(200), 20_000, "0.2 cores");
     }
 }

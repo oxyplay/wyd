@@ -616,7 +616,9 @@ fn run_capacity(json: bool, set: Vec<String>) -> io::Result<()> {
                 | "max_parallel_per_project"
                 | "max_queued"
                 | "queue_timeout_secs"
-                | "starvation_after_secs" => {
+                | "starvation_after_secs"
+                | "cpu_budget_millicores"
+                | "pids_budget" => {
                     limits.insert(key.into(), json!(value));
                 }
                 other => {
@@ -644,6 +646,8 @@ fn run_capacity(json: bool, set: Vec<String>) -> io::Result<()> {
             queue: Vec::new(),
             over_parallel_limit: false,
             aggregate_memory_max_bytes: None,
+            aggregate_cpu_millicores: None,
+            aggregate_pids_max: None,
             reservation_note: "no supervisor running; these are the configured limits".into(),
             capabilities: backend_capabilities(),
         }
@@ -675,6 +679,12 @@ fn run_capacity(json: bool, set: Vec<String>) -> io::Result<()> {
         memory_budget_bytes / (1024 * 1024),
         default_run_memory_bytes / (1024 * 1024),
     );
+    if let Some(millicores) = capacity.aggregate_cpu_millicores {
+        println!("kernel cpu  {} millicores across all runs", millicores);
+    }
+    if let Some(pids) = capacity.aggregate_pids_max {
+        println!("kernel pids {} across all runs", pids);
+    }
     if capacity.over_parallel_limit {
         println!(
             "warning    {} run(s) still active above the new limit; they are not killed",

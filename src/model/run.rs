@@ -490,6 +490,10 @@ pub struct LimitSummary {
     pub memory_budget_bytes: u64,
     pub default_run_memory_bytes: u64,
     pub starvation_after_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_budget_millicores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pids_budget: Option<u32>,
 }
 
 /// Read-only view of what the supervisor can admit right now.
@@ -507,10 +511,14 @@ pub struct Capacity {
     /// `true` when runs already admitted exceed a newly lowered limit. The
     /// current runs are not killed for it; the UI says so instead.
     pub over_parallel_limit: bool,
-    /// Kernel-enforced aggregate memory cap shared by every run, when the
-    /// backend has one. Distinct from the admission budget.
+    /// Kernel-enforced aggregate caps shared by every run, when the backend
+    /// has them. Distinct from the admission budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate_memory_max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate_cpu_millicores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate_pids_max: Option<u32>,
     /// How `reserved_memory_bytes` is defined, so nobody reads it as usage.
     pub reservation_note: String,
     pub capabilities: BackendCapabilities,

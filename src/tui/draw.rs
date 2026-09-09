@@ -880,8 +880,16 @@ pub(super) fn capacity_line(width: usize, capacity: Option<&Capacity>) -> Line<'
                 Some(bytes) => format!(" · kernel cap {}", fmt_bytes(bytes)),
                 None => String::new(),
             };
+            let cpu = match c.aggregate_cpu_millicores {
+                Some(m) => format!(" · cpu {m}m"),
+                None => String::new(),
+            };
+            let pids = match c.aggregate_pids_max {
+                Some(p) => format!(" · pids {p}"),
+                None => String::new(),
+            };
             format!(
-                " slots  {}/{} used ({} per project) · queue {} waiting / ≤{} · reserved {} of {} (budget, not RAM){cap}{over}",
+                " slots  {}/{} used ({} per project) · queue {} waiting / ≤{} · reserved {} of {} (budget, not RAM){cap}{cpu}{pids}{over}",
                 c.running,
                 c.limits.max_parallel,
                 c.limits.max_parallel_per_project,

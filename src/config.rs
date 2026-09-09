@@ -40,6 +40,12 @@ pub struct RunsConfig {
     pub memory_budget_mb: u64,
     pub default_run_memory_mb: u64,
     pub starvation_after_secs: u64,
+    /// Aggregate CPU cap shared by every run, in millicores. `None` leaves
+    /// the total CPU unbounded (per-run `cpu.max` still applies).
+    pub cpu_budget_millicores: Option<u32>,
+    /// Aggregate process-count cap shared by every run. `None` leaves the
+    /// total unbounded (per-run `pids.max` still applies).
+    pub pids_budget: Option<u32>,
 }
 
 impl Default for RunsConfig {
@@ -52,6 +58,10 @@ impl Default for RunsConfig {
             memory_budget_mb: 8192,
             default_run_memory_mb: 512,
             starvation_after_secs: 60,
+            // No aggregate CPU/pids cap by default: a machine-wide limit that
+            // nobody asked for would surprise existing users.
+            cpu_budget_millicores: None,
+            pids_budget: None,
         }
     }
 }
@@ -67,6 +77,8 @@ impl RunsConfig {
             memory_budget_bytes: self.memory_budget_mb.saturating_mul(1024 * 1024),
             default_run_memory_bytes: self.default_run_memory_mb.saturating_mul(1024 * 1024),
             starvation_after: std::time::Duration::from_secs(self.starvation_after_secs),
+            cpu_budget_millicores: self.cpu_budget_millicores,
+            pids_budget: self.pids_budget,
         }
     }
 }
