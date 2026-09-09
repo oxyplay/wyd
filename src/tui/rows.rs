@@ -1,10 +1,22 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::classify::leftover_count;
+use crate::model::run::RunRecord;
 use crate::model::session::SessionInfo;
 use crate::model::{
     Category, DockerResource, ListeningPort, RuntimeItem, RuntimeSnapshot, RuntimeState,
 };
+use crate::runner::RunView;
+use crate::store::RunEvent;
+
+/// Everything the run detail popup shows: the durable record (which keeps the
+/// spec fields the API view omits, like the timeout) plus its recent events.
+/// Events are capped by the feed before they land here.
+#[derive(Clone)]
+pub struct RunDetailData {
+    pub record: RunRecord,
+    pub events: Vec<RunEvent>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -21,6 +33,7 @@ pub enum Section {
     Projects,
     Docker,
     Sessions,
+    Runs,
 }
 
 impl Section {
@@ -33,6 +46,7 @@ impl Section {
             Self::Projects => "Projects",
             Self::Docker => "Docker",
             Self::Sessions => "Sessions",
+            Self::Runs => "Runs",
         }
     }
 }
@@ -69,6 +83,8 @@ pub enum Row<'a> {
         kids: usize,
     },
     Session(&'a SessionInfo),
+    /// Index into the run list held by the app, newest first.
+    Run(usize),
 }
 
 pub fn hay_hit(hay: &str, q: &str) -> bool {
@@ -106,7 +122,11 @@ fn section_match(item: &RuntimeItem, section: Section) -> bool {
         Section::All => true,
         Section::Category(c) => item.category == c,
         Section::Leftovers => item.state == RuntimeState::Suspicious,
-        Section::Ports | Section::Projects | Section::Docker | Section::Sessions => false,
+        Section::Ports
+        | Section::Projects
+        | Section::Docker
+        | Section::Sessions
+        | Section::Runs => false,
     }
 }
 
@@ -126,7 +146,7 @@ fn docker_hit(res: &DockerResource, q: &str, project: Option<&str>) -> bool {
     q_ok && p_ok
 }
 
-pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
+pub fn overview(snap: &RuntimeSnapshot, runs: &[RunView]) -> Vec<OverviewLine> {
     let mut counts: HashMap<Category, u32> = HashMap::new();
     add_cat(&snap.logical_items, &mut counts);
     let mut lines = vec![OverviewLine {
@@ -179,6 +199,11 @@ pub fn overview(snap: &RuntimeSnapshot) -> Vec<OverviewLine> {
         label: "Sessions",
         count: snap.sessions.len() as u32,
     });
+    lines.push(OverviewLine {
+        section: Section::Runs,
+        label: "Runs",
+        count: runs.len() as u32,
+    });
     lines
 }
 
@@ -228,6 +253,7 @@ fn walk_projects<'a>(items: &'a [RuntimeItem], f: &mut dyn FnMut(&'a str)) {
 
 pub fn rows<'a>(
     snap: &'a RuntimeSnapshot,
+    runs: &[RunView],
     section: Section,
     project: Option<&str>,
     q: &str,
@@ -269,6 +295,7 @@ pub fn rows<'a>(
             }
         }
         Section::Sessions => collect_sessions(&snap.sessions, q, &mut out),
+        Section::Runs => collect_runs(runs, q, &mut out),
         other => collect_items(
             &snap.logical_items,
             0,
@@ -289,6 +316,26 @@ fn collect_sessions<'a>(sessions: &'a [SessionInfo], q: &str, out: &mut Vec<Row<
             out.push(Row::Session(s));
         }
     }
+}
+
+/// Newest-first run rows. The index is kept so rendering never clones a run.
+fn collect_runs<'a>(runs: &[RunView], q: &str, out: &mut Vec<Row<'a>>) {
+    for (i, run) in runs.iter().enumerate() {
+        if run_hit(run, q) {
+            out.push(Row::Run(i));
+        }
+    }
+}
+
+fn run_hit(run: &RunView, q: &str) -> bool {
+    q.is_empty()
+        || hay_hit(&run.run_id, q)
+        || hay_hit(run.state.as_str(), q)
+        || run.outcome.is_some_and(|o| hay_hit(o.as_str(), q))
+        || hay_hit(&run.cwd, q)
+        || run.project_root.as_ref().is_some_and(|p| hay_hit(p, q))
+        || run.session_id.as_ref().is_some_and(|s| hay_hit(s, q))
+        || hay_hit(&run.argv.join(" "), q)
 }
 
 // ponytail: filter context + tree walk state; a struct would touch every
@@ -419,5 +466,20 @@ pub fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max - 1).collect::<String>())
+    }
+}
+
+/// A run's wall-clock duration. Kept distinct from `fmt_age`: a run that
+/// took 62s reads `1m02s`, never an "age" relative to now.
+pub fn fmt_dur(ms: u64) -> String {
+    let secs = ms / 1000;
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if secs < 60 {
+        format!("{}.{}s", secs, (ms % 1000) / 100)
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     }
 }

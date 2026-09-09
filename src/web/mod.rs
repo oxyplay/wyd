@@ -20,10 +20,16 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::demo;
-use crate::model::{RuntimeSnapshot, session::SessionInfo};
+use crate::model::{
+    RuntimeSnapshot,
+    run::{RunId, RunState},
+    session::{RuntimeSessionId, SessionInfo},
+};
+use crate::runner::RunView;
+use crate::runner::logs::{RunPaths, Stream, read_chunk};
 use crate::scanner::processes::SysinfoProcessScanner;
 use crate::server;
-use crate::store::{RuntimeStore, SessionRecord};
+use crate::store::{RunFilter, RuntimeStore, SessionRecord};
 
 mod assets;
 mod proposal;
@@ -59,6 +65,22 @@ pub trait RuntimeProvider: Send + Sync + 'static {
     fn explain(&self, pid: u32) -> Option<Value>;
     fn sessions(&self) -> Vec<SessionInfo>;
     fn session_record(&self, id: u64) -> Option<SessionRecord>;
+
+    /// Managed runs, newest first. Store-backed in local mode, so the Runs
+    /// view works with no supervisor running.
+    fn runs(&self, filter: &RunFilter) -> Vec<RunView>;
+    fn run(&self, id: RunId) -> Option<RunView>;
+    /// One bounded output chunk for a retained run.
+    fn run_output(
+        &self,
+        id: RunId,
+        stream: Stream,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> io::Result<Value>;
+    /// Ask the supervisor to stop a run. The only mutating run action; it is
+    /// reached only after a confirmed proposal.
+    fn cancel_run(&self, id: RunId) -> io::Result<Option<RunView>>;
 }
 
 /// Local provider: reuses the existing store + ownership tracker.
@@ -109,6 +131,60 @@ impl RuntimeProvider for LocalProvider {
             .ok()
             .flatten()
     }
+    fn runs(&self, filter: &RunFilter) -> Vec<RunView> {
+        let Ok(store) = self.open_store() else {
+            return Vec::new();
+        };
+        match store.run_list(filter) {
+            Ok(rows) => rows.iter().map(RunView::from_record).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+    fn run(&self, id: RunId) -> Option<RunView> {
+        let store = self.open_store().ok()?;
+        store
+            .run_get(id)
+            .ok()
+            .flatten()
+            .map(|r| RunView::from_record(&r))
+    }
+    fn run_output(
+        &self,
+        id: RunId,
+        stream: Stream,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> io::Result<Value> {
+        // Read the retained log file directly instead of going through the
+        // supervisor: this works with no daemon, and `logs::read_chunk` is
+        // exactly what the supervisor's own `output()` calls. It never
+        // spawns a collector and never signals anything.
+        let store = self.open_store()?;
+        let Some(record) = store.run_get(id)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("run {id} not found"),
+            ));
+        };
+        let paths = RunPaths::new(RuntimeStore::default_path().with_file_name("runs"));
+        let mut chunk = read_chunk(&paths.stream_file(id.0, stream), cursor, max_bytes)?;
+        chunk.truncated = match stream {
+            Stream::Stdout => record.logs.stdout_truncated,
+            Stream::Stderr => record.logs.stderr_truncated,
+        };
+        Ok(json!({
+            "stream": stream.as_str(),
+            "data": chunk.data,
+            "next_cursor": chunk.next_cursor,
+            "truncated": chunk.truncated,
+            "eof": chunk.eof,
+        }))
+    }
+    fn cancel_run(&self, id: RunId) -> io::Result<Option<RunView>> {
+        // Execution lives only in the supervisor; the web process only asks.
+        // A missing supervisor surfaces as the client's connect error.
+        crate::runner::client::Client::new().cancel(id)
+    }
 }
 
 /// Demo provider: deterministic synthetic data. No host scan, no disk I/O.
@@ -130,6 +206,41 @@ impl RuntimeProvider for DemoProvider {
     fn session_record(&self, id: u64) -> Option<SessionRecord> {
         demo::session_record(id)
     }
+    fn runs(&self, filter: &RunFilter) -> Vec<RunView> {
+        let session_hex = filter.session.map(|s| format!("{:016x}", s.as_u64()));
+        let mut out: Vec<RunView> = demo::runs()
+            .into_iter()
+            .filter(|r| {
+                filter.state.is_none_or(|s| r.state == s)
+                    && filter
+                        .project
+                        .as_ref()
+                        .is_none_or(|p| r.project_root.as_deref() == Some(p.as_str()))
+                    && filter
+                        .session
+                        .is_none_or(|_| r.session_id.as_deref() == session_hex.as_deref())
+            })
+            .collect();
+        out.truncate(filter.limit.unwrap_or(200).clamp(1, 1000));
+        out
+    }
+    fn run(&self, id: RunId) -> Option<RunView> {
+        demo::run(id.0)
+    }
+    fn run_output(
+        &self,
+        id: RunId,
+        stream: Stream,
+        cursor: u64,
+        max_bytes: usize,
+    ) -> io::Result<Value> {
+        demo::run_output(id.0, stream, cursor, max_bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("run {id} not found")))
+    }
+    fn cancel_run(&self, id: RunId) -> io::Result<Option<RunView>> {
+        // Simulated: demo recomputes the view, no process is ever touched.
+        Ok(demo::cancel_run(id.0))
+    }
 }
 
 #[derive(Debug)]
@@ -141,6 +252,11 @@ enum Route<'a> {
     Items,
     Leftovers,
     Explain { pid: u32 },
+    RunsList,
+    RunGet { id: i64 },
+    RunOutput { id: i64 },
+    RunCancelProposePost { id: i64 },
+    RunCancelPost { id: i64 },
     ProposalPost,
     ConfirmPost,
     KillPost,
@@ -160,7 +276,9 @@ pub fn serve(opts: WebOptions) -> io::Result<()> {
             format!("refusing to bind {addr} (non-loopback); pass --allow-lan to override"),
         ));
     }
-    if server::serve_alive() {
+    // Demo mode reads no host state at all, so a running supervisor is not a
+    // reason to refuse it — the error text already told users to use --demo.
+    if !opts.demo && server::serve_alive() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "`wyd serve` is already running; stop it first or use --demo",
@@ -340,6 +458,25 @@ fn match_route<'a>(method: &str, path: &'a str) -> Route<'a> {
             let pid = p.trim_start_matches("/api/explain/").parse().unwrap_or(0);
             Route::Explain { pid }
         }
+        ("GET", "/api/runs") => Route::RunsList,
+        ("GET", p) if p.starts_with("/api/runs/") && p.ends_with("/output") => Route::RunOutput {
+            id: parse_run_id(p),
+        },
+        // Exact `/api/runs/<id>` only: `/api/runs/1/cancel` on GET is not a
+        // run read and must fall through to NotFound.
+        ("GET", p) if bare_run_id(p).is_some() => Route::RunGet {
+            id: bare_run_id(p).unwrap_or(0),
+        },
+        ("POST", p) if p.starts_with("/api/runs/") && p.ends_with("/cancel/propose") => {
+            Route::RunCancelProposePost {
+                id: parse_run_id(p),
+            }
+        }
+        ("POST", p) if p.starts_with("/api/runs/") && p.ends_with("/cancel") => {
+            Route::RunCancelPost {
+                id: parse_run_id(p),
+            }
+        }
         ("POST", "/api/proposal") => Route::ProposalPost,
         ("POST", "/api/confirm") => Route::ConfirmPost,
         ("POST", "/api/kill") => Route::KillPost,
@@ -410,6 +547,8 @@ fn build_response(
             | Route::DockerStopPost
             | Route::DockerRemovePost
             | Route::DockerPrunePost
+            | Route::RunCancelProposePost { .. }
+            | Route::RunCancelPost { .. }
     ) && !csrf_ok(req, &state.read().csrf)
     {
         return HttpResponse::json(403, json!({"ok": false, "error": "forbidden"}));
@@ -451,6 +590,11 @@ fn build_response(
         Route::ProposalPost => proposal_response(req, state, provider),
         Route::ConfirmPost => confirm_response(req, state, provider),
         Route::KillPost => kill_response(req, provider),
+        Route::RunsList => runs_response(provider, req),
+        Route::RunGet { id } => run_response(provider, *id),
+        Route::RunOutput { id } => run_output_response(provider, req, *id),
+        Route::RunCancelProposePost { id } => run_cancel_propose_response(state, provider, *id),
+        Route::RunCancelPost { id } => run_cancel_response(state, provider, req, *id),
         Route::DockerStopPost => docker_stop_response(req, provider),
         Route::DockerRemovePost => docker_remove_response(req, provider),
         Route::DockerPrunePost => docker_prune_response(req, provider),
@@ -1071,6 +1215,230 @@ fn resource_by_id(
         .cloned()
 }
 
+// ── Managed runs ──────────────────────────────────────────────────────
+//
+// Reads (`GET /api/runs`, `GET /api/runs/<id>`, `GET /api/runs/<id>/output`)
+// never execute or signal anything and work with no supervisor. Cancelling a
+// run is the only mutating action and is gated by the same propose/confirm +
+// CSRF pattern as kill/docker: a bare GET can never cancel.
+
+/// `/api/runs/<id>[/...]` → the numeric run id (`0` when unparsable).
+/// `/api/runs/<decimal id>` with nothing after the id.
+fn bare_run_id(path: &str) -> Option<i64> {
+    let rest = path.strip_prefix("/api/runs/")?;
+    if rest.contains('/') {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+fn parse_run_id(path: &str) -> i64 {
+    path.trim_start_matches("/api/runs/")
+        .split('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Value of `key` in the request query string, `+`/`%XX` decoded.
+fn query_param(path: &str, key: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn run_filter_from_query(req: &ParsedRequest) -> RunFilter {
+    let mut filter = RunFilter::default();
+    if let Some(state) = query_param(&req.path, "state") {
+        filter.state = RunState::parse(&state);
+    }
+    if let Some(project) = query_param(&req.path, "project") {
+        filter.project = Some(project);
+    }
+    if let Some(session) = query_param(&req.path, "session") {
+        filter.session = Some(RuntimeSessionId::from_u64(
+            u64::from_str_radix(&session, 16).unwrap_or(0),
+        ));
+    }
+    if let Some(limit) = query_param(&req.path, "limit") {
+        filter.limit = limit.parse().ok();
+    }
+    filter
+}
+
+fn runs_response(provider: &dyn RuntimeProvider, req: &ParsedRequest) -> HttpResponse {
+    let runs = provider.runs(&run_filter_from_query(req));
+    HttpResponse::json(200, json!({ "ok": true, "data": { "runs": runs } }))
+}
+
+fn run_response(provider: &dyn RuntimeProvider, id: i64) -> HttpResponse {
+    match provider.run(RunId(id)) {
+        Some(run) => HttpResponse::json(200, json!({ "ok": true, "data": { "run": run } })),
+        None => HttpResponse::json(404, json!({"ok": false, "error": "no such run"})),
+    }
+}
+
+fn run_output_response(
+    provider: &dyn RuntimeProvider,
+    req: &ParsedRequest,
+    id: i64,
+) -> HttpResponse {
+    let stream = match query_param(&req.path, "stream") {
+        None => Stream::Stdout,
+        Some(s) => match Stream::parse(&s) {
+            Some(s) => s,
+            None => {
+                return HttpResponse::json(
+                    400,
+                    json!({"ok": false, "error": "stream must be stdout or stderr"}),
+                );
+            }
+        },
+    };
+    let cursor = query_param(&req.path, "cursor")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let max_bytes = query_param(&req.path, "max_bytes")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64 * 1024)
+        .clamp(1, 1024 * 1024);
+    match provider.run_output(RunId(id), stream, cursor, max_bytes) {
+        Ok(chunk) => HttpResponse::json(200, json!({ "ok": true, "data": chunk })),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            HttpResponse::json(404, json!({"ok": false, "error": e.to_string()}))
+        }
+        Err(e) => HttpResponse::json(500, json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+fn run_cancel_propose_response(
+    state: &Arc<RwLock<WebState>>,
+    provider: &dyn RuntimeProvider,
+    id: i64,
+) -> HttpResponse {
+    let Some(run) = provider.run(RunId(id)) else {
+        return HttpResponse::json(404, json!({"ok": false, "error": "no such run"}));
+    };
+    if run.state.is_terminal() {
+        return HttpResponse::json(409, json!({"ok": false, "error": "run already finished"}));
+    }
+    let proposal = json!({
+        "kind": "cancel_run",
+        "run_id": run.run_id,
+        "request_id": run.request_id,
+        "argv": run.argv,
+        "cwd": run.cwd,
+        "session_id": run.session_id,
+        "state": run.state,
+        "revision": run.revision,
+        "note": "Confirm to ask the supervisor to stop this run and its process group. Nothing is signalled until then.",
+    });
+    let proposal_id = format!("run-{:x}-{:x}", id, now());
+    state
+        .write()
+        .proposals
+        .insert(proposal_id.clone(), proposal.clone());
+    HttpResponse::json(
+        200,
+        json!({ "ok": true, "data": { "id": proposal_id, "proposal": proposal } }),
+    )
+}
+
+fn run_cancel_response(
+    state: &Arc<RwLock<WebState>>,
+    provider: &dyn RuntimeProvider,
+    req: &ParsedRequest,
+    id: i64,
+) -> HttpResponse {
+    let body: Value = match serde_json::from_str(&req.body) {
+        Ok(v) => v,
+        Err(e) => {
+            return HttpResponse::json(
+                400,
+                json!({"ok": false, "error": format!("bad json: {e}")}),
+            );
+        }
+    };
+    let Some(proposal_id) = body.get("id").and_then(Value::as_str) else {
+        return HttpResponse::json(400, json!({"ok": false, "error": "missing id"}));
+    };
+    let stored = state.read().proposals.get(proposal_id).cloned();
+    let Some(stored) = stored else {
+        return HttpResponse::json(404, json!({"ok": false, "error": "no such proposal"}));
+    };
+    let want = id.to_string();
+    if stored.get("kind").and_then(Value::as_str) != Some("cancel_run")
+        || stored.get("run_id").and_then(Value::as_str) != Some(want.as_str())
+    {
+        return HttpResponse::json(
+            409,
+            json!({"ok": false, "error": "proposal does not match this run"}),
+        );
+    }
+    // Re-check id and state immediately before acting: the run may have
+    // finished while the human read the proposal.
+    let Some(run) = provider.run(RunId(id)) else {
+        return HttpResponse::json(404, json!({"ok": false, "error": "no such run"}));
+    };
+    if run.state.is_terminal() {
+        return HttpResponse::json(409, json!({"ok": false, "error": "run already finished"}));
+    }
+    state.write().proposals.remove(proposal_id);
+    match provider.cancel_run(RunId(id)) {
+        Ok(Some(view)) => HttpResponse::json(
+            200,
+            json!({
+                "ok": true,
+                "simulated": provider.mode() == "demo",
+                "data": { "run": view },
+            }),
+        ),
+        Ok(None) => HttpResponse::json(404, json!({"ok": false, "error": "no such run"})),
+        Err(e) => HttpResponse::json(
+            503,
+            json!({"ok": false, "error": format!("no supervisor available: {e}")}),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1413,5 +1781,206 @@ mod tests {
         assert_eq!(exp["session"]["agent"], "opencode");
         assert_eq!(exp["session"]["active"], false);
         assert!(exp["evidence"].as_array().unwrap().len() >= 2);
+    }
+
+    // ── Managed runs ───────────────────────────────────────────────────
+    #[test]
+    fn run_routes_are_matched_and_gets_never_cancel() {
+        assert!(matches!(match_route("GET", "/api/runs"), Route::RunsList));
+        assert!(matches!(
+            match_route("GET", "/api/runs/412"),
+            Route::RunGet { id: 412 }
+        ));
+        assert!(matches!(
+            match_route("GET", "/api/runs/412/output"),
+            Route::RunOutput { id: 412 }
+        ));
+        assert!(matches!(
+            match_route("POST", "/api/runs/412/cancel/propose"),
+            Route::RunCancelProposePost { id: 412 }
+        ));
+        assert!(matches!(
+            match_route("POST", "/api/runs/412/cancel"),
+            Route::RunCancelPost { id: 412 }
+        ));
+        // A bare GET can never reach a cancel route.
+        for path in [
+            "/api/runs",
+            "/api/runs/412",
+            "/api/runs/412/output",
+            "/api/runs/412/cancel",
+            "/api/runs/412/cancel/propose",
+        ] {
+            assert!(
+                !matches!(
+                    match_route("GET", path),
+                    Route::RunCancelPost { .. } | Route::RunCancelProposePost { .. }
+                ),
+                "GET {path} must not map to a cancel route"
+            );
+        }
+    }
+
+    #[test]
+    fn run_cancel_routes_require_csrf() {
+        let state = demo_state();
+        for route in [
+            Route::RunCancelProposePost { id: 412 },
+            Route::RunCancelPost { id: 412 },
+        ] {
+            let resp = build_response(
+                &route,
+                &post_json(json!({"id": "x"})),
+                &state,
+                &DemoProvider,
+            );
+            assert_eq!(resp.status, 403, "route {route:?} must require csrf");
+        }
+    }
+
+    #[test]
+    fn demo_runs_are_synthetic_and_cancel_is_simulated() {
+        let runs = DemoProvider.runs(&RunFilter::default());
+        assert_eq!(runs.len(), 5);
+        let values: Vec<Value> = runs
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap())
+            .collect();
+        assert!(values.iter().any(|v| v["state"] == "running"));
+        let outcomes: Vec<&str> = values
+            .iter()
+            .filter_map(|v| v["outcome"].as_str())
+            .collect();
+        for expected in ["exited", "timed_out", "cancelled", "spawn_failed"] {
+            assert!(outcomes.contains(&expected), "missing outcome {expected}");
+        }
+
+        // Cancelling a live demo run simulates the transition and leaves the
+        // synthetic definition untouched — no host process is involved.
+        let before = demo::run(412).unwrap();
+        assert!(!before.state.is_terminal());
+        let cancelled = DemoProvider.cancel_run(RunId(412)).unwrap().unwrap();
+        let cancelled = serde_json::to_value(&cancelled).unwrap();
+        assert_eq!(cancelled["state"], "finished");
+        assert_eq!(cancelled["outcome"], "cancelled");
+        assert_eq!(cancelled["cleanup"], "complete");
+        assert!(!demo::run(412).unwrap().state.is_terminal());
+
+        // Idempotent on an already-finished run.
+        let done = DemoProvider.cancel_run(RunId(411)).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&done).unwrap()["outcome"], "exited");
+    }
+
+    #[test]
+    fn run_json_matches_contract_shape() {
+        let runs = DemoProvider.runs(&RunFilter::default());
+        let v = serde_json::to_value(&runs[0]).unwrap();
+        for key in [
+            "run_id",
+            "request_id",
+            "argv",
+            "cwd",
+            "project_root",
+            "session_id",
+            "state",
+            "outcome",
+            "exit_code",
+            "signal",
+            "cleanup",
+            "revision",
+            "created_at",
+            "started_at",
+            "finished_at",
+            "duration_ms",
+            "detail",
+            "logs",
+            "capabilities",
+        ] {
+            assert!(v.get(key).is_some(), "run view missing {key}");
+        }
+        assert!(v["run_id"].is_string(), "run_id is a decimal string");
+        assert!(v["logs"]["stdout_bytes"].is_u64());
+        assert!(v["capabilities"]["process_group_cleanup"].is_string());
+    }
+
+    #[test]
+    fn runs_list_filters_and_output_chunks() {
+        let state = demo_state();
+        let req = ParsedRequest {
+            method: "GET".into(),
+            path: "/api/runs?state=running".into(),
+            ..Default::default()
+        };
+        let resp = build_response(&Route::RunsList, &req, &state, &DemoProvider);
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        let runs = v["data"]["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["state"], "running");
+
+        let req = ParsedRequest {
+            method: "GET".into(),
+            path: "/api/runs/412/output?stream=stdout&cursor=0&max_bytes=5".into(),
+            ..Default::default()
+        };
+        let resp = build_response(&Route::RunOutput { id: 412 }, &req, &state, &DemoProvider);
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["data"]["stream"], "stdout");
+        assert_eq!(v["data"]["data"], "web: ");
+        assert_eq!(v["data"]["next_cursor"], 5);
+        assert_eq!(v["data"]["eof"], false);
+        assert!(v["data"]["truncated"].is_boolean());
+    }
+
+    #[test]
+    fn cancel_proposal_then_confirm_cancels_demo_run() {
+        let state = demo_state();
+        let csrf = state.read().csrf.clone();
+        let resp = build_response(
+            &Route::RunCancelProposePost { id: 412 },
+            &post_json(json!({"csrf": csrf.clone()})),
+            &state,
+            &DemoProvider,
+        );
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        let proposal_id = v["data"]["id"].as_str().unwrap().to_string();
+        assert_eq!(v["data"]["proposal"]["kind"], "cancel_run");
+        assert_eq!(v["data"]["proposal"]["run_id"], "412");
+
+        // A proposal for one run cannot cancel another.
+        let resp = build_response(
+            &Route::RunCancelPost { id: 411 },
+            &post_json(json!({"csrf": csrf.clone(), "id": proposal_id})),
+            &state,
+            &DemoProvider,
+        );
+        assert_eq!(resp.status, 409);
+
+        let resp = build_response(
+            &Route::RunCancelPost { id: 412 },
+            &post_json(json!({"csrf": csrf, "id": proposal_id})),
+            &state,
+            &DemoProvider,
+        );
+        assert_eq!(resp.status, 200);
+        let v: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["simulated"], true);
+        assert_eq!(v["data"]["run"]["state"], "finished");
+        assert_eq!(v["data"]["run"]["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn cancel_proposal_rejects_finished_run() {
+        let state = demo_state();
+        let csrf = state.read().csrf.clone();
+        let resp = build_response(
+            &Route::RunCancelProposePost { id: 411 },
+            &post_json(json!({"csrf": csrf})),
+            &state,
+            &DemoProvider,
+        );
+        assert_eq!(resp.status, 409);
     }
 }

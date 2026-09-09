@@ -355,6 +355,25 @@ button, input { font-family: inherit; }
   font-weight: 600; color: var(--muted); margin-bottom: 4px;
 }
 
+/* managed-run output: bounded, scrollable, never interpreted as markup */
+.run-output {
+  margin: 6px 0 0;
+  padding: 8px;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink);
+}
+.run-output:empty::before { content: '(no output)'; color: var(--muted); }
+.run-output + .details-actions { margin-top: 8px; }
+
 /* ───────── listening sockets ───────── */
 
 .listeners {

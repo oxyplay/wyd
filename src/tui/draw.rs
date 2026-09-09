@@ -8,13 +8,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
-use super::rows::{self, Row, Section, fmt_age, fmt_bytes, truncate};
+use super::rows::{self, Row, RunDetailData, Section, fmt_age, fmt_bytes, fmt_dur, truncate};
 use super::{App, Focus, Mode};
 use crate::classify::short_path;
 use crate::config;
 use crate::model::{
     DockerResource, ListeningPort, ProcessInfo, RuntimeItem, RuntimeSnapshot, RuntimeState,
 };
+use crate::runner::RunView;
 
 const CYAN: Color = Color::Cyan;
 const YELLOW: Color = Color::Yellow;
@@ -143,9 +144,9 @@ fn draw_popup(
 }
 
 /// Ghostty/iTerm tab title: how much is running.
-pub(super) fn window_title(snap: &RuntimeSnapshot) -> String {
+pub(super) fn window_title(snap: &RuntimeSnapshot, runs: &[RunView]) -> String {
     let mut parts = vec!["wyd".into()];
-    for line in rows::overview(snap) {
+    for line in rows::overview(snap, runs) {
         if line.count == 0 {
             continue;
         }
@@ -168,6 +169,7 @@ fn title_tag(section: Section) -> Option<&'static str> {
         Section::Category(crate::model::Category::Worker) => Some("wk"),
         Section::Docker => Some("docker"),
         Section::Leftovers => Some("left"),
+        Section::Runs => Some("runs"),
         _ => None,
     }
 }
@@ -234,7 +236,12 @@ pub fn ui(frame: &mut Frame, snap: &RuntimeSnapshot, app: &mut App) {
             .areas(body);
             let width = list.width as usize;
             follow_selected(app, list.height);
-            frame.render_widget(Paragraph::new(col_header(width)), head);
+            let head_line = if app.section == Section::Runs {
+                run_col_header()
+            } else {
+                col_header(width)
+            };
+            frame.render_widget(Paragraph::new(head_line), head);
             frame.render_widget(
                 Paragraph::new(runtime_lines(snap, app, &rs, width)).scroll((app.scroll, 0)),
                 list,
@@ -391,7 +398,10 @@ pub(super) fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
                 Some(Row::DockerAgg { .. }) => {
                     parts.insert(0, format!("{} prune", keys.prune));
                 }
-                Some(Row::Port { .. }) | Some(Row::Project { .. }) | Some(Row::Session(_)) => {}
+                Some(Row::Port { .. })
+                | Some(Row::Project { .. })
+                | Some(Row::Session(_))
+                | Some(Row::Run(_)) => {}
                 None => {}
             }
             if app.section == Section::Docker && snap.docker.prunable_stats().0 > 0 {
@@ -401,7 +411,11 @@ pub(super) fn hint(app: &App, snap: &RuntimeSnapshot) -> String {
         }
         Mode::Details => {
             let keys = &config::Config::global().keys;
-            format!(" j/k scroll  o try HTTP  {} kill  esc back", keys.kill)
+            if app.section == Section::Runs {
+                " j/k scroll  esc back".into()
+            } else {
+                format!(" j/k scroll  o try HTTP  {} kill  esc back", keys.kill)
+            }
         }
         Mode::Help => " esc back".into(),
         Mode::ConfirmKill { force: true } => " y force kill  n/esc cancel".into(),
@@ -432,7 +446,7 @@ pub(super) fn overview_lines(
     let count_w = 5usize; // " " + up to 4 digits
     let label_w = width.saturating_sub(mark_w + count_w + 1).clamp(6, 18);
 
-    for (i, row) in rows::overview(snap).into_iter().enumerate() {
+    for (i, row) in rows::overview(snap, &app.runs).into_iter().enumerate() {
         let mark = if row.section == app.section {
             "▸"
         } else {
@@ -465,11 +479,19 @@ fn runtime_lines(
     rs: &[Row<'_>],
     width: usize,
 ) -> Vec<Line<'static>> {
-    if snap.processes.is_empty() {
-        return vec![Line::from(" scanning…").style(dim())];
-    }
     if rs.is_empty() {
-        return vec![Line::from(" no matching items").style(dim())];
+        let msg: String = if app.section == Section::Runs {
+            match &app.runs_error {
+                Some(e) => format!(" run store unavailable: {e}"),
+                None if app.runs.is_empty() && app.query.is_empty() => " no runs".into(),
+                None => " no matching runs".into(),
+            }
+        } else if snap.processes.is_empty() {
+            " scanning…".into()
+        } else {
+            " no matching items".into()
+        };
+        return vec![Line::from(msg).style(dim())];
     }
     let by_pid: HashMap<u32, &ProcessInfo> = snap.processes.iter().map(|p| (p.pid, p)).collect();
     let nw = name_width(width);
@@ -541,6 +563,11 @@ fn runtime_lines(
                         &s.id.to_string(),
                     )
                 }
+                Row::Run(i) => app
+                    .runs
+                    .get(*i)
+                    .map(|run| run_line(run, &app.marked, idx, width))
+                    .unwrap_or_else(|| Line::from(" run gone").style(dim())),
             };
             select_bar(line, app.focus == Focus::Runtime && idx == app.selected)
         })
@@ -799,6 +826,81 @@ fn docker_line(
     )
 }
 
+const RUN_ID_W: usize = 7;
+const RUN_STATE_W: usize = 9;
+const RUN_OUTCOME_W: usize = 13;
+const RUN_DUR_W: usize = 8;
+const RUN_PROJ_W: usize = 14;
+const RUN_SESS_W: usize = 9;
+
+/// Fixed width of the run row's metadata columns (excluding the command).
+fn run_fixed() -> usize {
+    RUN_ID_W + RUN_STATE_W + RUN_OUTCOME_W + RUN_DUR_W + RUN_PROJ_W + RUN_SESS_W + GAP * 6
+}
+
+fn run_col_header() -> Line<'static> {
+    let g = " ".repeat(GAP);
+    Line::from(format!(
+        "  {:<RUN_ID_W$}{g}{:<RUN_STATE_W$}{g}{:<RUN_OUTCOME_W$}{g}{:>RUN_DUR_W$}{g}{:<RUN_PROJ_W$}{g}{:<RUN_SESS_W$}{g}CMD",
+        "RUN", "STATE", "OUTCOME", "TIME", "PROJECT", "SESSION"
+    ))
+    .style(dim())
+}
+
+/// Compact run row: id, state, outcome, duration, project basename, session
+/// and the command. Outcome is shown as recorded — never blended with the
+/// heuristic leftover score used for runtime items.
+fn run_line(run: &RunView, marked: &HashSet<usize>, idx: usize, width: usize) -> Line<'static> {
+    let star = if marked.contains(&idx) { "*" } else { " " };
+    let g = " ".repeat(GAP);
+    let cmd_w = width.saturating_sub(run_fixed()).max(8);
+    let path = run.project_root.as_deref().unwrap_or(run.cwd.as_str());
+    let project = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let outcome = run.outcome.map(|o| o.as_str()).unwrap_or("-");
+    let duration = run.duration_ms.map(fmt_dur).unwrap_or_else(|| "—".into());
+    let state_style = if run.state.is_terminal() {
+        dim()
+    } else {
+        chrome()
+    };
+    Line::from(vec![
+        Span::raw(format!(
+            " {star}{:<RUN_ID_W$}",
+            truncate(&format!("#{}", run.run_id), RUN_ID_W)
+        )),
+        Span::styled(
+            format!("{g}{:<RUN_STATE_W$}", run.state.as_str()),
+            state_style,
+        ),
+        Span::styled(
+            format!("{g}{:<RUN_OUTCOME_W$}", truncate(outcome, RUN_OUTCOME_W)),
+            dim(),
+        ),
+        Span::styled(
+            format!("{g}{:>RUN_DUR_W$}", truncate(&duration, RUN_DUR_W)),
+            chrome(),
+        ),
+        Span::styled(
+            format!("{g}{:<RUN_PROJ_W$}", truncate(&project, RUN_PROJ_W)),
+            chrome(),
+        ),
+        Span::styled(
+            format!(
+                "{g}{:<RUN_SESS_W$}",
+                truncate(run.session_id.as_deref().unwrap_or("—"), RUN_SESS_W)
+            ),
+            dim(),
+        ),
+        Span::styled(
+            format!("{g}{}", truncate(&run.argv.join(" "), cmd_w)),
+            dim(),
+        ),
+    ])
+}
+
 pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Line<'static>> {
     let rs = app.rows(snap);
     match rs.get(app.selected) {
@@ -903,6 +1005,7 @@ pub fn details_lines(snap: &RuntimeSnapshot, app: &App, width: usize) -> Vec<Lin
             }
             lines
         }
+        Some(Row::Run(i)) => run_details(app.runs.get(*i), app.run_detail.as_ref()),
         None => vec![Line::from(" no item")],
     }
 }
@@ -1083,6 +1186,106 @@ pub fn confirm_lines(app: &App, force: bool) -> Vec<Line<'static>> {
             .style(accent.add_modifier(Modifier::BOLD)),
         Line::from(""),
     ]
+}
+
+/// Run detail: durable metadata plus recent event kinds. Log byte counts are
+/// metadata only — retained output is never read into the UI.
+fn run_details(run: Option<&RunView>, detail: Option<&RunDetailData>) -> Vec<Line<'static>> {
+    let Some(run) = run else {
+        return vec![Line::from(" no run")];
+    };
+    // The feed fills the record asynchronously; ignore it while it belongs to
+    // a different run.
+    let record = detail.filter(|d| d.record.id.to_string() == run.run_id);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "#{}  {}  {}",
+                run.run_id,
+                run.state.as_str(),
+                run.outcome.map(|o| o.as_str()).unwrap_or("-")
+            ),
+            chrome().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        detail_header("run"),
+        detail_row("command", &run.argv.join(" ")),
+        detail_row("cwd", &run.cwd),
+        detail_row("project", run.project_root.as_deref().unwrap_or("—")),
+        detail_row("session", run.session_id.as_deref().unwrap_or("—")),
+        detail_row("state", run.state.as_str()),
+        detail_row("outcome", run.outcome.map(|o| o.as_str()).unwrap_or("-")),
+        detail_row(
+            "exit code",
+            &run.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "—".into()),
+        ),
+        // Signal is its own field: a signaled run has no exit code, and the
+        // two are never collapsed into one number.
+        detail_row(
+            "signal",
+            &run.signal
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "—".into()),
+        ),
+        detail_row(
+            "timeout",
+            &record
+                .map(|d| fmt_dur(d.record.spec.timeout.as_secs() * 1000))
+                .unwrap_or_else(|| "—".into()),
+        ),
+        detail_row(
+            "duration",
+            &run.duration_ms.map(fmt_dur).unwrap_or_else(|| "—".into()),
+        ),
+        detail_row("cleanup", run.cleanup.as_str()),
+        detail_row("supervisor", run.supervisor.as_deref().unwrap_or("—")),
+        Line::from(""),
+        detail_header("logs"),
+        detail_indent(&log_line(
+            "stdout",
+            run.logs.stdout_bytes,
+            run.logs.stdout_truncated,
+        )),
+        detail_indent(&log_line(
+            "stderr",
+            run.logs.stderr_bytes,
+            run.logs.stderr_truncated,
+        )),
+    ];
+    if let Some(text) = &run.detail {
+        lines.push(Line::from(""));
+        lines.push(detail_header("detail"));
+        lines.push(detail_indent(text).style(warn()));
+    }
+    lines.push(Line::from(""));
+    match record {
+        Some(d) if !d.events.is_empty() => {
+            lines.push(detail_header(&format!("events   {}", d.events.len())));
+            for e in &d.events {
+                let text = match &e.detail {
+                    Some(x) => format!("{:>4}  {:<12} {x}", e.revision, e.kind),
+                    None => format!("{:>4}  {}", e.revision, e.kind),
+                };
+                lines.push(detail_indent(&text).style(dim()));
+            }
+        }
+        _ => {
+            lines.push(detail_header("events"));
+            lines.push(detail_indent("loading…").style(dim()));
+        }
+    }
+    lines
+}
+
+/// One stream's retained size and whether older bytes were dropped.
+fn log_line(name: &str, bytes: u64, truncated: bool) -> String {
+    format!(
+        "{name:<7} {} ({bytes} bytes){}",
+        fmt_bytes(bytes),
+        if truncated { "  truncated" } else { "" }
+    )
 }
 
 pub fn docker_details(res: &DockerResource, width: usize) -> Vec<Line<'static>> {

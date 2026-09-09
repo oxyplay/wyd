@@ -69,7 +69,7 @@ exact ancestry is gone.
 - **`wyd why <pid>`** — which session owns a process, and the evidence.
 - **`wyd --json sessions`** — recorded sessions as JSON.
 - **`wyd serve`** — a local daemon over a Unix socket (`wyd.sock`, mode 0600, single-instance). Keeps provenance fresh and answers read-only queries; vendors can register sessions with `session_start` / `session_end` (their id maps to a Wyd session as an alias).
-- **`wyd mcp`** — a Model Context Protocol server over stdio, so a coding agent can ask wyd for its sessions and who owns a PID.
+- **`wyd mcp`** — a Model Context Protocol server over stdio, so a coding agent can ask wyd for its sessions, who owns a PID, and its managed runs (`--allow-run` adds host execution).
 
 ## MCP
 
@@ -77,26 +77,94 @@ exact ancestry is gone.
 can ask the machine what it — or other agents — left running.
 
 ```bash
-wyd mcp
+wyd mcp                 # read-only
+wyd mcp --allow-run     # also allows starting and cancelling runs
 ```
 
-Starts the local MCP server (read-only). It exposes two tools:
-`list_sessions` (recorded agent sessions) and `explain` (which session owns a
-process, by pid). No network, no account — the answers come from the local
-provenance store.
+Starts the local MCP server. Read tools are always available:
+`list_sessions` (recorded agent sessions), `explain` (which session owns a
+process, by pid), `list_runs`, `get_run` and `read_run_output`. `--allow-run`
+adds `start_run` and `cancel_run` for that connection only — without it those
+calls are rejected with a message to restart with `--allow-run`. No network,
+no account — the answers come from the local provenance store.
 
 Registered in the MCP Registry:
 
 - MCP Registry name: `mcp-name: io.github.oxyplay/wyd`
 
+## Managed runs
+
+`wyd run` starts a command under a local supervisor, so an agent gets a
+deadline, a process group wyd owns, and bounded logs instead of a hung shell.
+
+```bash
+wyd run --timeout 120s -- npm test
+```
+
+The command is `argv`, not a shell — `&&`, pipes and globs need an explicit
+`sh -c`. `--timeout` defaults to `10m`, `--grace` (soft-to-forced stop) to
+`3s`, and `--cwd` must be absolute. `--json` prints the structured result
+instead of the captured output; repeating a `--request-id` within 24 hours
+reuses that run instead of starting a second one, and the same id with a
+different command is rejected.
+
+Inspect or stop it afterwards:
+
+```bash
+wyd runs                  # recent runs: state, outcome, cleanup, duration
+wyd runs --json           # full RunView records
+wyd logs <id> --follow    # retained stdout (--stream stderr for the other)
+wyd cancel <id>           # idempotent
+```
+
+The TUI shows the same runs read-only: select **Runs** in the Overview pane,
+`enter` opens a run's details. The web dashboard has the same view.
+
+The supervisor owns the run, not the client that started it: if the CLI or MCP
+connection drops, the run continues to its deadline and its result and logs are
+still there afterwards. Reads are durable and daemon-free — `wyd runs`,
+`wyd logs` and the MCP `list_runs`/`get_run`/`read_run_output` read the store
+and the retained log files, so they work with no supervisor alive. Starting or
+cancelling a run needs the supervisor, which starts on demand and exits after
+five idle minutes; the next `wyd run` or `wyd mcp --allow-run` brings it back.
+
+Exit codes: the command's own code when it exits, `128+signal` when it is
+signaled, `124` on timeout, `130` on cancel, `125` when the command could not
+be spawned. The precise reason is always in the JSON (`outcome`, `exit_code`,
+`signal`, `cleanup`, `detail`).
+
+Output is bounded per stream at 10 MiB and at 250 MiB total across retained
+runs — the head is kept and truncation is reported
+(`stdout_truncated`/`stderr_truncated` in JSON, a marker on stderr from
+`wyd logs`). The pipe keeps draining after the limit so a chatty test cannot
+wedge the supervisor. Finished runs and their logs are kept 7 days.
+
+### What this is not
+
+Stage 1 manages local processes on macOS and Linux and nothing more:
+
+- Cleanup covers the run's own process group. A command that leaves it —
+  `setsid`, double fork, an external daemon — is not silently claimed as
+  covered: `cleanup` reports `incomplete` or `unknown` instead of `complete`.
+- `TMPDIR`, `TMP` and `TEMP` point at a run-owned directory. That is
+  convenience, **not a sandbox**: the command can still write anywhere you can.
+- No filesystem, network or secret isolation, and no control over package
+  installs. Run untrusted code in a container or VM, not here.
+
+MCP setup: `wyd mcp` is read-only. `wyd mcp --allow-run` enables `start_run`
+and `cancel_run` for that connection; `start_run` is described as host
+execution and is never sandboxed by wyd.
+
 ## WebMCP
 
 Try the hosted demo: **https://demo.wyd.sh**
 
-wyd exposes six WebMCP tools so a browser agent can investigate leftovers in
+wyd exposes ten WebMCP tools so a browser agent can investigate leftovers in
 the same UI the human sees: `list_sessions`, `get_session`, `list_leftovers`,
-`explain_process`, `focus_resource`, `propose_cleanup`. Nothing is killed from
-a tool call — the human confirms cleanup.
+`explain_process`, `focus_resource`, `propose_cleanup`, plus managed-run reads
+`list_runs`, `get_run`, `read_run_output` and the proposal-only
+`propose_cancel_run`. Nothing is killed from a tool call — the human confirms
+cleanup, and run cancel goes through the same confirmed proposal.
 
 ```bash
 wyd web         # local runtime (loopback)

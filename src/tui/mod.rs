@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::io;
 use std::process::Command;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
@@ -14,7 +14,7 @@ use crossterm::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     },
 };
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -23,12 +23,127 @@ use ratatui::{
 
 use crate::actions::process::{self, Identity, Signal};
 use crate::config;
-use crate::model::{DockerResource, RuntimeSnapshot};
+use crate::model::DockerResource;
+use crate::model::RuntimeSnapshot;
+use crate::model::run::RunId;
+use crate::runner::RunView;
+use crate::store::{RunFilter, RuntimeStore};
 
 use draw::{hits, ui};
-use rows::{Focus, Row, Section, overview, rows as visible_rows};
+use rows::{Focus, Row, RunDetailData, Section, overview, rows as visible_rows};
 
 const EVENT_POLL: Duration = Duration::from_millis(100);
+/// How often the run feed re-reads the durable store.
+const RUNS_REFRESH: Duration = Duration::from_millis(1000);
+/// Newest runs kept in memory. The store is the bound: nothing older is read.
+const RUNS_LIMIT: usize = 200;
+/// Event rows kept for the focused run's detail popup.
+const RUN_EVENTS_SHOWN: usize = 40;
+
+/// Run list plus the focused run's detail, published by the feed thread. The
+/// UI only ever sees a bounded snapshot: the newest `RUNS_LIMIT` runs and at
+/// most `RUN_EVENTS_SHOWN` events — never log bytes.
+#[derive(Default)]
+struct RunFeed {
+    version: u64,
+    rows: Vec<RunView>,
+    detail: Option<RunDetailData>,
+    error: Option<String>,
+    focus: Option<RunId>,
+    /// Set when the UI wants a reload before the next periodic tick; checked
+    /// under the same lock that the wait releases, so a wake-up cannot be
+    /// lost between a publish and the wait.
+    dirty: bool,
+    stop: bool,
+}
+
+type Feed = Arc<(Mutex<RunFeed>, Condvar)>;
+
+fn new_feed() -> Feed {
+    Arc::new((Mutex::new(RunFeed::default()), Condvar::new()))
+}
+
+/// Reads the run store off the UI thread: opened once, then every tick
+/// reloads the bounded newest-first list and the focused run's events. A
+/// missing or unreadable store leaves the rest of the TUI working.
+fn run_feed(feed: Feed) {
+    let (lock, cv) = &*feed;
+    let store = match RuntimeStore::open(&RuntimeStore::default_path()) {
+        Ok(s) => s,
+        Err(e) => {
+            let mut f = lock.lock();
+            f.error = Some(format!("run store: {e}"));
+            f.version += 1;
+            return;
+        }
+    };
+    loop {
+        let focus = lock.lock().focus;
+        let mut error = None;
+        let rows = match store.run_list(&RunFilter {
+            limit: Some(RUNS_LIMIT),
+            ..RunFilter::default()
+        }) {
+            Ok(records) => records
+                .iter()
+                .map(|r| {
+                    let mut v = RunView::from_record(r);
+                    // A running run has no result yet; show elapsed wall time.
+                    if v.duration_ms.is_none() && !v.state.is_terminal() {
+                        v.duration_ms = Some(now_secs().saturating_sub(v.created_at) * 1000);
+                    }
+                    v
+                })
+                .collect(),
+            Err(e) => {
+                error = Some(format!("run list: {e}"));
+                Vec::new()
+            }
+        };
+        let detail = focus.and_then(|id| match load_detail(&store, id) {
+            Ok(d) => d,
+            Err(e) => {
+                error = Some(format!("run detail: {e}"));
+                None
+            }
+        });
+        {
+            let mut f = lock.lock();
+            f.version += 1;
+            f.rows = rows;
+            f.detail = detail;
+            f.error = error;
+        }
+        let mut guard = lock.lock();
+        if guard.stop {
+            return;
+        }
+        if !guard.dirty {
+            cv.wait_for(&mut guard, RUNS_REFRESH);
+        }
+        guard.dirty = false;
+        if guard.stop {
+            return;
+        }
+    }
+}
+
+fn load_detail(store: &RuntimeStore, id: RunId) -> io::Result<Option<RunDetailData>> {
+    let Some(record) = store.run_get(id)? else {
+        return Ok(None);
+    };
+    let mut events = store.run_events(id, 0)?;
+    if events.len() > RUN_EVENTS_SHOWN {
+        events = events.split_off(events.len() - RUN_EVENTS_SHOWN);
+    }
+    Ok(Some(RunDetailData { record, events }))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 #[derive(Clone, PartialEq, Eq)]
 enum Mode {
@@ -55,6 +170,12 @@ struct App {
     frozen: Vec<Identity>,
     frozen_title: String,
     frozen_docker: Vec<DockerResource>,
+    /// Mirror of the feed's newest-first run list.
+    runs: Vec<RunView>,
+    run_detail: Option<RunDetailData>,
+    runs_version: u64,
+    runs_error: Option<String>,
+    feed: Feed,
 }
 
 impl App {
@@ -74,11 +195,22 @@ impl App {
             frozen: Vec::new(),
             frozen_title: String::new(),
             frozen_docker: Vec::new(),
+            runs: Vec::new(),
+            run_detail: None,
+            runs_version: 0,
+            runs_error: None,
+            feed: new_feed(),
         }
     }
 
     fn rows<'a>(&self, snap: &'a RuntimeSnapshot) -> Vec<Row<'a>> {
-        visible_rows(snap, self.section, self.project.as_deref(), &self.query)
+        visible_rows(
+            snap,
+            &self.runs,
+            self.section,
+            self.project.as_deref(),
+            &self.query,
+        )
     }
 
     fn clamp(&mut self, snap: &RuntimeSnapshot) {
@@ -88,12 +220,43 @@ impl App {
         } else if self.selected >= n {
             self.selected = n - 1;
         }
-        let ov = overview(snap).len();
+        let ov = overview(snap, &self.runs).len();
         if ov == 0 {
             self.ov_sel = 0;
         } else if self.ov_sel >= ov {
             self.ov_sel = ov - 1;
         }
+    }
+
+    /// Copy the feed's latest bounded snapshot. Cheap: only when it changed.
+    fn sync_runs(&mut self) {
+        let feed = Arc::clone(&self.feed);
+        let guard = feed.0.lock();
+        if guard.version == self.runs_version {
+            return;
+        }
+        self.runs_version = guard.version;
+        self.runs = guard.rows.clone();
+        self.run_detail = guard.detail.clone();
+        self.runs_error = guard.error.clone();
+    }
+
+    /// Point the feed at a run so its events load off the UI thread.
+    fn focus_run(&mut self, id: RunId) {
+        let feed = Arc::clone(&self.feed);
+        feed.0.lock().focus = Some(id);
+        self.wake_feed();
+        self.run_detail = None;
+    }
+
+    /// Ask the feed for an immediate reload instead of waiting for its tick.
+    fn wake_feed(&self) {
+        let feed = Arc::clone(&self.feed);
+        {
+            let mut f = feed.0.lock();
+            f.dirty = true;
+        }
+        feed.1.notify_all();
     }
 
     fn reset_runtime(&mut self) {
@@ -113,7 +276,18 @@ pub fn run_tui(snapshot: Arc<RwLock<RuntimeSnapshot>>, force: mpsc::Sender<()>) 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = run(&mut terminal, &snapshot, &force);
+    let feed = new_feed();
+    let worker = {
+        let feed = Arc::clone(&feed);
+        std::thread::spawn(move || run_feed(feed))
+    };
+    let result = run(&mut terminal, &snapshot, &force, &feed);
+    {
+        let (lock, cv) = &*feed;
+        lock.lock().stop = true;
+        cv.notify_all();
+    }
+    let _ = worker.join();
     drop(force);
     disable_raw_mode()?;
     execute!(
@@ -128,16 +302,24 @@ fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     snapshot: &Arc<RwLock<RuntimeSnapshot>>,
     force: &mpsc::Sender<()>,
+    feed: &Feed,
 ) -> io::Result<()> {
     let mut drawn_version = u64::MAX;
+    let mut drawn_runs = u64::MAX;
     let mut app = App::new();
+    app.feed = Arc::clone(feed);
     loop {
         let snap = snapshot.read();
+        app.sync_runs();
         app.clamp(&snap);
-        if snap.version != drawn_version {
+        if snap.version != drawn_version || app.runs_version != drawn_runs {
             drawn_version = snap.version;
+            drawn_runs = app.runs_version;
             terminal.draw(|f| ui(f, &snap, &mut app))?;
-            execute!(terminal.backend_mut(), SetTitle(draw::window_title(&snap)))?;
+            execute!(
+                terminal.backend_mut(),
+                SetTitle(draw::window_title(&snap, &app.runs))
+            )?;
         }
         drop(snap);
 
@@ -157,7 +339,10 @@ fn run(
             drop(snap);
             let snap = snapshot.read();
             terminal.draw(|f| ui(f, &snap, &mut app))?;
-            execute!(terminal.backend_mut(), SetTitle(draw::window_title(&snap)))?;
+            execute!(
+                terminal.backend_mut(),
+                SetTitle(draw::window_title(&snap, &app.runs))
+            )?;
         }
     }
 }
@@ -195,6 +380,7 @@ fn handle_key(
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.quit, c) => KeyResult::Quit,
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.refresh, c) => {
                     let _ = force.send(());
+                    app.wake_feed();
                     KeyResult::Continue
                 }
                 KeyCode::Char(c) if config::KeysConfig::hit(&keys.help, c) => {
@@ -416,7 +602,7 @@ fn handle_mouse(
         MouseEventKind::Down(_) | MouseEventKind::Drag(_) => {
             if h.overview.contains(pos) {
                 let i = m.row.saturating_sub(h.overview.y) as usize;
-                if i < overview(snap).len() {
+                if i < overview(snap, &app.runs).len() {
                     app.ov_sel = i;
                     app.focus = Focus::Overview;
                     apply_overview(snap, app);
@@ -429,6 +615,13 @@ fn handle_mouse(
                     app.selected = i;
                     app.focus = Focus::Runtime;
                     if again && matches!(m.kind, MouseEventKind::Down(_)) {
+                        let run = match app.rows(snap).get(i) {
+                            Some(Row::Run(ri)) => Some(*ri),
+                            _ => None,
+                        };
+                        if let Some(ri) = run {
+                            open_run(app, ri);
+                        }
                         app.detail_scroll = 0;
                         app.mode = Mode::Details;
                     }
@@ -504,7 +697,7 @@ fn back(app: &mut App) -> KeyResult {
 
 fn move_sel(app: &mut App, snap: &RuntimeSnapshot, delta: i32) {
     if app.focus == Focus::Overview {
-        let n = overview(snap).len();
+        let n = overview(snap, &app.runs).len();
         if n == 0 {
             return;
         }
@@ -521,7 +714,7 @@ fn move_sel(app: &mut App, snap: &RuntimeSnapshot, delta: i32) {
 }
 
 fn apply_overview(snap: &RuntimeSnapshot, app: &mut App) {
-    if let Some(line) = overview(snap).get(app.ov_sel) {
+    if let Some(line) = overview(snap, &app.runs).get(app.ov_sel) {
         app.section = line.section;
         app.focus = Focus::Runtime;
         app.reset_runtime();
@@ -529,12 +722,19 @@ fn apply_overview(snap: &RuntimeSnapshot, app: &mut App) {
 }
 
 fn jump_projects(snap: &RuntimeSnapshot, app: &mut App) {
-    let ov = overview(snap);
+    let ov = overview(snap, &app.runs);
     if let Some(i) = ov.iter().position(|l| l.section == Section::Projects) {
         app.ov_sel = i;
         app.section = Section::Projects;
         app.focus = Focus::Runtime;
         app.reset_runtime();
+    }
+}
+
+/// Point the feed at the run behind a row so its events load off-thread.
+fn open_run(app: &mut App, i: usize) {
+    if let Some(id) = app.runs.get(i).and_then(|r| r.run_id.parse::<i64>().ok()) {
+        app.focus_run(RunId(id));
     }
 }
 
@@ -550,6 +750,11 @@ fn on_enter(snap: &RuntimeSnapshot, app: &mut App) -> KeyResult {
             app.section = Section::All;
             app.ov_sel = 0;
             app.reset_runtime();
+        }
+        Some(Row::Run(i)) => {
+            open_run(app, *i);
+            app.detail_scroll = 0;
+            app.mode = Mode::Details;
         }
         Some(_) => {
             app.detail_scroll = 0;
@@ -663,13 +868,18 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use crate::classify::group;
+    use crate::model::run::{
+        BackendCapabilities, CleanupState, LogState, RunOutcome, RunRecord, RunResult, RunSpec,
+        RunState,
+    };
     use crate::model::{self, ProcessInfo, Project, RuntimeSnapshot};
+    use crate::store::RunEvent;
 
     use super::draw::{
         confirm_lines, details_lines, docker_confirm_lines, help_lines, hint, overview_lines,
         runtime_summary, window_title,
     };
-    use super::rows::{fmt_age, fmt_bytes, truncate};
+    use super::rows::{fmt_age, fmt_bytes, fmt_dur, truncate};
 
     fn fixture_snapshot() -> RuntimeSnapshot {
         let now = SystemTime::now()
@@ -721,7 +931,7 @@ mod tests {
     #[test]
     fn window_title_lists_running_counts() {
         let snap = fixture_snapshot();
-        let title = window_title(&snap);
+        let title = window_title(&snap, &[]);
         assert!(title.starts_with("wyd ·"), "{title}");
         assert!(title.contains("1 agents"), "{title}");
         assert!(title.contains("1 mcp"), "{title}");
@@ -867,6 +1077,10 @@ mod tests {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
         assert_eq!(fmt_age(0), "—");
+        assert_eq!(fmt_dur(0), "0ms");
+        assert_eq!(fmt_dur(999), "999ms");
+        assert_eq!(fmt_dur(62_000), "1m02s");
+        assert_eq!(fmt_dur(3_700_000), "1h01m");
     }
 
     #[test]
@@ -998,8 +1212,11 @@ mod tests {
     #[test]
     fn slash_filter_hides_non_matching_leaves() {
         let snap = fixture_snapshot();
-        assert_eq!(visible_rows(&snap, Section::All, None, "").len(), 3);
-        assert_eq!(visible_rows(&snap, Section::All, None, "devtools").len(), 2);
+        assert_eq!(visible_rows(&snap, &[], Section::All, None, "").len(), 3);
+        assert_eq!(
+            visible_rows(&snap, &[], Section::All, None, "devtools").len(),
+            2
+        );
         let mut app = App::new();
         let (tx, _rx) = mpsc::channel();
         handle_key(KeyCode::Char('/'), &snap, &mut app, &tx);
@@ -1050,7 +1267,7 @@ mod tests {
     #[test]
     fn leftovers_section_hides_clean_tree() {
         let snap = fixture_snapshot();
-        assert!(visible_rows(&snap, Section::Leftovers, None, "").is_empty());
+        assert!(visible_rows(&snap, &[], Section::Leftovers, None, "").is_empty());
     }
 
     #[test]
@@ -1412,7 +1629,7 @@ mod tests {
     #[test]
     fn runtime_summary_shows_item_totals() {
         let snap = node_fixture();
-        let rs = visible_rows(&snap, Section::All, None, "");
+        let rs = visible_rows(&snap, &[], Section::All, None, "");
         let line = runtime_summary(&rs, 60).to_string();
         assert!(line.contains("1 item"), "{line}");
         assert!(line.contains("16M RAM"), "{line}");
@@ -1438,7 +1655,7 @@ mod tests {
             project: None,
             children: vec![],
         });
-        let rs = visible_rows(&snap, Section::All, None, "");
+        let rs = visible_rows(&snap, &[], Section::All, None, "");
         let line = runtime_summary(&rs, 60).to_string();
         assert!(line.contains("2 items"), "{line}");
         assert!(line.contains("64M RAM"), "16M + 48M:\n{line}");
@@ -1453,5 +1670,237 @@ mod tests {
             rendered.contains("1 item · 16M RAM"),
             "summary strip visible in pane:\n{rendered}"
         );
+    }
+
+    // ── Managed runs ───────────────────────────────────────────────────
+    fn run_view(
+        id: i64,
+        state: RunState,
+        outcome: Option<RunOutcome>,
+        cleanup: CleanupState,
+    ) -> RunView {
+        let finished = state.is_terminal();
+        RunView {
+            run_id: id.to_string(),
+            request_id: format!("req-{id}"),
+            argv: vec!["cargo".into(), "test".into(), "--all".into()],
+            cwd: "/src/queryknight".into(),
+            project_root: Some("/src/queryknight".into()),
+            session_id: Some("0123456789abcdef".into()),
+            state,
+            outcome,
+            exit_code: if outcome == Some(RunOutcome::Exited) {
+                Some(0)
+            } else {
+                None
+            },
+            signal: if outcome == Some(RunOutcome::Signaled) {
+                Some(9)
+            } else {
+                None
+            },
+            cleanup,
+            revision: 3,
+            created_at: 1_700_000_000,
+            started_at: if finished { Some(1_700_000_000) } else { None },
+            finished_at: if finished { Some(1_700_000_062) } else { None },
+            duration_ms: if finished { Some(62_000) } else { None },
+            detail: None,
+            logs: LogState {
+                stdout_bytes: 2048,
+                stderr_bytes: 0,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            },
+            supervisor: Some("4242:boot".into()),
+            capabilities: BackendCapabilities::stage1(),
+            events: Vec::new(),
+        }
+    }
+
+    fn run_record(id: i64, outcome: RunOutcome, cleanup: CleanupState) -> RunRecord {
+        let mut spec = RunSpec::new(
+            format!("req-{id}"),
+            vec!["cargo".into(), "test".into()],
+            "/src/queryknight".into(),
+        );
+        spec.project_root = Some("/src/queryknight".into());
+        let (exit_code, signal) = match outcome {
+            RunOutcome::Signaled => (None, Some(9)),
+            RunOutcome::SpawnFailed => (None, None),
+            _ => (Some(0), None),
+        };
+        RunRecord {
+            id: RunId(id),
+            spec,
+            state: RunState::Finished,
+            result: Some(RunResult {
+                outcome,
+                exit_code,
+                signal,
+                started_at: Some(1_700_000_000),
+                finished_at: 1_700_000_062,
+                duration_ms: 62_000,
+                cleanup,
+                detail: None,
+            }),
+            logs: LogState {
+                stdout_bytes: 10 << 20,
+                stderr_bytes: 0,
+                stdout_truncated: true,
+                stderr_truncated: false,
+            },
+            revision: 3,
+            created_at: 1_700_000_000,
+            leader: None,
+            supervisor: Some("4242:boot".into()),
+        }
+    }
+
+    /// A running run and a finished run in one list: distinct state, outcome,
+    /// duration and command, and the outcome is never mixed with the
+    /// leftover heuristic.
+    #[test]
+    fn runs_section_renders_running_and_finished() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        app.runs = vec![
+            run_view(
+                2,
+                RunState::Finished,
+                Some(RunOutcome::Exited),
+                CleanupState::Complete,
+            ),
+            run_view(1, RunState::Running, None, CleanupState::Pending),
+        ];
+        app.section = Section::Runs;
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("#2"), "finished run id:\n{rendered}");
+        assert!(rendered.contains("#1"), "running run id:\n{rendered}");
+        assert!(rendered.contains("finished"), "{rendered}");
+        assert!(rendered.contains("running"), "{rendered}");
+        assert!(rendered.contains("exited"), "outcome:\n{rendered}");
+        assert!(rendered.contains("1m02s"), "duration:\n{rendered}");
+        assert!(rendered.contains("queryknight"), "project:\n{rendered}");
+        assert!(
+            rendered.contains("cargo test --all"),
+            "command:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("leftover"),
+            "heuristic leaked:\n{rendered}"
+        );
+
+        // Cleanup is a per-run fact, not a shared guess: the finished run is
+        // complete, the running one still pending.
+        app.run_detail = Some(RunDetailData {
+            record: run_record(2, RunOutcome::Exited, CleanupState::Complete),
+            events: vec![],
+        });
+        app.mode = Mode::Details;
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let finished = format!("{:?}", terminal.backend().buffer());
+        assert!(finished.contains("complete"), "cleanup:\n{finished}");
+        app.selected = 1;
+        app.run_detail = None;
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let running = format!("{:?}", terminal.backend().buffer());
+        assert!(running.contains("pending"), "cleanup:\n{running}");
+    }
+
+    #[test]
+    fn run_details_separate_exit_code_signal_and_cleanup() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        let mut view = run_view(
+            7,
+            RunState::Finished,
+            Some(RunOutcome::Signaled),
+            CleanupState::Incomplete,
+        );
+        view.logs.stdout_bytes = 10 << 20;
+        view.logs.stdout_truncated = true;
+        app.runs = vec![view];
+        app.run_detail = Some(RunDetailData {
+            record: run_record(7, RunOutcome::Signaled, CleanupState::Incomplete),
+            events: vec![
+                RunEvent {
+                    revision: 0,
+                    at: 1,
+                    kind: "created".into(),
+                    detail: None,
+                },
+                RunEvent {
+                    revision: 2,
+                    at: 2,
+                    kind: "finished".into(),
+                    detail: Some("signaled".into()),
+                },
+            ],
+        });
+        app.section = Section::Runs;
+        app.mode = Mode::Details;
+        let text = join_lines(details_lines(&snap, &app, 100));
+        assert!(text.contains("command"), "{text}");
+        assert!(text.contains("cargo test --all"), "{text}");
+        assert!(text.contains("exit code"), "{text}");
+        assert!(text.contains("signal"), "{text}");
+        assert!(text.contains("timeout"), "{text}");
+        assert!(text.contains("10m00s"), "timeout value:\n{text}");
+        assert!(text.contains("incomplete"), "cleanup:\n{text}");
+        assert!(text.contains("supervisor"), "{text}");
+        assert!(text.contains("4242:boot"), "{text}");
+        assert!(text.contains("10M"), "log bytes:\n{text}");
+        assert!(text.contains("truncated"), "truncation marker:\n{text}");
+        assert!(text.contains("created"), "events:\n{text}");
+        assert!(text.contains("finished"), "events:\n{text}");
+        // Heuristic session scoring must never appear on a run.
+        assert!(!text.contains("score"), "{text}");
+        assert!(!text.contains("leftover"), "{text}");
+    }
+
+    #[test]
+    fn run_detail_renders_control_chars_safely() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        let mut view = run_view(
+            9,
+            RunState::Finished,
+            Some(RunOutcome::SpawnFailed),
+            CleanupState::Unknown,
+        );
+        view.argv = vec!["bad\u{7}\u{0}cmd".into()];
+        view.detail = Some("spawn failed: \u{1b}[31mboom\u{0}".into());
+        app.runs = vec![view];
+        let mut record = run_record(9, RunOutcome::SpawnFailed, CleanupState::Unknown);
+        record.result.as_mut().unwrap().detail = Some("spawn failed: \u{1b}[31mboom\u{0}".into());
+        app.run_detail = Some(RunDetailData {
+            record,
+            events: vec![],
+        });
+        app.section = Section::Runs;
+        app.mode = Mode::Details;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let text = join_lines(details_lines(&snap, &app, 100));
+        assert!(text.contains("spawn failed"), "{text}");
+        assert!(text.contains("loading…"), "missing events state:\n{text}");
+    }
+
+    #[test]
+    fn runs_section_empty_renders_without_panic() {
+        let snap = fixture_snapshot();
+        let mut app = App::new();
+        app.section = Section::Runs;
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &snap, &mut app)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("no runs"), "{rendered}");
+        assert!(rendered.contains("Runs"), "sidebar row:\n{rendered}");
     }
 }

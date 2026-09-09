@@ -15,8 +15,11 @@ use crate::model::{
     Category, ListeningPort, ProcessInfo, Project, Protocol, RuntimeItem, RuntimeSnapshot,
     RuntimeState, Suspicion, SuspicionReason,
     docker::{DockerKind, DockerResource, DockerSnapshot},
+    run::{BackendCapabilities, CleanupState, LogState, RunOutcome, RunState},
     session::{RuntimeSessionId, SessionInfo},
 };
+use crate::runner::RunView;
+use crate::runner::logs::Stream;
 use crate::store::SessionRecord;
 
 /// Stable ids derived from the seed string so demo is reproducible across
@@ -733,4 +736,214 @@ pub fn explain(pid: u32) -> Option<Value> {
         ],
         "session": session_json,
     }))
+}
+
+/// One synthetic managed run. Times are stored as offsets from "now" so the
+/// dashboard always shows plausible, freshly-aged durations.
+struct DemoRun {
+    id: i64,
+    request_id: &'static str,
+    argv: &'static [&'static str],
+    cwd: &'static str,
+    project_root: &'static str,
+    session_seed: Option<&'static str>,
+    state: RunState,
+    outcome: Option<RunOutcome>,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    cleanup: CleanupState,
+    ago_created: u64,
+    ago_started: Option<u64>,
+    ago_finished: Option<u64>,
+    duration_ms: Option<u64>,
+    detail: Option<&'static str>,
+    stdout: &'static str,
+    stderr: &'static str,
+}
+
+/// One live run plus one per terminal outcome the Runs view must render.
+/// Nothing here starts, signals or inspects a process.
+const RUNS: &[DemoRun] = &[
+    DemoRun {
+        id: 412,
+        request_id: "run-7f3a-web-tests",
+        argv: &["pnpm", "test", "--filter", "web"],
+        cwd: "/Users/me/Work/wyd",
+        project_root: "/Users/me/Work/wyd",
+        session_seed: Some("demo.opencode.wyd"),
+        state: RunState::Running,
+        outcome: None,
+        exit_code: None,
+        signal: None,
+        cleanup: CleanupState::Pending,
+        ago_created: 12,
+        ago_started: Some(11),
+        ago_finished: None,
+        duration_ms: None,
+        detail: None,
+        stdout: "web: running 3 test files...\nweb: PASS src/app.test.ts\n",
+        stderr: "",
+    },
+    DemoRun {
+        id: 411,
+        request_id: "run-2c9b-nextest",
+        argv: &["cargo", "nextest", "run"],
+        cwd: "/Users/me/Work/api",
+        project_root: "/Users/me/Work/api",
+        session_seed: Some("demo.codex.api"),
+        state: RunState::Finished,
+        outcome: Some(RunOutcome::Exited),
+        exit_code: Some(0),
+        signal: None,
+        cleanup: CleanupState::Complete,
+        ago_created: 900,
+        ago_started: Some(899),
+        ago_finished: Some(858),
+        duration_ms: Some(41_300),
+        detail: None,
+        stdout: "   Compiling api v0.9.0\n    Finished test [ 41.2s]\n",
+        stderr: "",
+    },
+    DemoRun {
+        id: 410,
+        request_id: "run-91de-e2e",
+        argv: &["npm", "run", "e2e"],
+        cwd: "/Users/me/Work/site",
+        project_root: "/Users/me/Work/site",
+        session_seed: Some("demo.cursor.site"),
+        state: RunState::Finished,
+        outcome: Some(RunOutcome::TimedOut),
+        exit_code: None,
+        signal: Some(15),
+        cleanup: CleanupState::Complete,
+        ago_created: 3600,
+        ago_started: Some(3599),
+        ago_finished: Some(3479),
+        duration_ms: Some(120_000),
+        detail: Some("exceeded 120s timeout; process group terminated"),
+        stdout: "running e2e suite...\n",
+        stderr: "timeout: no progress after 120s\n",
+    },
+    DemoRun {
+        id: 409,
+        request_id: "run-4a17-http",
+        argv: &["python", "-m", "http.server", "8080"],
+        cwd: "/Users/me/Work/docs",
+        project_root: "/Users/me/Work/docs",
+        session_seed: Some("demo.claude.docs"),
+        state: RunState::Finished,
+        outcome: Some(RunOutcome::Cancelled),
+        exit_code: None,
+        signal: Some(15),
+        cleanup: CleanupState::Complete,
+        ago_created: 7200,
+        ago_started: Some(7199),
+        ago_finished: Some(7180),
+        duration_ms: Some(19_000),
+        detail: Some("cancelled by operator"),
+        stdout: "Serving HTTP on 127.0.0.1 port 8080...\n",
+        stderr: "",
+    },
+    DemoRun {
+        id: 408,
+        request_id: "run-e08c-migrate",
+        argv: &["./scripts/migrate.sh"],
+        cwd: "/Users/me/Work/notes",
+        project_root: "/Users/me/Work/notes",
+        session_seed: None,
+        state: RunState::Finished,
+        outcome: Some(RunOutcome::SpawnFailed),
+        exit_code: None,
+        signal: None,
+        cleanup: CleanupState::Unknown,
+        ago_created: 86_400,
+        ago_started: None,
+        ago_finished: Some(86_400),
+        duration_ms: Some(0),
+        detail: Some("No such file or directory (os error 2)"),
+        stdout: "",
+        stderr: "",
+    },
+];
+
+fn demo_view(r: &DemoRun, n: u64) -> RunView {
+    let session_id = r.session_seed.map(|s| format!("{:016x}", stable_id(s)));
+    RunView {
+        run_id: r.id.to_string(),
+        request_id: r.request_id.into(),
+        argv: r.argv.iter().map(|s| (*s).to_string()).collect(),
+        cwd: r.cwd.into(),
+        project_root: Some(r.project_root.into()),
+        session_id,
+        state: r.state,
+        outcome: r.outcome,
+        exit_code: r.exit_code,
+        signal: r.signal,
+        cleanup: r.cleanup,
+        revision: if r.state.is_terminal() { 4 } else { 2 },
+        created_at: n.saturating_sub(r.ago_created),
+        started_at: r.ago_started.map(|ago| n.saturating_sub(ago)),
+        finished_at: r.ago_finished.map(|ago| n.saturating_sub(ago)),
+        duration_ms: r.duration_ms,
+        detail: r.detail.map(str::to_string),
+        logs: LogState {
+            stdout_bytes: r.stdout.len() as u64,
+            stderr_bytes: r.stderr.len() as u64,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        },
+        supervisor: Some("demo:0".into()),
+        capabilities: BackendCapabilities::stage1(),
+        events: Vec::new(),
+    }
+}
+
+/// Synthetic managed runs, newest first. No host I/O.
+pub fn runs() -> Vec<RunView> {
+    let n = now();
+    RUNS.iter().map(|r| demo_view(r, n)).collect()
+}
+
+pub fn run(id: i64) -> Option<RunView> {
+    let n = now();
+    RUNS.iter().find(|r| r.id == id).map(|r| demo_view(r, n))
+}
+
+/// Synthetic output chunk with the same shape as `read_run_output`. Sliced
+/// from canned text — demo never opens a log file.
+pub fn run_output(id: i64, stream: Stream, cursor: u64, max_bytes: usize) -> Option<Value> {
+    let r = RUNS.iter().find(|r| r.id == id)?;
+    let src = match stream {
+        Stream::Stdout => r.stdout,
+        Stream::Stderr => r.stderr,
+    };
+    let start = usize::try_from(cursor).unwrap_or(usize::MAX).min(src.len());
+    let end = start.saturating_add(max_bytes).min(src.len());
+    Some(json!({
+        "stream": stream.as_str(),
+        "data": &src[start..end],
+        "next_cursor": end,
+        "truncated": false,
+        "eof": end >= src.len(),
+    }))
+}
+
+/// Simulated cancel: the view is recomputed as cancelled and nothing on the
+/// host is touched — the same contract as the demo kill/docker actions.
+pub fn cancel_run(id: i64) -> Option<RunView> {
+    let n = now();
+    let r = RUNS.iter().find(|r| r.id == id)?;
+    let mut view = demo_view(r, n);
+    if !view.state.is_terminal() {
+        let started = view.started_at.unwrap_or(n);
+        view.state = RunState::Finished;
+        view.outcome = Some(RunOutcome::Cancelled);
+        view.signal = Some(15); // SIGTERM
+        view.cleanup = CleanupState::Complete;
+        view.finished_at = Some(n);
+        view.duration_ms = Some(n.saturating_sub(started).saturating_mul(1000));
+        view.revision += 1;
+        view.detail = Some("cancelled by operator (demo)".into());
+    }
+    Some(view)
 }
