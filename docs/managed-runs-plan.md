@@ -402,9 +402,6 @@ systemd user-менеджером.
 - `[runs]` в config.toml и `wyd capacity [--json] [--set key=value]`.
 - MCP `get_capacity`; WebMCP `get_capacity` и `GET /api/capacity`; очередь,
   резервации и наблюдаемое потребление показаны в TUI и web раздельно.
-
-Реализовано:
-
 - **Linux cgroup v2** — делегированный subtree (`WYD_CGROUP_ROOT` или
   writable ancestor собственной cgroup): `memory.max`, `memory.swap.max`,
   `cpu.max`, `pids.max`, `cgroup.kill`, чтение `memory.events`/
