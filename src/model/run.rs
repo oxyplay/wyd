@@ -80,6 +80,9 @@ pub struct RunSpec {
     pub grace: Duration,
     /// Per-stream retained log bytes.
     pub log_limit_bytes: u64,
+    /// Resource requirements. Empty means "whatever the supervisor allows".
+    #[serde(default)]
+    pub resources: ResourceRequest,
 }
 
 impl SessionOrigin {
@@ -101,6 +104,7 @@ impl RunSpec {
             timeout: DEFAULT_TIMEOUT,
             grace: DEFAULT_GRACE,
             log_limit_bytes: DEFAULT_RUN_LOG_LIMIT,
+            resources: ResourceRequest::default(),
         }
     }
 
@@ -287,7 +291,12 @@ pub struct BackendCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
+    /// Enforced by the OS for every run.
     Available,
+    /// Observed and acted on by wyd, but not a kernel guarantee. The string
+    /// says what the measurement is and what it can miss.
+    Monitored(String),
+    /// Not available at all; a run requiring it is refused before spawn.
     Unavailable(String),
 }
 
@@ -297,23 +306,36 @@ impl Capability {
     }
 }
 
-impl BackendCapabilities {
-    /// Stage 1 backend: process groups on macOS and Linux, nothing else.
-    /// Queue, memory, CPU, pids and filesystem limits arrive in stage 2.
-    pub fn stage1() -> Self {
-        Self {
-            queue: Capability::unavailable("no scheduler yet (stage 2)"),
-            process_group_cleanup: Capability::Available,
-            aggregate_memory_limit: Capability::unavailable(
-                "no hard aggregate memory backend yet (stage 2)",
-            ),
-            cpu_quota: Capability::unavailable("no cpu quota backend yet (stage 2)"),
-            process_limit: Capability::unavailable("no pids limit backend yet (stage 2)"),
-            filesystem_isolation: Capability::unavailable(
-                "runs share the host filesystem; TMPDIR is a convenience, not a sandbox",
-            ),
-        }
+/// What this build can do on this platform. The memory entry is the honest
+/// part: macOS gets monitoring, not a hard limit, and says so.
+pub fn backend_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        queue: Capability::Available,
+        process_group_cleanup: Capability::Available,
+        aggregate_memory_limit: memory_capability(),
+        cpu_quota: Capability::unavailable("no cpu quota backend yet (Linux cgroup v2 planned)"),
+        process_limit: Capability::unavailable(
+            "no pids limit backend yet (Linux cgroup v2 planned)",
+        ),
+        filesystem_isolation: Capability::unavailable(
+            "runs share the host filesystem; TMPDIR is a convenience, not a sandbox",
+        ),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn memory_capability() -> Capability {
+    Capability::Monitored(
+        "sum of RSS over the run's process group, sampled every 200 ms: shared pages can be counted more than once and a brief peak can be missed"
+            .into(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn memory_capability() -> Capability {
+    Capability::unavailable(
+        "no hard aggregate memory backend yet: Linux cgroup v2 delegation is not implemented",
+    )
 }
 
 /// One finished run plus its retained log state, as read back from storage.
@@ -328,6 +350,12 @@ pub struct RunRecord {
     pub created_at: u64,
     pub leader: Option<ProcessIdentity>,
     pub supervisor: Option<String>,
+    /// What the backend applied, once the run was admitted.
+    pub effective: EffectiveLimits,
+    /// Milliseconds spent waiting for a slot.
+    pub queue_wait_ms: u64,
+    /// Last resource limit event, if any.
+    pub limit_event: Option<String>,
 }
 
 /// Wrapper exit codes for CLI callers, so a shell can distinguish "the
@@ -337,6 +365,127 @@ pub mod exit {
     pub const TIMED_OUT: i32 = 124;
     pub const CANCELLED: i32 = 130;
     pub const SPAWN_FAILED: i32 = 125;
+    /// A resource limit stopped the run. Distinct from the others on purpose:
+    /// a caller must not mistake "wyd stopped it for memory" for a spawn
+    /// failure or a timeout.
+    pub const RESOURCE_LIMIT: i32 = 137;
+}
+
+/// How a resource requirement is enforced. The three states are deliberately
+/// distinct: "observed" must never be presented as a kernel limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Enforcement {
+    /// No requirement; the run is neither limited nor stopped for resources.
+    #[default]
+    None,
+    /// Stop the run when observed usage crosses the threshold. Sampling can
+    /// miss a brief peak, so this is a policy, not a guarantee.
+    Monitored,
+    /// A hard kernel-enforced limit. Refused before spawn when the backend
+    /// cannot deliver it — never silently downgraded.
+    Hard,
+}
+
+/// What a caller asks for. Empty means "whatever the supervisor allows".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRequest {
+    /// Reserved against the memory budget at admission, and used as the
+    /// monitored threshold when `enforcement` is `monitored`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_millicores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<u32>,
+    #[serde(default)]
+    pub enforcement: Enforcement,
+    /// How long the request may wait for a slot before it is abandoned.
+    /// Separate from the execution timeout, which only starts at spawn.
+    #[serde(
+        default,
+        with = "opt_duration_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub queue_timeout: Option<Duration>,
+}
+
+/// What the backend actually applies to a run. `requested` and `effective`
+/// are both reported so a caller can see a refusal instead of guessing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EffectiveLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    pub enforcement: Enforcement,
+    /// Where the numbers come from, e.g. "sum of RSS over the run's process
+    /// group, sampled every 200 ms".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    /// Backend that enforces (or observes) the limits.
+    pub backend: String,
+}
+
+/// Why a run is still queued, and how long it has waited. Deliberately no
+/// exact ETA: the supervisor cannot know when a slot frees.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueueInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    pub waiting_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One queued request as `get_capacity` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueEntry {
+    pub run_id: String,
+    pub project: String,
+    pub position: usize,
+    pub waiting_ms: u64,
+    pub memory_bytes: u64,
+    pub reason: String,
+}
+
+/// Per-project slot and reservation usage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectUsage {
+    pub project: String,
+    pub running: usize,
+    pub reserved_memory_bytes: u64,
+}
+
+/// Admission limits in force. A temporary exceedance after a config change is
+/// reported, never hidden.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitSummary {
+    pub max_parallel: usize,
+    pub max_parallel_per_project: usize,
+    pub max_queued: usize,
+    pub queue_timeout_secs: u64,
+    pub memory_budget_bytes: u64,
+    pub default_run_memory_bytes: u64,
+    pub starvation_after_secs: u64,
+}
+
+/// Read-only view of what the supervisor can admit right now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Capacity {
+    pub limits: LimitSummary,
+    pub running: usize,
+    pub queued: usize,
+    pub slots_free: usize,
+    /// Sum of reservations held by runs that have not released them. This is
+    /// reserved budget, not measured RAM.
+    pub reserved_memory_bytes: u64,
+    pub projects: Vec<ProjectUsage>,
+    pub queue: Vec<QueueEntry>,
+    /// `true` when runs already admitted exceed a newly lowered limit. The
+    /// current runs are not killed for it; the UI says so instead.
+    pub over_parallel_limit: bool,
+    /// How `reserved_memory_bytes` is defined, so nobody reads it as usage.
+    pub reservation_note: String,
+    pub capabilities: BackendCapabilities,
 }
 
 /// `Duration` as whole seconds in JSON, so the wire format stays readable.
@@ -350,6 +499,23 @@ mod duration_secs {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         Ok(Duration::from_secs(u64::deserialize(d)?))
+    }
+}
+
+/// Optional `Duration` as whole seconds.
+mod opt_duration_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(d) => s.serialize_some(&d.as_secs()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        Ok(Option::<u64>::deserialize(d)?.map(Duration::from_secs))
     }
 }
 
@@ -429,13 +595,25 @@ mod tests {
     }
 
     #[test]
-    fn stage1_reports_no_hard_limits() {
-        let caps = BackendCapabilities::stage1();
+    fn capabilities_never_claim_a_hard_limit_we_lack() {
+        let caps = backend_capabilities();
         assert!(matches!(caps.process_group_cleanup, Capability::Available));
+        assert!(matches!(caps.queue, Capability::Available));
+        // No backend in this build hard-limits cpu or pids.
+        assert!(matches!(caps.cpu_quota, Capability::Unavailable(_)));
+        assert!(matches!(caps.process_limit, Capability::Unavailable(_)));
         assert!(matches!(
-            caps.aggregate_memory_limit,
+            caps.filesystem_isolation,
             Capability::Unavailable(_)
         ));
-        assert!(matches!(caps.queue, Capability::Unavailable(_)));
+        // Memory is either a real kernel limit or explicitly monitored —
+        // never advertised as hard when it is only observed.
+        assert!(
+            matches!(
+                caps.aggregate_memory_limit,
+                Capability::Available | Capability::Monitored(_)
+            ),
+            "memory capability must be honest about monitoring"
+        );
     }
 }

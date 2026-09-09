@@ -21,6 +21,54 @@ pub struct Config {
     pub keys: KeysConfig,
     #[serde(default)]
     pub signature: Vec<SignatureConfig>,
+    #[serde(default)]
+    pub runs: RunsConfig,
+}
+
+/// Admission limits for managed runs (`[runs]` in config.toml). Defaults are
+/// deliberately small: this is a dev-machine budget, not a scheduler for a
+/// shared server.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RunsConfig {
+    pub max_parallel: usize,
+    pub max_parallel_per_project: usize,
+    pub max_queued: usize,
+    pub queue_timeout_secs: u64,
+    /// Total memory that may be *reserved* by running runs. Reservations are
+    /// a budgeting device; they are not a measurement of RAM in use.
+    pub memory_budget_mb: u64,
+    pub default_run_memory_mb: u64,
+    pub starvation_after_secs: u64,
+}
+
+impl Default for RunsConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel: 4,
+            max_parallel_per_project: 2,
+            max_queued: 32,
+            queue_timeout_secs: 600,
+            memory_budget_mb: 8192,
+            default_run_memory_mb: 512,
+            starvation_after_secs: 60,
+        }
+    }
+}
+
+impl RunsConfig {
+    /// The scheduler's view of these limits.
+    pub fn limits(&self) -> crate::runner::scheduler::Limits {
+        crate::runner::scheduler::Limits {
+            max_parallel: self.max_parallel.max(1),
+            max_parallel_per_project: self.max_parallel_per_project.max(1),
+            max_queued: self.max_queued,
+            queue_timeout: std::time::Duration::from_secs(self.queue_timeout_secs),
+            memory_budget_bytes: self.memory_budget_mb.saturating_mul(1024 * 1024),
+            default_run_memory_bytes: self.default_run_memory_mb.saturating_mul(1024 * 1024),
+            starvation_after: std::time::Duration::from_secs(self.starvation_after_secs),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -112,6 +112,29 @@ impl Client {
         )
     }
 
+    /// Runs, newest first. Live fields (observed usage, queue position) are
+    /// only present when this reaches a running supervisor.
+    pub fn list(&self, filter: Value) -> std::io::Result<Vec<RunView>> {
+        let data = self.request("list_runs", json!({ "filter": filter }))?;
+        serde_json::from_value(data.get("runs").cloned().unwrap_or(json!([])))
+            .map_err(|e| std::io::Error::other(format!("bad run list: {e}")))
+    }
+
+    /// Read-only admission capacity. Starts the supervisor if it is not
+    /// running: capacity is meaningless without one.
+    pub fn capacity(&self) -> std::io::Result<crate::model::run::Capacity> {
+        let data = self.request("get_capacity", json!({}))?;
+        serde_json::from_value(data.get("capacity").cloned().unwrap_or(Value::Null))
+            .map_err(|e| std::io::Error::other(format!("bad capacity: {e}")))
+    }
+
+    /// Replace admission limits at runtime. Active runs are not affected.
+    pub fn set_limits(&self, limits: Value) -> std::io::Result<crate::model::run::Capacity> {
+        let data = self.request("set_limits", json!({ "limits": limits }))?;
+        serde_json::from_value(data.get("capacity").cloned().unwrap_or(Value::Null))
+            .map_err(|e| std::io::Error::other(format!("bad capacity: {e}")))
+    }
+
     pub fn cancel(&self, id: RunId) -> std::io::Result<Option<RunView>> {
         let data = self.request("cancel_run", json!({ "run_id": id.to_string() }))?;
         match data.get("run") {

@@ -12,15 +12,18 @@
 
 pub mod client;
 pub mod logs;
+pub mod scheduler;
 
 use crate::model::boot::BootId;
 use crate::model::process::ProcessIdentity;
 use crate::model::run::{
-    BackendCapabilities, CleanupState, DEFAULT_TOTAL_LOG_LIMIT, LogState, RUN_RETENTION, RunId,
-    RunOutcome, RunRecord, RunResult, RunSpec, RunState, SessionOrigin,
+    BackendCapabilities, Capability, Capacity, CleanupState, DEFAULT_TOTAL_LOG_LIMIT,
+    EffectiveLimits, Enforcement, LogState, QueueInfo, RUN_RETENTION, ResourceRequest, RunId,
+    RunOutcome, RunRecord, RunResult, RunSpec, RunState, SessionOrigin, backend_capabilities,
 };
 use crate::platform::BootIdentityProvider;
 use crate::platform::pgroup;
+use crate::runner::scheduler::{Admission, RejectReason, Scheduler};
 use crate::store::{RunFilter, RunInsert, RunStep, RuntimeStore};
 use logs::{GlobalBudget, LogChunk, LogSink, RunPaths, Stream};
 use parking_lot::{Condvar, Mutex};
@@ -43,6 +46,69 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Upper bound on a single `get_run` long-poll.
 pub const MAX_WAIT_MS: u64 = 60_000;
+/// How often queued requests are checked for an expired queue deadline.
+const QUEUE_TICK: Duration = Duration::from_millis(250);
+
+/// Project key used for per-project admission: the project root when known,
+/// otherwise the working directory.
+fn project_key(spec: &RunSpec) -> String {
+    spec.project_root
+        .as_ref()
+        .unwrap_or(&spec.cwd)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Refuse a hard requirement the backend cannot deliver, before any process
+/// exists. A hard request is never silently downgraded to monitored.
+fn check_capabilities(spec: &RunSpec) -> io::Result<()> {
+    if spec.resources.enforcement != Enforcement::Hard {
+        return Ok(());
+    }
+    let caps = backend_capabilities();
+    let checks = [
+        (
+            spec.resources.memory_bytes.is_some(),
+            &caps.aggregate_memory_limit,
+            "memory",
+        ),
+        (
+            spec.resources.cpu_millicores.is_some(),
+            &caps.cpu_quota,
+            "cpu",
+        ),
+        (
+            spec.resources.processes.is_some(),
+            &caps.process_limit,
+            "process count",
+        ),
+    ];
+    for (requested, capability, what) in checks {
+        if !requested {
+            continue;
+        }
+        match capability {
+            Capability::Available => {}
+            Capability::Monitored(note) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "hard {what} limit is not available on this backend; \
+                         only monitoring is: {note}. Ask for enforcement=monitored \
+                         or drop the requirement."
+                    ),
+                ));
+            }
+            Capability::Unavailable(why) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("hard {what} limit is not available on this backend: {why}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -74,6 +140,16 @@ struct RunSlot {
     /// Shared with the drain threads, so a read reflects bytes written right
     /// up to the moment of the read.
     logs: Arc<Mutex<LogState>>,
+    /// Caller environment, held in memory until the run is admitted.
+    env: Mutex<Vec<(String, String)>>,
+    /// When the request entered the queue, for the live reported wait.
+    queued_at: Mutex<Option<Instant>>,
+    /// Final queue wait, kept after the live slot is replaced by a
+    /// read-from-storage slot.
+    queue_wait_ms: Mutex<u64>,
+    /// Last observed group usage, when the run is monitored.
+    usage: Mutex<Option<pgroup::GroupUsage>>,
+    limit_event: Mutex<Option<String>>,
 }
 
 impl RunSlot {
@@ -99,6 +175,21 @@ impl RunSlot {
     fn known(&self) -> HashSet<ProcessIdentity> {
         self.known.lock().clone()
     }
+
+    fn take_env(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.env.lock())
+    }
+
+    fn queue_wait_ms(&self) -> u64 {
+        match self
+            .queued_at
+            .lock()
+            .map(|t| t.elapsed().as_millis() as u64)
+        {
+            Some(live) => live,
+            None => *self.queue_wait_ms.lock(),
+        }
+    }
 }
 
 /// The supervisor. Cheap to share: every field is either immutable or behind
@@ -106,6 +197,7 @@ impl RunSlot {
 pub struct Supervisor {
     db: Mutex<RuntimeStore>,
     registry: Mutex<HashMap<RunId, Arc<RunSlot>>>,
+    scheduler: Mutex<Scheduler>,
     paths: RunPaths,
     budget: Arc<GlobalBudget>,
     boot_id: BootId,
@@ -141,6 +233,20 @@ pub struct RunView {
     pub duration_ms: Option<u64>,
     pub detail: Option<String>,
     pub logs: LogState,
+    /// What the caller asked for.
+    pub requested: ResourceRequest,
+    /// What the backend applied. Both are reported so a refusal is visible.
+    pub effective: EffectiveLimits,
+    /// Queue position and wait, when the run waited for capacity.
+    pub queue: QueueInfo,
+    /// Last observed usage of the run's process group (monitored mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_processes: Option<usize>,
+    /// Last resource limit event, e.g. the monitored threshold being crossed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_event: Option<String>,
     /// Identity of the supervisor that owns (or owned) the run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor: Option<String>,
@@ -194,8 +300,18 @@ impl RunView {
             duration_ms: r.result.as_ref().map(|x| x.duration_ms),
             detail: r.result.as_ref().and_then(|x| x.detail.clone()),
             logs: r.logs,
+            requested: r.spec.resources.clone(),
+            effective: r.effective.clone(),
+            queue: QueueInfo {
+                position: None,
+                waiting_ms: r.queue_wait_ms,
+                reason: None,
+            },
+            observed_memory_bytes: None,
+            observed_processes: None,
+            limit_event: r.limit_event.clone(),
             supervisor: r.supervisor.clone(),
-            capabilities: BackendCapabilities::stage1(),
+            capabilities: backend_capabilities(),
             events: Vec::new(),
         }
     }
@@ -215,17 +331,20 @@ impl Supervisor {
         let epoch = crate::platform::SystemBoot.current_boot_epoch()?;
         let boot_id = db.boot_id_for_epoch(epoch, now_secs())?;
         let used = scan_log_bytes(paths.root());
+        let limits = crate::config::Config::global().runs.limits();
         let supervisor = Arc::new(Self {
             db: Mutex::new(db),
             registry: Mutex::new(HashMap::new()),
+            scheduler: Mutex::new(Scheduler::new(limits)),
             paths,
             budget: Arc::new(GlobalBudget::new(DEFAULT_TOTAL_LOG_LIMIT, used)),
             boot_id,
             identity: format!("{}:{}", std::process::id(), boot_id),
-            capabilities: BackendCapabilities::stage1(),
+            capabilities: backend_capabilities(),
         });
         supervisor.recover()?;
         supervisor.prune();
+        supervisor.spawn_queue_tick();
         Ok(supervisor)
     }
 
@@ -273,6 +392,8 @@ impl Supervisor {
             ));
         }
 
+        check_capabilities(&spec)?;
+
         let now = now_secs();
         let id = {
             let mut db = self.db.lock();
@@ -311,16 +432,140 @@ impl Supervisor {
             cancel: AtomicBool::new(false),
             known: Mutex::new(HashSet::new()),
             logs: Arc::new(Mutex::new(LogState::default())),
+            env: Mutex::new(env),
+            queued_at: Mutex::new(None),
+            queue_wait_ms: Mutex::new(0),
+            usage: Mutex::new(None),
+            limit_event: Mutex::new(None),
         });
         self.registry.lock().insert(id, Arc::clone(&slot));
         self.db.lock().run_event(id, 0, "created", None, now)?;
-
-        let sup = Arc::clone(self);
-        let worker = Arc::clone(&slot);
-        thread::Builder::new()
-            .name(format!("wyd-run-{id}"))
-            .spawn(move || sup.run_worker(worker, env))?;
+        self.admit(slot)?;
         Ok(StartResult { id, created: true })
+    }
+
+    /// What the backend applies to this run, as opposed to what it asked for.
+    fn effective_limits(&self, spec: &RunSpec) -> EffectiveLimits {
+        let memory = spec.resources.memory_bytes;
+        let enforcement = match (spec.resources.enforcement, memory) {
+            (Enforcement::Monitored, Some(_)) => Enforcement::Monitored,
+            (Enforcement::Hard, Some(_)) => Enforcement::Hard,
+            _ => Enforcement::None,
+        };
+        EffectiveLimits {
+            memory_bytes: memory,
+            enforcement,
+            metric: (enforcement == Enforcement::Monitored).then(|| {
+                "sum of RSS over the run's process group, sampled every 200 ms".to_string()
+            }),
+            backend: "process_group".to_string(),
+        }
+    }
+
+    /// Submit to the scheduler: start now, wait for a slot, or refuse. Only
+    /// the supervisor decides admission; callers never reserve capacity.
+    fn admit(self: &Arc<Self>, slot: Arc<RunSlot>) -> io::Result<()> {
+        let project = project_key(&slot.spec);
+        let memory = slot
+            .spec
+            .resources
+            .memory_bytes
+            .unwrap_or_else(|| self.scheduler.lock().limits().default_run_memory_bytes);
+        let decision = self.scheduler.lock().submit(
+            slot.id,
+            &project,
+            memory,
+            slot.spec.resources.queue_timeout,
+            Instant::now(),
+        );
+        match decision {
+            Admission::Start { .. } => {
+                self.spawn_worker(slot);
+                Ok(())
+            }
+            Admission::Queued { position } => {
+                *slot.queued_at.lock() = Some(Instant::now());
+                let reason = self
+                    .scheduler
+                    .lock()
+                    .queue_entries(Instant::now())
+                    .into_iter()
+                    .find(|e| e.run_id == slot.id.to_string())
+                    .map(|e| e.reason)
+                    .unwrap_or_else(|| "waiting for a slot".to_string());
+                let detail = format!("queued at position {position}: {reason}");
+                slot.inner.lock().detail = Some(detail.clone());
+                self.db
+                    .lock()
+                    .run_event(slot.id, 0, "queued", Some(&detail), now_secs())?;
+                slot.cv.notify_all();
+                Ok(())
+            }
+            Admission::Rejected(reason) => {
+                let detail = match reason {
+                    RejectReason::Impossible { requested, budget } => {
+                        format!("requested {requested} bytes of memory but the budget is {budget}")
+                    }
+                    RejectReason::QueueFull { max_queued } => {
+                        format!("queue is full ({max_queued} waiting)")
+                    }
+                };
+                self.finish(
+                    &slot,
+                    RunOutcome::SpawnFailed,
+                    None,
+                    None,
+                    CleanupState::Complete,
+                    Some(detail.clone()),
+                    None,
+                );
+                Err(io::Error::new(io::ErrorKind::InvalidInput, detail))
+            }
+        }
+    }
+
+    /// Start the run's worker thread with the environment held in its slot.
+    fn spawn_worker(self: &Arc<Self>, slot: Arc<RunSlot>) {
+        let env = slot.take_env();
+        let sup = Arc::clone(self);
+        let id = slot.id;
+        let spawned = thread::Builder::new()
+            .name(format!("wyd-run-{id}"))
+            .spawn(move || sup.run_worker(slot, env));
+        if let Err(e) = spawned {
+            eprintln!("wyd: cannot start worker for run {id}: {e}");
+        }
+    }
+
+    /// Expire queued requests whose queue deadline passed. Separate from the
+    /// execution timeout, which only starts at spawn.
+    fn spawn_queue_tick(self: &Arc<Self>) {
+        let sup = Arc::clone(self);
+        thread::Builder::new()
+            .name("wyd-run-queue".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(QUEUE_TICK);
+                    // Collect first: holding the scheduler lock across
+                    // `finish` (which takes it again) would deadlock.
+                    let expired = sup.scheduler.lock().expire(Instant::now());
+                    for id in expired {
+                        let slot = sup.registry.lock().get(&id).cloned();
+                        if let Some(slot) = slot.filter(|s| !s.is_terminal()) {
+                            sup.finish(
+                                &slot,
+                                RunOutcome::TimedOut,
+                                None,
+                                None,
+                                CleanupState::Complete,
+                                Some("queue timeout: waited for a slot too long".into()),
+                                None,
+                            );
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 
     /// Current view of one run, optionally waiting for a revision newer than
@@ -384,32 +629,114 @@ impl Supervisor {
     /// Runs, newest first.
     pub fn list(&self, filter: &RunFilter) -> io::Result<Vec<RunView>> {
         let records = self.db.lock().run_list(filter)?;
-        Ok(records.iter().map(|r| self.view_record(r)).collect())
+        // Live-only fields (observed usage, queue position, limit event) are
+        // not in the store, so merge them in from the running slots. One
+        // registry snapshot, not one lock per row.
+        let slots: HashMap<RunId, Arc<RunSlot>> = self.registry.lock().clone();
+        Ok(records
+            .iter()
+            .map(|r| {
+                let mut view = self.view_record(r);
+                if let Some(slot) = slots.get(&r.id) {
+                    let usage = *slot.usage.lock();
+                    view.queue = QueueInfo {
+                        position: self.scheduler.lock().position(r.id),
+                        waiting_ms: slot.queue_wait_ms(),
+                        reason: slot.inner.lock().detail.clone(),
+                    };
+                    view.observed_memory_bytes = usage.map(|u| u.memory_bytes);
+                    view.observed_processes = usage.map(|u| u.processes);
+                    view.limit_event = slot.limit_event.lock().clone();
+                }
+                view
+            })
+            .collect())
     }
 
     /// Ask a run to stop. Idempotent: repeating it only returns current
     /// status, and a run that already finished is left alone.
-    pub fn cancel(&self, id: RunId) -> io::Result<Option<RunView>> {
+    pub fn cancel(self: &Arc<Self>, id: RunId) -> io::Result<Option<RunView>> {
         let slot = self.slot_or_load(id)?;
         let Some(slot) = slot else {
             return Ok(None);
         };
-        if !slot.is_terminal() {
-            slot.cancel.store(true, Ordering::SeqCst);
-            slot.cv.notify_all();
+        if slot.is_terminal() {
+            return self.view(id, Some(&slot), None);
         }
+        // A queued request has no process yet: drop it from the queue and
+        // finish it directly. Cancelling it must not spawn anything.
+        if slot.inner.lock().state == RunState::Queued && self.scheduler.lock().cancel_queued(id) {
+            self.finish(
+                &slot,
+                RunOutcome::Cancelled,
+                None,
+                None,
+                CleanupState::Complete,
+                Some("cancelled while queued".into()),
+                None,
+            );
+            return self.view(id, Some(&slot), None);
+        }
+        slot.cancel.store(true, Ordering::SeqCst);
+        slot.cv.notify_all();
         self.view(id, Some(&slot), None)
+    }
+
+    /// Read-only view of admission capacity. Reserved bytes are a budget, not
+    /// a measurement of RAM in use.
+    pub fn capacity(&self) -> Capacity {
+        let now = Instant::now();
+        let sched = self.scheduler.lock();
+        Capacity {
+            limits: sched.limits().summary(),
+            running: sched.running_count(),
+            queued: sched.queued_count(),
+            slots_free: sched.slots_free(),
+            over_parallel_limit: sched.running_count() > sched.limits().max_parallel,
+            reserved_memory_bytes: sched.reserved(),
+            projects: sched.projects(),
+            queue: sched.queue_entries(now),
+            reservation_note: format!(
+                "reserved_memory_bytes is a budget held by {} running run(s) plus {} held for \
+                 incomplete cleanup; it is not measured RAM",
+                sched.running_count(),
+                sched.held_reservations()
+            ),
+            capabilities: backend_capabilities(),
+        }
+    }
+
+    /// Replace admission limits at runtime. Active runs keep running.
+    pub fn set_limits(&self, limits: scheduler::Limits) -> Capacity {
+        self.scheduler.lock().set_limits(limits);
+        self.capacity()
     }
 
     /// Ask every live run to stop. Used by a graceful supervisor shutdown so
     /// active runs end as `cancelled` with a real cleanup report instead of
     /// being discovered later as `supervisor_lost`.
-    pub fn cancel_all(&self) {
-        for slot in self.registry.lock().values() {
-            if !slot.is_terminal() {
-                slot.cancel.store(true, Ordering::SeqCst);
-                slot.cv.notify_all();
+    pub fn cancel_all(self: &Arc<Self>) {
+        let slots: Vec<Arc<RunSlot>> = self.registry.lock().values().cloned().collect();
+        for slot in slots {
+            if slot.is_terminal() {
+                continue;
             }
+            if slot.inner.lock().state == RunState::Queued
+                && self.scheduler.lock().cancel_queued(slot.id)
+            {
+                self.finish(
+                    &slot,
+                    RunOutcome::Cancelled,
+                    None,
+                    None,
+                    CleanupState::Complete,
+                    Some("cancelled while queued".into()),
+                    None,
+                );
+                continue;
+            }
+            slot.cancel.store(true, Ordering::SeqCst);
+            slot.cv.notify_all();
         }
     }
 
@@ -442,6 +769,11 @@ impl Supervisor {
             cancel: AtomicBool::new(false),
             known: Mutex::new(HashSet::new()),
             logs: Arc::new(Mutex::new(record.logs)),
+            env: Mutex::new(Vec::new()),
+            queued_at: Mutex::new(None),
+            queue_wait_ms: Mutex::new(record.queue_wait_ms),
+            usage: Mutex::new(None),
+            limit_event: Mutex::new(record.limit_event.clone()),
         });
         Ok(Some(slot))
     }
@@ -469,8 +801,18 @@ impl Supervisor {
         };
         if let Some(slot) = slot {
             let (state, cleanup, revision, result, logs) = slot.snapshot();
+            // Read every locked value into a local first: a temporary guard
+            // inside a struct literal lives until the end of the statement,
+            // so nested locks here would deadlock against the worker.
             let record = self.db.lock().run_get(id)?;
             let created_at = record.as_ref().map(|r| r.created_at).unwrap_or(0);
+            let supervisor = record.as_ref().and_then(|r| r.supervisor.clone());
+            let queue_position = self.scheduler.lock().position(id);
+            let queue_wait_ms = slot.queue_wait_ms();
+            let slot_detail = slot.inner.lock().detail.clone();
+            let usage = *slot.usage.lock();
+            let limit_event = slot.limit_event.lock().clone();
+            let effective = self.effective_limits(&slot.spec);
             return Ok(Some(RunView {
                 run_id: id.to_string(),
                 request_id: slot.spec.request_id.clone(),
@@ -495,10 +837,20 @@ impl Supervisor {
                 detail: result
                     .as_ref()
                     .and_then(|r| r.detail.clone())
-                    .or_else(|| slot.inner.lock().detail.clone()),
+                    .or_else(|| slot_detail.clone()),
                 logs,
-                supervisor: self.db.lock().run_get(id)?.and_then(|r| r.supervisor),
-                capabilities: BackendCapabilities::stage1(),
+                requested: slot.spec.resources.clone(),
+                effective,
+                queue: QueueInfo {
+                    position: queue_position,
+                    waiting_ms: queue_wait_ms,
+                    reason: slot_detail,
+                },
+                observed_memory_bytes: usage.map(|u| u.memory_bytes),
+                observed_processes: usage.map(|u| u.processes),
+                limit_event,
+                supervisor,
+                capabilities: backend_capabilities(),
                 events,
             }));
         }
@@ -667,6 +1019,18 @@ impl Supervisor {
             }
         };
 
+        let effective = self.effective_limits(&slot.spec);
+        let queue_wait = slot.queue_wait_ms();
+        *slot.queue_wait_ms.lock() = queue_wait;
+        self.db
+            .lock()
+            .run_set_effective(id, &effective, queue_wait)
+            .ok();
+        let monitored_memory = match effective.enforcement {
+            Enforcement::Monitored => effective.memory_bytes,
+            _ => None,
+        };
+
         let pgid = child.id();
         let leader = identity_of(child.id(), &self.boot_id);
         slot.inner.lock().pgid = Some(pgid);
@@ -724,6 +1088,19 @@ impl Supervisor {
             if last_sample.elapsed() >= SAMPLE_INTERVAL {
                 last_sample = Instant::now();
                 self.sample_group(&slot, pgid);
+                let usage = pgroup::group_usage(pgid);
+                *slot.usage.lock() = Some(usage);
+                if let Some(limit) = monitored_memory.filter(|l| usage.memory_bytes > *l) {
+                    let event = format!(
+                        "observed {} bytes of RSS over {} process(es), above the \
+                         monitored limit of {limit}",
+                        usage.memory_bytes, usage.processes
+                    );
+                    *slot.limit_event.lock() = Some(event.clone());
+                    slot.inner.lock().detail = Some(event);
+                    stop_reason = Some(RunOutcome::ResourceLimit);
+                    break;
+                }
             }
             if slot.cancel.load(Ordering::SeqCst) {
                 stop_reason = Some(RunOutcome::Cancelled);
@@ -830,7 +1207,7 @@ impl Supervisor {
 
     #[allow(clippy::too_many_arguments)]
     fn finish(
-        &self,
+        self: &Arc<Self>,
         slot: &Arc<RunSlot>,
         outcome: RunOutcome,
         exit_code: Option<i32>,
@@ -874,8 +1251,32 @@ impl Supervisor {
             inner.revision
         };
         slot.cv.notify_all();
+        // Persist the resource story even for a run that never spawned, so a
+        // queue timeout or a refusal still shows its request and its wait.
+        let wait = slot.queue_wait_ms();
+        let effective = self.effective_limits(&slot.spec);
+        {
+            let mut db = self.db.lock();
+            let _ = db.run_set_effective(slot.id, &effective, wait);
+            if let Some(event) = slot.limit_event.lock().clone() {
+                let _ = db.run_set_limit_event(slot.id, &event);
+            }
+        }
         let _ = self.db.lock().run_finish(slot.id, revision, &result, logs);
         self.registry.lock().remove(&slot.id);
+
+        // An incomplete cleanup keeps its reservation: the processes may
+        // still be alive, and pretending the capacity is free would let the
+        // next run bypass the budget.
+        let hold = cleanup != CleanupState::Complete;
+        let admitted = self.scheduler.lock().release(slot.id, hold, Instant::now());
+        for id in admitted {
+            let next = self.registry.lock().get(&id).cloned();
+            if let Some(next) = next {
+                next.inner.lock().detail = None;
+                self.spawn_worker(next);
+            }
+        }
     }
 
     /// Record every live member of the group, so a child that outlives the
@@ -1071,8 +1472,19 @@ pub fn caller_session(session: Option<crate::model::session::RuntimeSessionId>) 
 /// An in-memory supervisor rooted at `root`, for tests.
 #[cfg(test)]
 pub fn for_tests(root: &std::path::Path) -> io::Result<Arc<Supervisor>> {
+    for_tests_with(root, scheduler::Limits::default())
+}
+
+/// A test supervisor with explicit admission limits.
+#[cfg(test)]
+pub fn for_tests_with(
+    root: &std::path::Path,
+    limits: scheduler::Limits,
+) -> io::Result<Arc<Supervisor>> {
     let db = RuntimeStore::open_in_memory()?;
-    Supervisor::new(db, RunPaths::new(root.join("runs")))
+    let supervisor = Supervisor::new(db, RunPaths::new(root.join("runs")))?;
+    *supervisor.scheduler.lock() = Scheduler::new(limits);
+    Ok(supervisor)
 }
 
 #[cfg(test)]
@@ -1332,5 +1744,164 @@ mod tests {
             assert_eq!(view.outcome, Some(RunOutcome::Cancelled));
             assert_eq!(view.cleanup, CleanupState::Complete);
         }
+    }
+    fn tiny_limits() -> scheduler::Limits {
+        scheduler::Limits {
+            max_parallel: 1,
+            max_parallel_per_project: 1,
+            max_queued: 4,
+            queue_timeout: Duration::from_secs(30),
+            memory_budget_bytes: 100 * 1024 * 1024,
+            default_run_memory_bytes: 10 * 1024 * 1024,
+            starvation_after: Duration::from_secs(5),
+        }
+    }
+
+    fn sup_with(name: &str, limits: scheduler::Limits) -> Arc<Supervisor> {
+        let root = std::env::temp_dir().join(format!(
+            "wyd-runner-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for_tests_with(&root, limits).unwrap()
+    }
+
+    #[test]
+    fn a_full_slot_queues_the_next_run_then_admits_it() {
+        let sup = sup_with("queue", tiny_limits());
+        let first = sup.start(spec("q1", "sleep 1"), Vec::new()).unwrap();
+        let second = sup.start(spec("q2", "echo second"), Vec::new()).unwrap();
+        let view = sup.get(second.id, None, 0).unwrap().unwrap();
+        assert_eq!(view.state, RunState::Queued);
+        assert_eq!(view.queue.position, Some(1));
+        assert!(view.queue.reason.is_some());
+
+        let first_view = wait(&sup, first.id);
+        assert_eq!(first_view.outcome, Some(RunOutcome::Exited));
+        let second_view = wait(&sup, second.id);
+        assert_eq!(second_view.outcome, Some(RunOutcome::Exited));
+        assert_eq!(second_view.cleanup, CleanupState::Complete);
+        assert!(
+            second_view.queue.waiting_ms > 0,
+            "the wait must be reported: {second_view:?}"
+        );
+        assert_eq!(text(&sup, second.id, Stream::Stdout).trim(), "second");
+    }
+
+    #[test]
+    fn queue_cancel_never_spawns_the_command() {
+        let sup = sup_with("queue-cancel", tiny_limits());
+        let first = sup.start(spec("qc1", "sleep 2"), Vec::new()).unwrap();
+        let second = sup
+            .start(spec("qc2", "echo should-not-run"), Vec::new())
+            .unwrap();
+        assert_eq!(
+            sup.get(second.id, None, 0).unwrap().unwrap().state,
+            RunState::Queued
+        );
+        sup.cancel(second.id).unwrap();
+        let view = wait(&sup, second.id);
+        assert_eq!(view.outcome, Some(RunOutcome::Cancelled));
+        assert_eq!(view.cleanup, CleanupState::Complete);
+        assert!(
+            text(&sup, second.id, Stream::Stdout).is_empty(),
+            "a cancelled queued run must not execute"
+        );
+        wait(&sup, first.id);
+    }
+
+    #[test]
+    fn queue_timeout_finishes_without_consuming_execution_time() {
+        let mut limits = tiny_limits();
+        limits.queue_timeout = Duration::from_millis(300);
+        let sup = sup_with("queue-timeout", limits);
+        let first = sup.start(spec("qt1", "sleep 2"), Vec::new()).unwrap();
+        let second = sup.start(spec("qt2", "echo never"), Vec::new()).unwrap();
+        let view = wait(&sup, second.id);
+        assert_eq!(view.outcome, Some(RunOutcome::TimedOut));
+        assert!(
+            view.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("queue timeout"),
+            "detail must name the queue: {view:?}"
+        );
+        assert!(text(&sup, second.id, Stream::Stdout).is_empty());
+        wait(&sup, first.id);
+    }
+
+    #[test]
+    fn an_impossible_memory_request_is_rejected() {
+        let sup = sup_with("impossible", tiny_limits());
+        let mut spec = spec("impossible", "echo never");
+        spec.resources.memory_bytes = Some(10 * 1024 * 1024 * 1024);
+        let err = sup.start(spec, Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("budget"), "{err}");
+        assert_eq!(sup.scheduler.lock().queued_count(), 0);
+    }
+
+    #[test]
+    fn a_hard_memory_request_is_refused_before_spawn() {
+        let sup = sup_with("hard", tiny_limits());
+        let mut spec = spec("hard", "echo never");
+        spec.resources.memory_bytes = Some(1024 * 1024);
+        spec.resources.enforcement = Enforcement::Hard;
+        let err = sup.start(spec, Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+        assert!(err.to_string().contains("hard memory"), "{err}");
+    }
+
+    #[test]
+    fn monitored_memory_stops_the_run_and_explains_itself() {
+        let sup = sup_with("monitored", tiny_limits());
+        let mut spec = spec("monitored", "sleep 30");
+        // Any live process has RSS above one byte, so the threshold trips on
+        // the first sample without needing a real allocation.
+        spec.resources.memory_bytes = Some(1);
+        spec.resources.enforcement = Enforcement::Monitored;
+        let started = sup.start(spec, Vec::new()).unwrap();
+        let view = wait(&sup, started.id);
+        assert_eq!(view.outcome, Some(RunOutcome::ResourceLimit));
+        assert_eq!(view.cleanup, CleanupState::Complete);
+        let event = view.limit_event.unwrap_or_default();
+        assert!(event.contains("above the"), "{event}");
+        assert_eq!(view.effective.enforcement, Enforcement::Monitored);
+        assert!(view.effective.metric.is_some());
+    }
+
+    #[test]
+    fn capacity_reports_slots_and_the_queue() {
+        let sup = sup_with("capacity", tiny_limits());
+        let running = sup.start(spec("cap1", "sleep 2"), Vec::new()).unwrap();
+        let queued = sup.start(spec("cap2", "echo later"), Vec::new()).unwrap();
+        let capacity = sup.capacity();
+        assert_eq!(capacity.running, 1);
+        assert_eq!(capacity.queued, 1);
+        assert_eq!(capacity.slots_free, 0);
+        assert_eq!(capacity.queue[0].run_id, queued.id.to_string());
+        assert!(capacity.reserved_memory_bytes > 0);
+        assert!(capacity.reservation_note.contains("not measured RAM"));
+        assert!(matches!(capacity.limits.max_parallel, 1));
+        wait(&sup, running.id);
+        wait(&sup, queued.id);
+    }
+    #[test]
+    fn a_repeated_request_id_does_not_reserve_capacity_twice() {
+        let sup = sup_with("dedupe-capacity", tiny_limits());
+        let first = sup.start(spec("dup", "sleep 1"), Vec::new()).unwrap();
+        let again = sup.start(spec("dup", "sleep 1"), Vec::new()).unwrap();
+        assert!(!again.created);
+        assert_eq!(first.id, again.id);
+        let capacity = sup.capacity();
+        assert_eq!(capacity.running, 1, "one slot for one request");
+        assert_eq!(capacity.queued, 0, "a retry must not queue a second time");
+        assert_eq!(
+            capacity.reserved_memory_bytes,
+            tiny_limits().default_run_memory_bytes,
+            "one reservation, not two"
+        );
+        wait(&sup, first.id);
     }
 }

@@ -150,6 +150,16 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 ";
 
+/// `SCHEMA_VERSION` as declared in `src/store.rs`.
+fn production_schema_version() -> i64 {
+    include_str!("../src/store.rs")
+        .split("const SCHEMA_VERSION: i64 = ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|n| n.trim().parse().ok())
+        .expect("SCHEMA_VERSION in src/store.rs")
+}
+
 /// Table names declared by a DDL string, in declaration order.
 fn table_names(ddl: &str) -> std::collections::BTreeSet<String> {
     ddl.split("CREATE TABLE IF NOT EXISTS ")
@@ -165,6 +175,10 @@ fn table_names(ddl: &str) -> std::collections::BTreeSet<String> {
 fn fixture_schema_matches_production() {
     let production = table_names(include_str!("../src/store.rs"));
     let fixture = table_names(SCHEMA);
+    assert!(
+        production_schema_version() > 0,
+        "the fixture must be able to read the production schema version"
+    );
     assert_eq!(
         fixture, production,
         "tests/mcp_conformance.rs SCHEMA drifted from RuntimeStore::init"
@@ -192,10 +206,13 @@ fn seed_store(home: &Path) {
     // An initialized store always carries the schema version; without it the
     // first open runs the migration DDL and takes a write lock, which races
     // the in-process collector.
+    // Take the version from production instead of hard-coding it: a fixture
+    // that lags one version behind makes the first store open run migrations
+    // and take a write lock, which races the collector.
     conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
+        rusqlite::params![production_schema_version().to_string()],
     )
     .unwrap();
     conn.execute(
@@ -223,9 +240,13 @@ impl McpClient {
     fn spawn_with(extra: &[&str]) -> Self {
         // Hermetic: point HOME/XDG at a throwaway dir so the spawned server's
         // collect loop and store never touch the real user's state.
+        // The clock can have coarser granularity than nanoseconds, so two
+        // tests spawning at once would otherwise share a home directory.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let home = std::env::temp_dir().join(format!(
-            "wyd-mcp-conformance-{}-{}",
+            "wyd-mcp-conformance-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -365,6 +386,7 @@ fn full_handshake_as_a_client() {
         names,
         [
             "explain",
+            "get_capacity",
             "get_run",
             "list_runs",
             "list_sessions",

@@ -262,6 +262,11 @@ fn dispatch(store: &mut RuntimeStore, supervisor: &Arc<Supervisor>, line: &str) 
             "supervisor": supervisor.identity(),
         })),
         "capabilities" => ok_json(json!({ "capabilities": supervisor.capabilities() })),
+        "get_capacity" => ok_json(json!({ "capacity": supervisor.capacity() })),
+        "set_limits" => match set_limits(supervisor, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
         "start_run" => match start_run(supervisor, &req) {
             Ok(v) => ok_json(v),
             Err(e) => err_json(&e.to_string()),
@@ -316,6 +321,45 @@ fn dispatch(store: &mut RuntimeStore, supervisor: &Arc<Supervisor>, line: &str) 
         },
         other => err_json(&format!("unknown command {other:?}")),
     }
+}
+
+/// Replace admission limits without touching active runs.
+fn set_limits(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Value> {
+    let raw = req
+        .get("limits")
+        .ok_or_else(|| std::io::Error::other("set_limits needs a limits object"))?;
+    let mut limits = supervisor.capacity().limits;
+    if let Some(v) = raw.get("max_parallel").and_then(Value::as_u64) {
+        limits.max_parallel = (v as usize).max(1);
+    }
+    if let Some(v) = raw.get("max_parallel_per_project").and_then(Value::as_u64) {
+        limits.max_parallel_per_project = (v as usize).max(1);
+    }
+    if let Some(v) = raw.get("max_queued").and_then(Value::as_u64) {
+        limits.max_queued = v as usize;
+    }
+    if let Some(v) = raw.get("queue_timeout_secs").and_then(Value::as_u64) {
+        limits.queue_timeout_secs = v;
+    }
+    if let Some(v) = raw.get("memory_budget_bytes").and_then(Value::as_u64) {
+        limits.memory_budget_bytes = v;
+    }
+    if let Some(v) = raw.get("default_run_memory_bytes").and_then(Value::as_u64) {
+        limits.default_run_memory_bytes = v;
+    }
+    if let Some(v) = raw.get("starvation_after_secs").and_then(Value::as_u64) {
+        limits.starvation_after_secs = v;
+    }
+    let applied = supervisor.set_limits(crate::runner::scheduler::Limits {
+        max_parallel: limits.max_parallel,
+        max_parallel_per_project: limits.max_parallel_per_project,
+        max_queued: limits.max_queued,
+        queue_timeout: Duration::from_secs(limits.queue_timeout_secs),
+        memory_budget_bytes: limits.memory_budget_bytes,
+        default_run_memory_bytes: limits.default_run_memory_bytes,
+        starvation_after: Duration::from_secs(limits.starvation_after_secs),
+    });
+    Ok(json!({ "capacity": applied }))
 }
 
 fn start_run(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Value> {

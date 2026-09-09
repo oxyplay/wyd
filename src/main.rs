@@ -28,7 +28,7 @@ use model::process::ProcessIdentity;
 use parking_lot::RwLock;
 use platform::BootIdentityProvider;
 use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// See what your dev sessions left running.
 #[derive(Parser)]
@@ -86,6 +86,23 @@ enum Subcmd {
         /// Reuse an existing run instead of starting a new one
         #[arg(long)]
         request_id: Option<String>,
+        /// Memory in MiB: reserved against the run budget, and the stop
+        /// threshold when --enforce monitored
+        #[arg(long)]
+        memory: Option<u64>,
+        /// none | monitored | hard. `hard` is refused when the backend cannot
+        /// enforce it; it is never silently downgraded.
+        #[arg(long, default_value = "none")]
+        enforce: String,
+        /// How long the request may wait for a slot (separate from --timeout)
+        #[arg(long, value_parser = parse_duration)]
+        queue_timeout: Option<Duration>,
+        /// CPU in millicores (advisory until a Linux backend enforces it)
+        #[arg(long)]
+        cpu: Option<u32>,
+        /// Process-count request (advisory until a Linux backend enforces it)
+        #[arg(long)]
+        processes: Option<u32>,
         /// Print the structured result instead of the captured output
         #[arg(long)]
         json: bool,
@@ -119,6 +136,15 @@ enum Subcmd {
     },
     /// Ask a run to stop (idempotent)
     Cancel { run_id: i64 },
+    /// Show managed-run admission capacity; with --set, change the limits
+    Capacity {
+        #[arg(long)]
+        json: bool,
+        /// Change a limit, e.g. --set max_parallel=2. Repeatable. Active runs
+        /// keep running; the new limits apply to admission from now on.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
     /// Run an MCP server over stdio (for coding agents)
     Mcp {
         /// Enable the execution tools (start_run, cancel_run) for this
@@ -207,9 +233,26 @@ fn main() -> io::Result<()> {
             grace,
             cwd,
             request_id,
+            memory,
+            enforce,
+            queue_timeout,
+            cpu,
+            processes,
             json,
             argv,
-        }) => run_command(timeout, grace, cwd, request_id, json, argv),
+        }) => run_command(RunOptions {
+            timeout,
+            grace,
+            cwd,
+            request_id,
+            memory,
+            enforce,
+            queue_timeout,
+            cpu,
+            processes,
+            json,
+            argv,
+        }),
         Some(Subcmd::Runs {
             state,
             project,
@@ -222,6 +265,7 @@ fn main() -> io::Result<()> {
             follow,
         }) => run_logs(run_id, stream, follow),
         Some(Subcmd::Cancel { run_id }) => run_cancel(run_id),
+        Some(Subcmd::Capacity { json, set }) => run_capacity(json, set),
         Some(Subcmd::Mcp { allow_run }) => mcp::serve_stdio(allow_run),
         Some(Subcmd::Web {
             host,
@@ -274,16 +318,37 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs.max(1)))
 }
 
-/// `wyd run`: start under the supervisor, wait, print the result.
-fn run_command(
+/// Everything `wyd run` accepts.
+struct RunOptions {
     timeout: Duration,
     grace: Duration,
     cwd: Option<String>,
     request_id: Option<String>,
+    memory: Option<u64>,
+    enforce: String,
+    queue_timeout: Option<Duration>,
+    cpu: Option<u32>,
+    processes: Option<u32>,
     json: bool,
     argv: Vec<String>,
-) -> io::Result<()> {
-    use model::run::{RunSpec, exit};
+}
+
+/// `wyd run`: start under the supervisor, wait, print the result.
+fn run_command(opts: RunOptions) -> io::Result<()> {
+    use model::run::{Enforcement, RunSpec, exit};
+    let RunOptions {
+        timeout,
+        grace,
+        cwd,
+        request_id,
+        memory,
+        enforce,
+        queue_timeout,
+        cpu,
+        processes,
+        json,
+        argv,
+    } = opts;
     runner::client::ensure_supervisor()?;
     let client = runner::client::Client::new();
 
@@ -312,6 +377,21 @@ fn run_command(
     let mut spec = RunSpec::new(request_id, argv, cwd);
     spec.timeout = timeout;
     spec.grace = grace;
+    spec.resources.memory_bytes = memory.map(|mb| mb.saturating_mul(1024 * 1024));
+    spec.resources.enforcement = match enforce.as_str() {
+        "none" => Enforcement::None,
+        "monitored" => Enforcement::Monitored,
+        "hard" => Enforcement::Hard,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--enforce must be none|monitored|hard, got {other:?}"),
+            ));
+        }
+    };
+    spec.resources.queue_timeout = queue_timeout;
+    spec.resources.cpu_millicores = cpu;
+    spec.resources.processes = processes;
 
     let env: Vec<(String, String)> = std::env::vars().collect();
     let started = client.start(&spec, &env)?;
@@ -341,6 +421,7 @@ fn run_command(
         Some(model::run::RunOutcome::Signaled) => 128 + view.signal.unwrap_or(0),
         Some(model::run::RunOutcome::TimedOut) => exit::TIMED_OUT,
         Some(model::run::RunOutcome::Cancelled) => exit::CANCELLED,
+        Some(model::run::RunOutcome::ResourceLimit) => exit::RESOURCE_LIMIT,
         _ => exit::SPAWN_FAILED,
     };
     std::process::exit(code);
@@ -494,6 +575,114 @@ fn run_logs(run_id: i64, stream: String, follow: bool) -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// `wyd capacity`: admission limits and current usage. Reads the supervisor
+/// when one is running; otherwise reports the configured limits and an empty
+/// machine, without starting a daemon for a read.
+fn run_capacity(json: bool, set: Vec<String>) -> io::Result<()> {
+    use model::run::{Capacity, LimitSummary, backend_capabilities};
+    if !set.is_empty() {
+        let mut limits = serde_json::Map::new();
+        for item in &set {
+            let (key, value) = item.split_once('=').ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("--set expects KEY=VALUE, got {item:?}"),
+                )
+            })?;
+            let value: u64 = value.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("--set {key}: {value:?} is not a number"),
+                )
+            })?;
+            match key {
+                "memory_budget_mb" => {
+                    limits.insert(key.into(), json!(value.saturating_mul(1024 * 1024)));
+                }
+                "default_run_memory_mb" => {
+                    limits.insert(key.into(), json!(value.saturating_mul(1024 * 1024)));
+                }
+                "max_parallel"
+                | "max_parallel_per_project"
+                | "max_queued"
+                | "queue_timeout_secs"
+                | "starvation_after_secs" => {
+                    limits.insert(key.into(), json!(value));
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown limit {other:?}"),
+                    ));
+                }
+            }
+        }
+        runner::client::ensure_supervisor()?;
+        runner::client::Client::new().set_limits(Value::Object(limits))?;
+    }
+    let capacity = if server::serve_alive() {
+        runner::client::Client::new().capacity()?
+    } else {
+        let limits = config::Config::global().runs.limits().summary();
+        Capacity {
+            limits,
+            running: 0,
+            queued: 0,
+            slots_free: config::Config::global().runs.max_parallel.max(1),
+            reserved_memory_bytes: 0,
+            projects: Vec::new(),
+            queue: Vec::new(),
+            over_parallel_limit: false,
+            reservation_note: "no supervisor running; these are the configured limits".into(),
+            capabilities: backend_capabilities(),
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&capacity)?);
+        return Ok(());
+    }
+    let LimitSummary {
+        max_parallel,
+        max_parallel_per_project,
+        max_queued,
+        queue_timeout_secs,
+        memory_budget_bytes,
+        default_run_memory_bytes,
+        ..
+    } = capacity.limits;
+    println!(
+        "slots      {}/{} used ({} per project)",
+        capacity.running, max_parallel, max_parallel_per_project
+    );
+    println!(
+        "queue      {} waiting, {} max, {}s timeout",
+        capacity.queued, max_queued, queue_timeout_secs
+    );
+    println!(
+        "reserved   {} of {} MiB (default {} MiB per run)",
+        capacity.reserved_memory_bytes / (1024 * 1024),
+        memory_budget_bytes / (1024 * 1024),
+        default_run_memory_bytes / (1024 * 1024),
+    );
+    if capacity.over_parallel_limit {
+        println!(
+            "warning    {} run(s) still active above the new limit; they are not killed",
+            capacity.running
+        );
+    }
+    println!("note       {}", capacity.reservation_note);
+    for entry in &capacity.queue {
+        println!(
+            "  queued   #{} run {} {} ({}s)",
+            entry.position,
+            entry.run_id,
+            entry.reason,
+            entry.waiting_ms / 1000
+        );
+    }
+    Ok(())
 }
 
 fn run_cancel(run_id: i64) -> io::Result<()> {

@@ -110,6 +110,41 @@ pub fn group_identities(pgid: u32, boot_id: &BootId) -> Vec<ProcessIdentity> {
         .collect()
 }
 
+/// Live resource usage of a process group, from the OS process table.
+///
+/// Memory is the sum of RSS over the group's members: shared pages can be
+/// counted more than once, so this is an observation, not an accounting
+/// figure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupUsage {
+    pub processes: usize,
+    pub memory_bytes: u64,
+}
+
+pub fn group_usage(pgid: u32) -> GroupUsage {
+    let pids: Vec<Pid> = members_of_group(pgid)
+        .into_iter()
+        .map(Pid::from_u32)
+        .collect();
+    if pids.is_empty() {
+        return GroupUsage::default();
+    }
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    let mut usage = GroupUsage::default();
+    for pid in pids {
+        if let Some(process) = sys.process(pid) {
+            usage.processes += 1;
+            usage.memory_bytes += process.memory();
+        }
+    }
+    usage
+}
+
 /// Identity of one specific `pid`, independent of its process group.
 pub fn identity_of_pid(pid: u32, boot_id: &BootId) -> Option<ProcessIdentity> {
     let pids = [Pid::from_u32(pid)];

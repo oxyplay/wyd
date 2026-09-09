@@ -144,6 +144,11 @@ fn tools(allow_run: bool) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "get_capacity",
+            "description": "Read-only admission capacity: limits, running/queued counts, reserved memory and queue positions.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        }),
+        json!({
             "name": "read_run_output",
             "description": "Read a bounded chunk of a run's captured stdout or stderr from a byte cursor.",
             "inputSchema": {
@@ -170,6 +175,11 @@ fn tools(allow_run: bool) -> Vec<Value> {
                     "argv": { "type": "array", "items": { "type": "string" }, "description": "executable and arguments, no implicit shell" },
                     "cwd": { "type": "string", "description": "absolute working directory" },
                     "timeout_ms": { "type": "integer" },
+                    "memory_mb": { "type": "integer", "description": "reserved memory; with enforcement=monitored it is the stop threshold" },
+                    "enforcement": { "type": "string", "description": "none|monitored|hard; hard is refused when the backend cannot enforce it" },
+                    "queue_timeout_ms": { "type": "integer", "description": "how long the request may wait for a slot" },
+                    "cpu_millicores": { "type": "integer" },
+                    "processes": { "type": "integer" },
                     "session_id": { "type": "string", "description": "originating session id (metadata, not authorization)" },
                     "project_root": { "type": "string" }
                 },
@@ -197,12 +207,11 @@ fn call_tool(id: &Value, name: &str, args: &Value, allow_run: bool) -> String {
         Err(e) => return tool_error(id, &e.to_string()),
     };
     let text = match name {
-        "list_runs" | "get_run" | "read_run_output" | "start_run" | "cancel_run" => {
-            match run_tool(name, args, allow_run) {
-                Ok(text) => text,
-                Err(e) => return tool_error(id, &e.to_string()),
-            }
-        }
+        "list_runs" | "get_run" | "read_run_output" | "get_capacity" | "start_run"
+        | "cancel_run" => match run_tool(name, args, allow_run) {
+            Ok(text) => text,
+            Err(e) => return tool_error(id, &e.to_string()),
+        },
         "list_sessions" => match store.sessions() {
             Ok(s) => serde_json::to_string_pretty(
                 &s.iter()
@@ -378,6 +387,25 @@ fn run_tool(name: &str, args: &Value, allow_run: bool) -> std::io::Result<String
             if let Some(root) = args.get("project_root").and_then(Value::as_str) {
                 spec.project_root = Some(std::path::PathBuf::from(root));
             }
+            if let Some(mb) = args.get("memory_mb").and_then(Value::as_u64) {
+                spec.resources.memory_bytes = Some(mb.saturating_mul(1024 * 1024));
+            }
+            spec.resources.enforcement = match args.get("enforcement").and_then(Value::as_str) {
+                Some("monitored") => crate::model::run::Enforcement::Monitored,
+                Some("hard") => crate::model::run::Enforcement::Hard,
+                _ => crate::model::run::Enforcement::None,
+            };
+            spec.resources.cpu_millicores = args
+                .get("cpu_millicores")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            spec.resources.processes = args
+                .get("processes")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32);
+            if let Some(ms) = args.get("queue_timeout_ms").and_then(Value::as_u64) {
+                spec.resources.queue_timeout = Some(std::time::Duration::from_millis(ms.max(1)));
+            }
             if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
                 spec.session_id = Some(crate::model::session::RuntimeSessionId::from_u64(
                     u64::from_str_radix(sid, 16).unwrap_or(0),
@@ -388,6 +416,10 @@ fn run_tool(name: &str, args: &Value, allow_run: bool) -> std::io::Result<String
             let env: Vec<(String, String)> = std::env::vars().collect();
             let view = Client::new().start(&spec, &env)?;
             Ok(pretty(&serde_json::to_value(view)?))
+        }
+        "get_capacity" => {
+            client::ensure_supervisor()?;
+            Ok(pretty(&serde_json::to_value(Client::new().capacity()?)?))
         }
         "cancel_run" => {
             client::ensure_supervisor()?;

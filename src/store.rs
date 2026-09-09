@@ -12,8 +12,8 @@ use crate::classify::ownership::resolver::{AttributionDecision, Evidence, Eviden
 use crate::model::boot::{BootEpoch, BootId};
 use crate::model::process::ProcessIdentity;
 use crate::model::run::{
-    CleanupState, LogState, REQUEST_ID_WINDOW, RunId, RunOutcome, RunRecord, RunResult, RunSpec,
-    RunState, SessionOrigin,
+    CleanupState, EffectiveLimits, LogState, REQUEST_ID_WINDOW, RunId, RunOutcome, RunRecord,
+    RunResult, RunSpec, RunState, SessionOrigin,
 };
 use crate::model::session::RuntimeSessionId;
 use crate::trace;
@@ -23,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// One deferred trace line from inside a transaction. `reselect` names the
 /// primary key to re-read after commit for the post-image; when absent,
@@ -249,7 +249,11 @@ impl RuntimeStore {
                 log_stdout_bytes INTEGER NOT NULL DEFAULT 0,
                 log_stderr_bytes INTEGER NOT NULL DEFAULT 0,
                 log_stdout_truncated INTEGER NOT NULL DEFAULT 0,
-                log_stderr_truncated INTEGER NOT NULL DEFAULT 0
+                log_stderr_truncated INTEGER NOT NULL DEFAULT 0,
+                resources TEXT,
+                effective TEXT,
+                queue_wait_ms INTEGER,
+                limit_event TEXT
             );
             CREATE INDEX IF NOT EXISTS runs_request ON runs(request_id, created_at);
             CREATE INDEX IF NOT EXISTS runs_state ON runs(state);
@@ -287,6 +291,15 @@ impl RuntimeStore {
             "vendor_ended_at",
             "vendor_ended_at INTEGER",
         )?;
+        // v2 → v3: resource requests and what the backend actually applied.
+        for (column, ddl) in [
+            ("resources", "resources TEXT"),
+            ("effective", "effective TEXT"),
+            ("queue_wait_ms", "queue_wait_ms INTEGER"),
+            ("limit_event", "limit_event TEXT"),
+        ] {
+            self.add_column_if_missing("runs", column, ddl)?;
+        }
 
         // Older stores are migrated forward: every change so far is additive
         // (new tables, new nullable columns). A store written by a *newer*
@@ -1533,8 +1546,8 @@ impl RuntimeStore {
             "INSERT INTO runs (
                 request_id, fingerprint, argv, cwd, project_root, session_id,
                 session_origin, timeout_secs, grace_secs, log_limit_bytes,
-                state, cleanup, revision, supervisor, boot_id, created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                state, cleanup, revision, supervisor, boot_id, created_at, resources
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 spec.request_id,
                 fingerprint,
@@ -1557,6 +1570,7 @@ impl RuntimeStore {
                 supervisor,
                 boot_id.to_le_bytes().as_slice(),
                 now as i64,
+                serde_json::to_string(&spec.resources).map_err(err)?,
             ],
         )
         .map_err(err)?;
@@ -1609,6 +1623,39 @@ impl RuntimeStore {
                     started_at as i64,
                     id.0
                 ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Record what the backend actually applied, and how long the run waited
+    /// for a slot. Called at admission, before the command starts.
+    pub fn run_set_effective(
+        &mut self,
+        id: RunId,
+        effective: &EffectiveLimits,
+        queue_wait_ms: u64,
+    ) -> io::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET effective = ?1, queue_wait_ms = ?2 WHERE run_id = ?3",
+                params![
+                    serde_json::to_string(effective).map_err(err)?,
+                    queue_wait_ms as i64,
+                    id.0
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Record the last resource limit event (e.g. the monitored memory
+    /// threshold being crossed), so a finished run explains itself.
+    pub fn run_set_limit_event(&mut self, id: RunId, event: &str) -> io::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET limit_event = ?1 WHERE run_id = ?2",
+                params![event, id.0],
             )
             .map_err(err)?;
         Ok(())
@@ -1885,7 +1932,8 @@ const RUN_SELECT: &str = "SELECT
     timeout_secs, grace_secs, log_limit_bytes, state, outcome, exit_code, signal,
     cleanup, started_at, finished_at, duration_ms, detail, revision, supervisor,
     leader_boot_id, leader_pid, leader_start_time, created_at,
-    log_stdout_bytes, log_stderr_bytes, log_stdout_truncated, log_stderr_truncated
+    log_stdout_bytes, log_stderr_bytes, log_stdout_truncated, log_stderr_truncated,
+    resources, effective, queue_wait_ms, limit_event
     FROM runs";
 
 type RunRow = (
@@ -1918,6 +1966,10 @@ type RunRow = (
     i64,
     i64,
     i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
 );
 
 fn run_row(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
@@ -1951,6 +2003,10 @@ fn run_row(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         r.get(26)?,
         r.get(27)?,
         r.get(28)?,
+        r.get(29)?,
+        r.get(30)?,
+        r.get(31)?,
+        r.get(32)?,
     ))
 }
 
@@ -1985,6 +2041,10 @@ fn record_from_row(row: RunRow) -> io::Result<RunRecord> {
         stderr_bytes,
         stdout_truncated,
         stderr_truncated,
+        resources,
+        effective,
+        queue_wait_ms,
+        limit_event,
     ) = row;
 
     let argv: Vec<String> = serde_json::from_str(&argv).map_err(err)?;
@@ -2002,6 +2062,7 @@ fn record_from_row(row: RunRow) -> io::Result<RunRecord> {
         timeout: Duration::from_secs(timeout_secs as u64),
         grace: Duration::from_secs(grace_secs as u64),
         log_limit_bytes: log_limit_bytes as u64,
+        resources: serde_json::from_str(resources.as_deref().unwrap_or("{}")).map_err(err)?,
     };
     let state = RunState::parse(&state)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad run state"))?;
@@ -2043,6 +2104,9 @@ fn record_from_row(row: RunRow) -> io::Result<RunRecord> {
         created_at: created_at as u64,
         leader,
         supervisor,
+        effective: serde_json::from_str(effective.as_deref().unwrap_or("{}")).unwrap_or_default(),
+        queue_wait_ms: queue_wait_ms.unwrap_or(0).max(0) as u64,
+        limit_event,
     })
 }
 
@@ -2742,7 +2806,10 @@ mod tests {
             .unwrap();
         }
         let store = RuntimeStore::open(&path).unwrap();
-        assert_eq!(store.meta("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(
+            store.meta("schema_version").unwrap().as_deref(),
+            Some(SCHEMA_VERSION.to_string().as_str())
+        );
         // The runs tables exist and are usable after the migration.
         assert!(store.run_list(&RunFilter::default()).unwrap().is_empty());
 
