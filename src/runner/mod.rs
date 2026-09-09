@@ -2305,4 +2305,19 @@ mod tests {
         );
         wait(&sup, first.id);
     }
+    /// The wall clock is the backstop for a suspend: the monotonic clock
+    /// pauses while the machine sleeps, so a deadline that elapsed during
+    /// sleep must still read as elapsed after wake.
+    #[test]
+    fn a_wall_clock_jump_still_expires_a_deadline() {
+        let mono = Instant::now();
+        let slept = SystemTime::now() - Duration::from_secs(3600);
+        assert!(
+            elapsed(&mono, &slept) >= Duration::from_secs(3599),
+            "a monotonic clock that barely moved must not hide an hour of sleep"
+        );
+        // Without a jump the monotonic clock is the honest source.
+        let fresh = SystemTime::now();
+        assert!(elapsed(&mono, &fresh) < Duration::from_secs(1));
+    }
 }

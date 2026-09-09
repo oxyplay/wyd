@@ -310,12 +310,16 @@ impl Capability {
 /// part: macOS gets monitoring, not a hard limit, and says so.
 pub fn backend_capabilities() -> BackendCapabilities {
     let cgroup = crate::platform::cgroup_delegated();
-    // Capabilities are fixed when the supervisor starts, so say that a
-    // restart is needed: a client cannot silently get a different answer
-    // from a daemon that was started in another environment.
-    let no_cgroup = "no delegated cgroup v2 subtree; run wyd under a systemd unit \
-                     with Delegate=yes or set WYD_CGROUP_ROOT, then restart the \
-                     supervisor";
+    // The reason must name the right platform: telling a macOS user to enable
+    // systemd delegation is noise. Capabilities are fixed when the supervisor
+    // starts, so the Linux wording says a restart is needed.
+    let no_cgroup = if cfg!(target_os = "macos") {
+        "macOS has no cgroup v2: a hard aggregate limit needs a VM backend, \
+         which is not implemented"
+    } else {
+        "no delegated cgroup v2 subtree; run wyd under a systemd unit with \
+         Delegate=yes or set WYD_CGROUP_ROOT, then restart the supervisor"
+    };
     BackendCapabilities {
         queue: Capability::Available,
         process_group_cleanup: Capability::Available,
