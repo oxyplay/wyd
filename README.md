@@ -127,6 +127,8 @@ still there afterwards. Reads are durable and daemon-free — `wyd runs`,
 and the retained log files, so they work with no supervisor alive. Starting or
 cancelling a run needs the supervisor, which starts on demand and exits after
 five idle minutes; the next `wyd run` or `wyd mcp --allow-run` brings it back.
+`SIGTERM`/`SIGINT` to the supervisor stops its active runs first (up to 10s)
+instead of abandoning them.
 
 Exit codes: the command's own code when it exits, `128+signal` when it is
 signaled, `124` on timeout, `130` on cancel, `125` when the command could not

@@ -19,9 +19,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REFRESH: Duration = Duration::from_secs(2);
 /// Longest a client may take to send one request line.
@@ -32,6 +32,55 @@ const MAX_CLIENTS: usize = 64;
 /// A supervisor started on demand exits after this long without clients or
 /// runs. An explicit `wyd serve` never does.
 const IDLE_EXIT: Duration = Duration::from_secs(300);
+/// How long a graceful shutdown waits for active runs to stop.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Set by the SIGTERM/SIGINT handler (an atomic store is async-signal-safe).
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handler() {
+    // SAFETY: the handler only stores an atomic flag.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// On SIGTERM/SIGINT, stop the active runs first, then leave. A run that
+/// outlives the grace period is reported rather than silently abandoned; the
+/// next supervisor start recovers it as `supervisor_lost`.
+fn spawn_shutdown(supervisor: Arc<Supervisor>) {
+    thread::spawn(move || {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        let active = supervisor.active_runs();
+        if active > 0 {
+            eprintln!("wyd serve: stopping {active} active run(s)");
+            supervisor.cancel_all();
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            while supervisor.active_runs() > 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+            }
+            let left = supervisor.active_runs();
+            if left > 0 {
+                eprintln!("wyd serve: {left} run(s) still active; exiting anyway");
+            }
+        }
+        let _ = std::fs::remove_file(socket_path());
+        std::process::exit(0);
+    });
+}
 
 /// The Unix socket lives next to the state database.
 pub fn socket_path() -> PathBuf {
@@ -76,6 +125,8 @@ pub fn serve(auto: bool) -> std::io::Result<()> {
 
     let supervisor = Supervisor::open()?;
     thread::spawn(|| collect_loop(None));
+    install_signal_handler();
+    spawn_shutdown(Arc::clone(&supervisor));
 
     let clients = Arc::new(AtomicUsize::new(0));
     let last_seen = Arc::new(AtomicU64::new(now()));

@@ -77,7 +77,8 @@ impl RuntimeStore {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap_or_default();
         if !mode.eq_ignore_ascii_case("wal") {
-            conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(err)?;
+            conn.execute_batch("PRAGMA journal_mode=WAL;")
+                .map_err(err)?;
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL;")
             .map_err(err)?;

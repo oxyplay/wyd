@@ -108,9 +108,7 @@ impl RuntimeProvider for LocalProvider {
     fn snapshot(&self) -> RuntimeSnapshot {
         // The collector's first scan lands within a refresh interval; wait
         // briefly rather than reporting an empty machine.
-        self.sink
-            .latest(Duration::from_secs(5))
-            .unwrap_or_default()
+        self.sink.latest(Duration::from_secs(5)).unwrap_or_default()
     }
     fn explain(&self, pid: u32) -> Option<Value> {
         server::explain_pid(pid).ok()

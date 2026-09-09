@@ -401,6 +401,18 @@ impl Supervisor {
         self.view(id, Some(&slot), None)
     }
 
+    /// Ask every live run to stop. Used by a graceful supervisor shutdown so
+    /// active runs end as `cancelled` with a real cleanup report instead of
+    /// being discovered later as `supervisor_lost`.
+    pub fn cancel_all(&self) {
+        for slot in self.registry.lock().values() {
+            if !slot.is_terminal() {
+                slot.cancel.store(true, Ordering::SeqCst);
+                slot.cv.notify_all();
+            }
+        }
+    }
+
     fn slot_or_load(&self, id: RunId) -> io::Result<Option<Arc<RunSlot>>> {
         if let Some(slot) = self.registry.lock().get(&id) {
             return Ok(Some(Arc::clone(slot)));
@@ -1296,5 +1308,29 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("orphaned worker {worker} survived recovery");
+    }
+    #[test]
+    fn cancel_all_stops_every_live_run() {
+        let sup = sup("cancel-all");
+        let first = sup
+            .start(spec("cancel-all-1", "sleep 30"), Vec::new())
+            .unwrap();
+        let second = sup
+            .start(spec("cancel-all-2", "sleep 30"), Vec::new())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while [first.id, second.id]
+            .iter()
+            .any(|id| sup.get(*id, None, 0).unwrap().unwrap().state != RunState::Running)
+        {
+            assert!(Instant::now() < deadline, "runs never reached running");
+            thread::sleep(Duration::from_millis(10));
+        }
+        sup.cancel_all();
+        for id in [first.id, second.id] {
+            let view = wait(&sup, id);
+            assert_eq!(view.outcome, Some(RunOutcome::Cancelled));
+            assert_eq!(view.cleanup, CleanupState::Complete);
+        }
     }
 }
