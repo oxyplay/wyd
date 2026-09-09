@@ -3,7 +3,7 @@ use crate::model::{DockerSnapshot, ProcessInfo, RuntimeItem};
 use std::sync::Arc;
 
 /// Immutable view of runtime state produced by the scanners, read by the TUI.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RuntimeSnapshot {
     pub processes: Vec<ProcessInfo>,
     pub logical_items: Vec<RuntimeItem>,

@@ -75,7 +75,7 @@ pub fn serve(auto: bool) -> std::io::Result<()> {
     eprintln!("wyd serve on {} (local runtime API)", path.display());
 
     let supervisor = Supervisor::open()?;
-    thread::spawn(collect_loop);
+    thread::spawn(|| collect_loop(None));
 
     let clients = Arc::new(AtomicUsize::new(0));
     let last_seen = Arc::new(AtomicU64::new(now()));
@@ -132,14 +132,43 @@ fn spawn_idle_exit(supervisor: Arc<Supervisor>, last_seen: Arc<AtomicU64>) {
     });
 }
 
+/// The most recent collected snapshot, published for other in-process
+/// consumers so there is exactly one process scanner per process.
+#[derive(Debug, Default)]
+pub struct SnapshotSink {
+    slot: parking_lot::Mutex<Option<crate::model::RuntimeSnapshot>>,
+    ready: parking_lot::Condvar,
+}
+
+impl SnapshotSink {
+    fn publish(&self, snap: crate::model::RuntimeSnapshot) {
+        *self.slot.lock() = Some(snap);
+        self.ready.notify_all();
+    }
+
+    /// The latest snapshot, waiting up to `timeout` for the first one.
+    pub fn latest(&self, timeout: Duration) -> Option<crate::model::RuntimeSnapshot> {
+        let mut guard = self.slot.lock();
+        if guard.is_none() {
+            self.ready.wait_for(&mut guard, timeout);
+        }
+        guard.clone()
+    }
+}
+
 /// Collect + persist on a loop so the API stays fresh even with no TUI open.
-/// Shared by `wyd serve` and `wyd mcp`.
-pub fn collect_loop() {
+/// Shared by `wyd serve`, `wyd mcp` and `wyd web`. When a sink is given, this
+/// is the process's only scanner: consumers read the published snapshot
+/// instead of scanning again.
+pub fn collect_loop(sink: Option<Arc<SnapshotSink>>) {
     let mut tracker = OwnershipTracker::new();
     loop {
         let mut snap = collect::snapshot();
         tracker.record(&snap.processes, &snap.logical_items);
         tracker.layer_session_leftovers(&mut snap.logical_items, &snap.processes);
+        if let Some(sink) = &sink {
+            sink.publish(snap);
+        }
         thread::sleep(REFRESH);
     }
 }

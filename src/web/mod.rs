@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde_json::{Value, json};
 
 use crate::demo;
@@ -27,8 +27,7 @@ use crate::model::{
 };
 use crate::runner::RunView;
 use crate::runner::logs::{RunPaths, Stream, read_chunk};
-use crate::scanner::processes::SysinfoProcessScanner;
-use crate::server;
+use crate::server::{self, SnapshotSink};
 use crate::store::{RunFilter, RuntimeStore, SessionRecord};
 
 mod assets;
@@ -86,18 +85,15 @@ pub trait RuntimeProvider: Send + Sync + 'static {
 /// Local provider: reuses the existing store + ownership tracker.
 struct LocalProvider {
     store_path: PathBuf,
-    /// Persistent process scanner, so CPU usage is a real delta across the
-    /// dashboard's 2s polls (sysinfo needs two samples; a fresh scanner per
-    /// request would report 0 forever).
-    scanner: Mutex<SysinfoProcessScanner>,
+    /// The process collector's published snapshot. One scanner per process:
+    /// the dashboard reads what `collect_loop` already scanned instead of
+    /// running a second `System` beside it.
+    sink: Arc<SnapshotSink>,
 }
 
 impl LocalProvider {
-    fn new(store_path: PathBuf) -> Self {
-        Self {
-            store_path,
-            scanner: Mutex::new(SysinfoProcessScanner::new()),
-        }
+    fn new(store_path: PathBuf, sink: Arc<SnapshotSink>) -> Self {
+        Self { store_path, sink }
     }
 
     fn open_store(&self) -> io::Result<RuntimeStore> {
@@ -110,7 +106,11 @@ impl RuntimeProvider for LocalProvider {
         "local"
     }
     fn snapshot(&self) -> RuntimeSnapshot {
-        crate::collect::snapshot_with(&mut self.scanner.lock())
+        // The collector's first scan lands within a refresh interval; wait
+        // briefly rather than reporting an empty machine.
+        self.sink
+            .latest(Duration::from_secs(5))
+            .unwrap_or_default()
     }
     fn explain(&self, pid: u32) -> Option<Value> {
         server::explain_pid(pid).ok()
@@ -292,9 +292,13 @@ pub fn serve(opts: WebOptions) -> io::Result<()> {
         eprintln!("wyd web on http://{addr} (demo) — {DEMO_BANNER}");
         Arc::new(DemoProvider)
     } else {
-        thread::spawn(server::collect_loop);
+        let sink = Arc::new(SnapshotSink::default());
+        thread::spawn({
+            let sink = Arc::clone(&sink);
+            move || server::collect_loop(Some(sink))
+        });
         eprintln!("wyd web on http://{addr} (local)");
-        Arc::new(LocalProvider::new(RuntimeStore::default_path()))
+        Arc::new(LocalProvider::new(RuntimeStore::default_path(), sink))
     };
 
     let state = Arc::new(RwLock::new(WebState::new(provider.mode())));

@@ -26,7 +26,7 @@ pub fn serve_stdio(allow_run: bool) -> std::io::Result<()> {
     // Keep the store fresh while serving, even with no `wyd serve`/TUI open —
     // but only if no daemon is already collecting, to avoid duplicate writers.
     if !server::serve_alive() {
-        thread::spawn(server::collect_loop);
+        thread::spawn(|| server::collect_loop(None));
     }
 
     let stdin = std::io::stdin();
