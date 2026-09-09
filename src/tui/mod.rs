@@ -2034,6 +2034,8 @@ mod tests {
             queue_timeout: Some(Duration::from_secs(300)),
         };
         view.effective = EffectiveLimits {
+            cpu_millicores: None,
+            processes: None,
             memory_bytes: Some(512 << 20),
             enforcement: Enforcement::Monitored,
             metric: Some("sum of RSS over the process group, sampled every 200 ms".into()),

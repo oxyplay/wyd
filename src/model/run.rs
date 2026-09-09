@@ -309,14 +309,27 @@ impl Capability {
 /// What this build can do on this platform. The memory entry is the honest
 /// part: macOS gets monitoring, not a hard limit, and says so.
 pub fn backend_capabilities() -> BackendCapabilities {
+    let cgroup = crate::platform::cgroup_delegated();
+    // Capabilities are fixed when the supervisor starts, so say that a
+    // restart is needed: a client cannot silently get a different answer
+    // from a daemon that was started in another environment.
+    let no_cgroup = "no delegated cgroup v2 subtree; run wyd under a systemd unit \
+                     with Delegate=yes or set WYD_CGROUP_ROOT, then restart the \
+                     supervisor";
     BackendCapabilities {
         queue: Capability::Available,
         process_group_cleanup: Capability::Available,
-        aggregate_memory_limit: memory_capability(),
-        cpu_quota: Capability::unavailable("no cpu quota backend yet (Linux cgroup v2 planned)"),
-        process_limit: Capability::unavailable(
-            "no pids limit backend yet (Linux cgroup v2 planned)",
-        ),
+        aggregate_memory_limit: memory_capability(cgroup),
+        cpu_quota: if cgroup {
+            Capability::Available
+        } else {
+            Capability::unavailable(no_cgroup)
+        },
+        process_limit: if cgroup {
+            Capability::Available
+        } else {
+            Capability::unavailable(no_cgroup)
+        },
         filesystem_isolation: Capability::unavailable(
             "runs share the host filesystem; TMPDIR is a convenience, not a sandbox",
         ),
@@ -324,18 +337,25 @@ pub fn backend_capabilities() -> BackendCapabilities {
 }
 
 #[cfg(target_os = "macos")]
-fn memory_capability() -> Capability {
+fn memory_capability(_cgroup: bool) -> Capability {
     Capability::Monitored(
         "sum of RSS over the run's process group, sampled every 200 ms: shared pages can be counted more than once and a brief peak can be missed"
             .into(),
     )
 }
 
+/// Linux: a delegated cgroup gives a real `memory.max`; without one the
+/// capability is unavailable rather than merely observed.
 #[cfg(not(target_os = "macos"))]
-fn memory_capability() -> Capability {
-    Capability::unavailable(
-        "no hard aggregate memory backend yet: Linux cgroup v2 delegation is not implemented",
-    )
+fn memory_capability(cgroup: bool) -> Capability {
+    if cgroup {
+        Capability::Available
+    } else {
+        Capability::unavailable(
+            "no delegated cgroup v2 subtree; run wyd under a systemd unit with \
+             Delegate=yes or set WYD_CGROUP_ROOT",
+        )
+    }
 }
 
 /// One finished run plus its retained log state, as read back from storage.
@@ -416,6 +436,10 @@ pub struct ResourceRequest {
 pub struct EffectiveLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_millicores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processes: Option<u32>,
     pub enforcement: Enforcement,
     /// Where the numbers come from, e.g. "sum of RSS over the run's process
     /// group, sampled every 200 ms".

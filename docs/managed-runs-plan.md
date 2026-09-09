@@ -56,17 +56,34 @@ wyd capacity [--json] [--set key=value ...]
 - Deadline монотонный; wall-clock используется только как подстраховка от
   сна машины (остановка возможна раньше, никогда позже) и для истории.
 
+## Результаты cgroup v2 spike (§2.3)
+
+Проверено в контейнере (`scripts/linux-cgroup-e2e.sh`):
+
+- контроллеры включаются **по уровням**: `+memory +pids +cpu` в
+  `cgroup.subtree_control` каждого каталога, начиная с делегированного; в
+  cgroup с процессами включить их нельзя («no internal processes»), и мы
+  никогда не переносим чужие процессы, чтобы это обойти;
+- `memory.max`, `memory.swap.max` (0 при hard-лимите), `cpu.max`,
+  `pids.max` применяются и читаются обратно — `effective` показывает
+  принятые значения, а не запрошенные;
+- ребёнок входит в cgroup в `pre_exec` (fork → attach → exec), поэтому
+  `setsid`-потомок остаётся внутри: `cgroup.kill` его достаёт, а
+  `cleanup=complete` подтверждается пустотой cgroup;
+- OOM приписывается только по `memory.events` (`oom_kill>0`), не по факту
+  SIGKILL;
+- без делегирования discovery возвращает причину, capability =
+  `Unavailable`, hard-запрос отклоняется до spawn.
+
 ## Что осталось
 
 - **Linux проверен в контейнере** (`rust:1-slim-bookworm`, 2026-09-09):
-  244 + 3 теста зелёные, `clippy -D warnings` и `fmt --check` чисто.
-  Это не полноценный desktop-Linux: реальное делегирование cgroup,
-  sleep/resume и поведение под systemd остаются непроверенными.
+  246 + 3 теста зелёные, `clippy -D warnings` и `fmt --check` чисто, плюс
+  сквозной прогон cgroup-бэкенда (`scripts/linux-cgroup-e2e.sh`). Это не
+  desktop-Linux: делегирование делалось вручную, как это делает systemd,
+  поведение под реальным systemd user-менеджером не проверялось.
 - **Sleep/resume** проверяется только логикой подстраховки, без реального
   теста сна.
-- **Linux cgroup v2 backend не реализован.** `aggregate_memory_limit`,
-  `cpu_quota` и `process_limit` возвращают `Unavailable` с объяснением;
-  hard-запрос отклоняется до spawn, а не исполняется без лимита.
 - **macOS hard limits недоступны by design.** Память — `Monitored`
   (сумма RSS по process group, сэмпл каждые 200 ms), hard-запрос
   отклоняется до spawn. CPU/processes — advisory, бэкенда нет.
@@ -357,13 +374,15 @@ README: setup MCP, сценарий теста, таймаут, восстано
 ограниченными ресурсами, не на реальных агентных процессах пользователя.
 Команды качества: cargo build; cargo test; cargo clippy --all-targets -- -D warnings;
 cargo fmt --check. Проверить macOS и Linux; недоступный platform check явно отмечать.
-**Linux-прогон не сделан** — см. «Что осталось» выше.
+**Linux-прогон сделан** в контейнере (см. «Что осталось»): 246 + 3 теста,
+clippy/fmt чисто.
 
 ## Этап 2. Очередь и бюджеты ресурсов
 
 Статус: **реализован** (2026-09-09) в объёме ниже; §2.1–2.5 остаются
-спецификацией, фактические отклонения отмечены. Не реализовано: Linux
-cgroup v2 backend, macOS hard limits, реальный sleep/resume-тест, Linux-прогон.
+спецификацией, фактические отклонения отмечены. Не реализовано: macOS hard
+limits (by design), реальный sleep/resume-тест, прогон под настоящим
+systemd user-менеджером.
 
 Реализовано:
 
@@ -384,13 +403,23 @@ cgroup v2 backend, macOS hard limits, реальный sleep/resume-тест, Li
 - MCP `get_capacity`; WebMCP `get_capacity` и `GET /api/capacity`; очередь,
   резервации и наблюдаемое потребление показаны в TUI и web раздельно.
 
+Реализовано:
+
+- **Linux cgroup v2** — делегированный subtree (`WYD_CGROUP_ROOT` или
+  writable ancestor собственной cgroup): `memory.max`, `memory.swap.max`,
+  `cpu.max`, `pids.max`, `cgroup.kill`, чтение `memory.events`/
+  `cgroup.events`. Ребёнок входит в cgroup между fork и exec, поэтому
+  `setsid`-потомок остаётся внутри и убивается вместе с запуском.
+  Без делегирования capability = `Unavailable`, hard-запрос отклоняется.
+- **`cpu_millicores`/`processes`** — на Linux жёсткие (`cpu.max`,
+  `pids.max`); на macOS только запрос и отображение.
+
 Не реализовано и не должно подаваться как реализованное:
 
-- **Linux cgroup v2** — `aggregate_memory_limit`/`cpu_quota`/`process_limit`
-  = `Unavailable`; hard-запрос отклоняется до spawn.
 - **macOS hard limits** — недоступны by design; `aggregate_memory_limit` =
   `Monitored`, hard-запрос отклоняется до spawn.
-- **`cpu_millicores`/`processes`** — только запрос и отображение; бэкенда нет.
+- **Реальный systemd user-менеджер** — делегирование в тестах
+  подготовлено вручную, автоматического создания unit'а нет и не будет.
 
 ### 2.1. Цель и область действия
 
@@ -506,8 +535,8 @@ macOS: monitored policy явно обозначена, unsupported hard request 
 | 3 параллельных fixture (`sleep 3`) | supervisor RSS 26 MB; `running=2 queued=1 reserved=512 MiB` (per-project cap: все три в одном cwd) |
 | 100 завершённых runs | +2.6 MiB на диске, `state.db` 152 KiB, каталог логов ~0 (команды без вывода) |
 
-Linux-измерений нет: cgroup v2 enforcement не реализован, capability
-`Unavailable`. macOS hard limits недоступны by design и отклоняются до spawn.
+Linux-измерений нет (debug/release-сборка в контейнере, не эталонная машина).
+macOS hard limits недоступны by design и отклоняются до spawn.
 
 ## Дальнейший этап: одноразовые среды
 

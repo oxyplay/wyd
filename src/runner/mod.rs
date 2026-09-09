@@ -49,6 +49,72 @@ pub const MAX_WAIT_MS: u64 = 60_000;
 /// How often queued requests are checked for an expired queue deadline.
 const QUEUE_TICK: Duration = Duration::from_millis(250);
 
+/// What a cgroup actually accepted, in a platform-neutral shape.
+#[derive(Debug, Clone, Default)]
+struct CgroupApplied {
+    memory_max_bytes: Option<u64>,
+    cpu_max: Option<(u64, u64)>,
+    pids_max: Option<u64>,
+}
+
+/// One run's cgroup, or a no-op stand-in where cgroups do not exist. The
+/// wrapper keeps the run worker free of `cfg` branches.
+#[derive(Debug, Clone, Default)]
+struct RunCgroup {
+    #[cfg(target_os = "linux")]
+    inner: Option<crate::platform::cgroup::Cgroup>,
+}
+
+impl RunCgroup {
+    fn is_active(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// `cgroup.kill`: SIGKILL every process in the subtree, including one
+    /// that left the process group with `setsid`.
+    fn kill(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            return cg.kill();
+        }
+        Ok(())
+    }
+
+    fn populated(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            return cg.populated().unwrap_or(true);
+        }
+        false
+    }
+
+    /// Kernel OOM kills in this cgroup, if the kernel reports any.
+    fn oom_kills(&self) -> u64 {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            return cg.events().map(|e| e.oom_kill).unwrap_or(0);
+        }
+        0
+    }
+
+    /// Remove the cgroup. Only succeeds once it is empty, which is exactly
+    /// the cleanup evidence we want.
+    fn remove(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &self.inner {
+            return cg.remove();
+        }
+        Ok(())
+    }
+}
+
 /// Project key used for per-project admission: the project root when known,
 /// otherwise the working directory.
 fn project_key(spec: &RunSpec) -> String {
@@ -150,6 +216,9 @@ struct RunSlot {
     /// Last observed group usage, when the run is monitored.
     usage: Mutex<Option<pgroup::GroupUsage>>,
     limit_event: Mutex<Option<String>>,
+    /// True once the worker recorded what the backend really applied, so a
+    /// later `finish` does not overwrite it with the request.
+    effective_set: AtomicBool,
 }
 
 impl RunSlot {
@@ -342,6 +411,27 @@ impl Supervisor {
             identity: format!("{}:{}", std::process::id(), boot_id),
             capabilities: backend_capabilities(),
         });
+        #[cfg(target_os = "linux")]
+        if let Some(root) = crate::platform::cgroup_root() {
+            // Say where hard limits come from, so "why is memory unavailable?"
+            // has an answer without a debug build.
+            eprintln!(
+                "wyd: cgroup v2 subtree {} (controllers: {})",
+                root.path().display(),
+                root.controllers().join(" ")
+            );
+            // Empty run cgroups can survive a crashed supervisor; remove what
+            // is provably empty and leave the rest alone.
+            if let Ok(entries) = std::fs::read_dir(root.path()) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let is_run = entry.file_name().to_string_lossy().starts_with("run-");
+                    if is_run && std::fs::remove_dir(&path).is_ok() {
+                        eprintln!("wyd: removed stale cgroup {}", path.display());
+                    }
+                }
+            }
+        }
         supervisor.recover()?;
         supervisor.prune();
         supervisor.spawn_queue_tick();
@@ -437,6 +527,7 @@ impl Supervisor {
             queue_wait_ms: Mutex::new(0),
             usage: Mutex::new(None),
             limit_event: Mutex::new(None),
+            effective_set: AtomicBool::new(false),
         });
         self.registry.lock().insert(id, Arc::clone(&slot));
         self.db.lock().run_event(id, 0, "created", None, now)?;
@@ -454,6 +545,8 @@ impl Supervisor {
         };
         EffectiveLimits {
             memory_bytes: memory,
+            cpu_millicores: spec.resources.cpu_millicores,
+            processes: spec.resources.processes,
             enforcement,
             metric: (enforcement == Enforcement::Monitored).then(|| {
                 "sum of RSS over the run's process group, sampled every 200 ms".to_string()
@@ -535,6 +628,65 @@ impl Supervisor {
         if let Err(e) = spawned {
             eprintln!("wyd: cannot start worker for run {id}: {e}");
         }
+    }
+
+    /// Create the run's cgroup, apply the requested hard limits and arrange
+    /// for the child to enter it between fork and exec. Returns a no-op
+    /// handle when no delegated subtree exists.
+    #[cfg(target_os = "linux")]
+    fn setup_cgroup(
+        &self,
+        slot: &Arc<RunSlot>,
+        cmd: &mut Command,
+    ) -> io::Result<(RunCgroup, Option<CgroupApplied>)> {
+        use crate::platform::cgroup::{CgroupLimits, attach_self};
+        let Some(root) = crate::platform::cgroup_root() else {
+            return Ok((RunCgroup::default(), None));
+        };
+        let cg = root.create(&format!("run-{}", slot.id.0))?;
+        // Without a hard request the cgroup still earns its keep: membership
+        // catches descendants that leave the process group. No limits are
+        // written in that case.
+        let limits = if slot.spec.resources.enforcement == Enforcement::Hard {
+            CgroupLimits {
+                memory_max_bytes: slot.spec.resources.memory_bytes,
+                // A memory limit that swap can undo is not a hard limit.
+                memory_swap_max_bytes: slot.spec.resources.memory_bytes.map(|_| 0),
+                cpu_max: slot
+                    .spec
+                    .resources
+                    .cpu_millicores
+                    .map(|m| (u64::from(m) * 1000, 100_000)),
+                pids_max: slot.spec.resources.processes.map(u64::from),
+            }
+        } else {
+            CgroupLimits::default()
+        };
+        let applied = cg.apply(&limits)?;
+        let procs = cg.procs_cstr()?;
+        // SAFETY: `attach_self` only calls async-signal-safe functions and the
+        // path was validated before the fork.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(move || attach_self(&procs));
+        }
+        Ok((
+            RunCgroup { inner: Some(cg) },
+            Some(CgroupApplied {
+                memory_max_bytes: applied.memory_max_bytes,
+                cpu_max: applied.cpu_max,
+                pids_max: applied.pids_max,
+            }),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn setup_cgroup(
+        &self,
+        _slot: &Arc<RunSlot>,
+        _cmd: &mut Command,
+    ) -> io::Result<(RunCgroup, Option<CgroupApplied>)> {
+        Ok((RunCgroup::default(), None))
     }
 
     /// Expire queued requests whose queue deadline passed. Separate from the
@@ -774,6 +926,7 @@ impl Supervisor {
             queue_wait_ms: Mutex::new(record.queue_wait_ms),
             usage: Mutex::new(None),
             limit_event: Mutex::new(record.limit_event.clone()),
+            effective_set: AtomicBool::new(true),
         });
         Ok(Some(slot))
     }
@@ -1002,6 +1155,32 @@ impl Supervisor {
         let tmp = self.paths.tmp(id.0);
         cmd.env("TMPDIR", &tmp).env("TMP", &tmp).env("TEMP", &tmp);
         pgroup::isolate(&mut cmd);
+        // Linux: give the run its own cgroup under the delegated subtree, and
+        // put the child in it between fork and exec so everything it starts —
+        // including a setsid child — is inside the limit.
+        let (cgroup, applied) = match self.setup_cgroup(&slot, &mut cmd) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let hard = slot.spec.resources.enforcement == Enforcement::Hard;
+                let detail = format!("cgroup setup failed: {e}");
+                if hard {
+                    self.finish(
+                        &slot,
+                        RunOutcome::SpawnFailed,
+                        None,
+                        None,
+                        CleanupState::Complete,
+                        Some(detail),
+                        None,
+                    );
+                    return;
+                }
+                // No hard limit was promised: run anyway, with process-group
+                // cleanup only, and say so.
+                eprintln!("wyd: run {id}: {detail}; continuing without a cgroup");
+                (RunCgroup::default(), None)
+            }
+        };
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -1019,13 +1198,26 @@ impl Supervisor {
             }
         };
 
-        let effective = self.effective_limits(&slot.spec);
+        let mut effective = self.effective_limits(&slot.spec);
+        if cgroup.is_active() {
+            // Name the backend that actually holds the limit.
+            effective.backend = "cgroup_v2".into();
+        }
+        if let Some(applied) = &applied {
+            // Report what the kernel accepted, not what was asked for.
+            effective.memory_bytes = applied.memory_max_bytes;
+            effective.cpu_millicores = applied
+                .cpu_max
+                .map(|(quota, period)| (quota.saturating_mul(1000) / period.max(1)) as u32);
+            effective.processes = applied.pids_max.map(|v| v as u32);
+        }
         let queue_wait = slot.queue_wait_ms();
         *slot.queue_wait_ms.lock() = queue_wait;
         self.db
             .lock()
             .run_set_effective(id, &effective, queue_wait)
             .ok();
+        slot.effective_set.store(true, Ordering::SeqCst);
         let monitored_memory = match effective.enforcement {
             Enforcement::Monitored => effective.memory_bytes,
             _ => None,
@@ -1116,17 +1308,25 @@ impl Supervisor {
         let mut cleanup = CleanupState::Complete;
         if stop_reason.is_some() {
             // Timeout or cancel: run the one stop algorithm, then reap.
-            cleanup = self.stop_group(&slot, pgid, stop_reason == Some(RunOutcome::TimedOut));
+            cleanup = self.stop_group(
+                &slot,
+                pgid,
+                stop_reason == Some(RunOutcome::TimedOut),
+                &cgroup,
+            );
             if leader_status.is_none() {
                 leader_status = status_rx.recv_timeout(Duration::from_secs(5)).ok();
             }
-        } else if pgroup::group_alive(pgid) {
-            // The command exited but left processes behind in its group.
-            cleanup = self.stop_group(&slot, pgid, false);
+        } else if pgroup::group_alive(pgid) || cgroup.populated() {
+            // The command exited but left processes behind. With a cgroup the
+            // managed set is the cgroup, not just the process group: a
+            // descendant that called setsid is out of the group and still
+            // inside the cgroup, and must be stopped too.
+            cleanup = self.stop_group(&slot, pgid, false, &cgroup);
         }
         reaper.join().ok();
 
-        let outcome = match (stop_reason, &leader_status) {
+        let mut outcome = match (stop_reason, &leader_status) {
             (Some(reason), _) => reason,
             (None, Some(Ok(status))) => exit_outcome(*status),
             (None, _) => RunOutcome::Signaled,
@@ -1148,6 +1348,27 @@ impl Supervisor {
             }
         }
         let logs = *log_state.lock();
+
+        // Attribute an OOM only when the kernel says so: a SIGKILL on its own
+        // is not evidence.
+        let oom_kills = cgroup.oom_kills();
+        if oom_kills > 0 {
+            *slot.limit_event.lock() = Some(format!(
+                "the kernel OOM-killed {oom_kills} process(es) in the run's cgroup"
+            ));
+            if matches!(outcome, RunOutcome::Signaled | RunOutcome::Exited) {
+                outcome = RunOutcome::ResourceLimit;
+            }
+        }
+        if cgroup.is_active() {
+            // Only an empty cgroup can be removed. A just-killed descendant
+            // stays a zombie until it is reaped, so keep trying for a moment;
+            // anything still left is swept at the next supervisor start.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while cgroup.remove().is_err() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
 
         let detail = leader_status
             .as_ref()
@@ -1257,7 +1478,12 @@ impl Supervisor {
         let effective = self.effective_limits(&slot.spec);
         {
             let mut db = self.db.lock();
-            let _ = db.run_set_effective(slot.id, &effective, wait);
+            // A run that never spawned has no backend result to report; a run
+            // that did already recorded the real one, which must not be
+            // overwritten by the request.
+            if !slot.effective_set.load(Ordering::SeqCst) {
+                let _ = db.run_set_effective(slot.id, &effective, wait);
+            }
             if let Some(event) = slot.limit_event.lock().clone() {
                 let _ = db.run_set_limit_event(slot.id, &event);
             }
@@ -1301,7 +1527,13 @@ impl Supervisor {
     /// The one stop algorithm used by timeout, cancel and group-exit: mark
     /// stopping, SIGTERM the group, escalate after the grace period, then
     /// report how much of the group is really gone.
-    fn stop_group(&self, slot: &Arc<RunSlot>, pgid: u32, forced: bool) -> CleanupState {
+    fn stop_group(
+        &self,
+        slot: &Arc<RunSlot>,
+        pgid: u32,
+        forced: bool,
+        cgroup: &RunCgroup,
+    ) -> CleanupState {
         let reason = if forced { "timeout" } else { "stop" };
         self.transition(
             slot,
@@ -1312,31 +1544,39 @@ impl Supervisor {
         );
         self.sample_group(slot, pgid);
 
-        // Never signal a group we can no longer attribute to this run.
-        if !self.group_is_ours(slot, pgid) {
+        // Attribution: the process group is ours while a recorded member is
+        // alive; an active cgroup is ours by construction, and it also holds
+        // descendants that left the process group.
+        let group_is_ours = self.group_is_ours(slot, pgid);
+        if !group_is_ours && !cgroup.is_active() {
+            // Nothing verifiable remains: this pgid may have been reused, so
+            // signalling it could hit an unrelated process.
             return CleanupState::Unknown;
         }
-        pgroup::signal_group(pgid, libc::SIGTERM).ok();
 
+        if group_is_ours {
+            pgroup::signal_group(pgid, libc::SIGTERM).ok();
+        }
         let grace = slot.spec.grace.max(Duration::from_millis(50));
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
-            if !pgroup::group_alive(pgid) {
+            if !pgroup::group_alive(pgid) && !cgroup.populated() {
                 return CleanupState::Complete;
             }
             thread::sleep(Duration::from_millis(20));
         }
 
-        // Still there: escalate, but only while a member we recorded is
-        // alive. If nothing verifiable remains, this pgid may have been
-        // reused and we must not signal it.
-        if !self.group_is_ours(slot, pgid) {
-            return CleanupState::Unknown;
+        if cgroup.is_active() {
+            // `cgroup.kill` SIGKILLs every process in the subtree, including
+            // one that left the process group with setsid.
+            cgroup.kill().ok();
         }
-        pgroup::signal_group(pgid, libc::SIGKILL).ok();
+        if self.group_is_ours(slot, pgid) {
+            pgroup::signal_group(pgid, libc::SIGKILL).ok();
+        }
         let deadline = Instant::now() + KILL_GRACE;
         while Instant::now() < deadline {
-            if !pgroup::group_alive(pgid) {
+            if !pgroup::group_alive(pgid) && !cgroup.populated() {
                 return CleanupState::Complete;
             }
             thread::sleep(Duration::from_millis(20));

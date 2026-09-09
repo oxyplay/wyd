@@ -136,9 +136,16 @@ it is an observation, not a guarantee.
 
 On macOS there is no hard memory limit: `aggregate_memory_limit` is
 `monitored`, and `--enforce hard` is refused before the run is created rather
-than downgraded. On Linux the cgroup v2 backend is **not implemented**:
-`aggregate_memory_limit`, `cpu_quota` and `process_limit` report `unavailable`,
-so a hard request is refused there too.
+than downgraded. On Linux hard limits come from a **delegated cgroup v2
+subtree** (`memory.max`, `memory.swap.max`, `cpu.max`, `pids.max`), so
+`aggregate_memory_limit`, `cpu_quota` and `process_limit` report `available`
+when one exists. Without delegation they report `unavailable` and a `hard`
+request is refused — wyd never asks for root and never rewrites your systemd
+units. Put the supervisor in a unit with `Delegate=yes`, or point
+`WYD_CGROUP_ROOT` at a directory you own inside a delegated subtree, and
+restart the supervisor (capabilities are fixed at its start). Because cgroup
+membership is inherited by every descendant, a `setsid` child that escapes the
+process group is still inside the run's cgroup and is killed with it.
 
 Inspect or stop it afterwards:
 
@@ -220,9 +227,10 @@ Managed runs are local processes on macOS and Linux and nothing more:
   installs. Run untrusted code in a container or VM, not here.
 - A monitored memory limit is a policy, not a guarantee: a brief peak between
   two 200 ms samples is missed, and shared pages can be counted twice. Hard
-  memory, CPU and process-count limits are not available on this backend —
-  macOS monitors, and the Linux cgroup v2 backend is not implemented — so a
-  `hard` request is refused rather than approximated.
+  memory, CPU and process-count limits depend on the backend: macOS only
+  monitors, Linux enforces them through a delegated cgroup v2 subtree when one
+  is available — otherwise the capability reports `unavailable` and a `hard`
+  request is refused rather than approximated.
 - Reservations are a budget, not measured RAM: `reserved_memory_bytes` says
   what runs may use, `observed_memory_bytes` says what one run was seen using.
 

@@ -1049,6 +1049,8 @@ fn demo_view(r: &DemoRun, n: u64) -> RunView {
             // A request with no explicit amount still gets the configured
             // default reserved, so requested and effective legitimately differ.
             memory_bytes: Some(r.memory_bytes.unwrap_or(DEFAULT_RUN_MEMORY_BYTES)),
+            cpu_millicores: None,
+            processes: None,
             enforcement: r.enforcement,
             metric: (r.enforcement == Enforcement::Monitored).then(|| OBSERVED_METRIC.to_string()),
             backend: "process_group".into(),
