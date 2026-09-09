@@ -19,7 +19,10 @@ use std::thread;
 /// newer version gets this and must fall back).
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
-pub fn serve_stdio() -> std::io::Result<()> {
+/// Read tools are always available; the execution tools (`start_run`,
+/// `cancel_run`) exist only when the user launched this connection with
+/// `--allow-run`. The MCP surface is never a way around that choice.
+pub fn serve_stdio(allow_run: bool) -> std::io::Result<()> {
     // Keep the store fresh while serving, even with no `wyd serve`/TUI open —
     // but only if no daemon is already collecting, to avoid duplicate writers.
     if !server::serve_alive() {
@@ -40,7 +43,7 @@ pub fn serve_stdio() -> std::io::Result<()> {
             Ok(v) => v,
             Err(_) => continue, // malformed line: ignore
         };
-        let Some(resp) = handle(&msg) else {
+        let Some(resp) = handle(&msg, allow_run) else {
             continue; // notification
         };
         let mut out = stdout.lock();
@@ -52,7 +55,7 @@ pub fn serve_stdio() -> std::io::Result<()> {
 /// Process one JSON-RPC message. Returns `Some(response)` for requests,
 /// `None` for notifications (JSON-RPC: a notification has no id and must
 /// never be answered).
-fn handle(msg: &Value) -> Option<String> {
+fn handle(msg: &Value, allow_run: bool) -> Option<String> {
     let id = msg.get("id")?.clone(); // no id → notification → no response
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
@@ -73,7 +76,7 @@ fn handle(msg: &Value) -> Option<String> {
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "tools": tools() }
+                "result": { "tools": tools(allow_run) }
             })
             .to_string(),
         ),
@@ -81,7 +84,7 @@ fn handle(msg: &Value) -> Option<String> {
             let params = msg.get("params").cloned().unwrap_or(json!({}));
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            Some(call_tool(&id, name, &args))
+            Some(call_tool(&id, name, &args, allow_run))
         }
         // Unknown request method: a proper JSON-RPC error, not a tool-style
         // isError result.
@@ -96,8 +99,8 @@ fn handle(msg: &Value) -> Option<String> {
     }
 }
 
-fn tools() -> Vec<Value> {
-    vec![
+fn tools(allow_run: bool) -> Vec<Value> {
+    let mut tools = vec![
         json!({
             "name": "list_sessions",
             "description": "List recorded coding-agent runtime sessions (id, agent, project, state, started_at).",
@@ -112,15 +115,94 @@ fn tools() -> Vec<Value> {
                 "required": ["pid"]
             }
         }),
-    ]
+        json!({
+            "name": "list_runs",
+            "description": "List managed runs started through wyd (id, state, command, duration).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string", "description": "queued|starting|running|stopping|finished" },
+                    "project": { "type": "string", "description": "absolute project root" },
+                    "session": { "type": "string", "description": "session id (hex)" },
+                    "limit": { "type": "integer" }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "get_run",
+            "description": "Get one managed run's state, result and cleanup report. Optionally waits for a newer revision.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "after_revision": { "type": "integer", "description": "wait for a revision newer than this" },
+                    "wait_ms": { "type": "integer", "description": "bounded wait, max 60000" }
+                },
+                "required": ["run_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "read_run_output",
+            "description": "Read a bounded chunk of a run's captured stdout or stderr from a byte cursor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "stream": { "type": "string", "description": "stdout|stderr" },
+                    "cursor": { "type": "integer" },
+                    "max_bytes": { "type": "integer" }
+                },
+                "required": ["run_id"],
+                "additionalProperties": false
+            }
+        }),
+    ];
+    if allow_run {
+        tools.push(json!({
+            "name": "start_run",
+            "description": "Start a command on the HOST through wyd's supervisor (not sandboxed). Returns a run id; execution continues even if this connection drops.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string", "description": "idempotency key" },
+                    "argv": { "type": "array", "items": { "type": "string" }, "description": "executable and arguments, no implicit shell" },
+                    "cwd": { "type": "string", "description": "absolute working directory" },
+                    "timeout_ms": { "type": "integer" },
+                    "session_id": { "type": "string", "description": "originating session id (metadata, not authorization)" },
+                    "project_root": { "type": "string" }
+                },
+                "required": ["request_id", "argv", "cwd"],
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "cancel_run",
+            "description": "Ask a run to stop. Idempotent: repeating it returns the current status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "run_id": { "type": "string" } },
+                "required": ["run_id"],
+                "additionalProperties": false
+            }
+        }));
+    }
+    tools
 }
 
-fn call_tool(id: &Value, name: &str, args: &Value) -> String {
+fn call_tool(id: &Value, name: &str, args: &Value, allow_run: bool) -> String {
     let store = match RuntimeStore::open(&RuntimeStore::default_path()) {
         Ok(s) => s,
         Err(e) => return tool_error(id, &e.to_string()),
     };
     let text = match name {
+        "list_runs" | "get_run" | "read_run_output" | "start_run" | "cancel_run" => {
+            match run_tool(name, args, allow_run) {
+                Ok(text) => text,
+                Err(e) => return tool_error(id, &e.to_string()),
+            }
+        }
         "list_sessions" => match store.sessions() {
             Ok(s) => serde_json::to_string_pretty(
                 &s.iter()
@@ -156,6 +238,182 @@ fn call_tool(id: &Value, name: &str, args: &Value) -> String {
     .to_string()
 }
 
+/// Managed-run tools. Read tools work on any connection; `start_run` and
+/// `cancel_run` require `--allow-run`, and the gate is checked here, not in
+/// the schema alone.
+fn run_tool(name: &str, args: &Value, allow_run: bool) -> std::io::Result<String> {
+    use crate::model::run::RunSpec;
+    use crate::runner::client::{self, Client};
+
+    match name {
+        "start_run" if !allow_run => {
+            return Err(std::io::Error::other(
+                "start_run is disabled: restart wyd mcp with --allow-run",
+            ));
+        }
+        "cancel_run" if !allow_run => {
+            return Err(std::io::Error::other(
+                "cancel_run is disabled: restart wyd mcp with --allow-run",
+            ));
+        }
+        _ => {}
+    }
+
+    let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into());
+    match name {
+        "list_runs" => {
+            // Durable read: works with or without a live supervisor.
+            let store = RuntimeStore::open(&RuntimeStore::default_path())?;
+            let filter = crate::store::RunFilter {
+                project: args
+                    .get("project")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                session: args.get("session").and_then(Value::as_str).map(|s| {
+                    crate::model::session::RuntimeSessionId::from_u64(
+                        u64::from_str_radix(s, 16).unwrap_or(0),
+                    )
+                }),
+                state: args
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .and_then(crate::model::run::RunState::parse),
+                limit: args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize),
+            };
+            let runs: Vec<crate::runner::RunView> = store
+                .run_list(&filter)?
+                .iter()
+                .map(crate::runner::RunView::from_record)
+                .collect();
+            Ok(pretty(&serde_json::to_value(runs)?))
+        }
+        "get_run" => {
+            let id = run_id_arg(args)?;
+            if !crate::server::serve_alive() {
+                // No supervisor: a finished run is still readable.
+                let store = RuntimeStore::open(&RuntimeStore::default_path())?;
+                return Ok(match store.run_get(id)? {
+                    Some(record) => pretty(&serde_json::to_value(
+                        crate::runner::RunView::from_record(&record),
+                    )?),
+                    None => "null".into(),
+                });
+            }
+            let after = args.get("after_revision").and_then(Value::as_i64);
+            let wait = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+            match Client::new().get(id, after, wait)? {
+                Some(view) => Ok(pretty(&serde_json::to_value(view)?)),
+                None => Ok("null".into()),
+            }
+        }
+        "read_run_output" => {
+            let id = run_id_arg(args)?;
+            let stream = match args.get("stream").and_then(Value::as_str) {
+                Some("stderr") => crate::runner::logs::Stream::Stderr,
+                _ => crate::runner::logs::Stream::Stdout,
+            };
+            let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+            let max_bytes = args
+                .get("max_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(64 * 1024)
+                .clamp(1, 1024 * 1024) as usize;
+            if crate::server::serve_alive() {
+                return Ok(pretty(
+                    &Client::new().output(id, stream, cursor, max_bytes)?,
+                ));
+            }
+            // No supervisor: the retained file is still readable, so reading
+            // a finished run's output never needs a daemon.
+            let store = RuntimeStore::open(&RuntimeStore::default_path())?;
+            let Some(record) = store.run_get(id)? else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("run {id} not found"),
+                ));
+            };
+            let paths = crate::runner::logs::RunPaths::new(
+                RuntimeStore::default_path().with_file_name("runs"),
+            );
+            let chunk = crate::runner::logs::read_chunk(
+                &paths.stream_file(id.0, stream),
+                cursor,
+                max_bytes,
+            )?;
+            let truncated = match stream {
+                crate::runner::logs::Stream::Stdout => record.logs.stdout_truncated,
+                crate::runner::logs::Stream::Stderr => record.logs.stderr_truncated,
+            };
+            Ok(pretty(&json!({
+                "stream": stream.as_str(),
+                "data": chunk.data,
+                "next_cursor": chunk.next_cursor,
+                "truncated": truncated,
+                "eof": chunk.eof,
+            })))
+        }
+        "start_run" => {
+            client::ensure_supervisor()?;
+            let argv: Vec<String> = serde_json::from_value(
+                args.get("argv")
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::other("argv is required"))?,
+            )
+            .map_err(|e| std::io::Error::other(format!("argv must be a string array: {e}")))?;
+            let cwd = args
+                .get("cwd")
+                .and_then(Value::as_str)
+                .ok_or_else(|| std::io::Error::other("cwd is required"))?;
+            let request_id = args
+                .get("request_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| std::io::Error::other("request_id is required"))?;
+            let mut spec = RunSpec::new(request_id, argv, std::path::PathBuf::from(cwd));
+            if let Some(ms) = args.get("timeout_ms").and_then(Value::as_u64) {
+                spec.timeout = std::time::Duration::from_millis(ms.max(1));
+            }
+            if let Some(root) = args.get("project_root").and_then(Value::as_str) {
+                spec.project_root = Some(std::path::PathBuf::from(root));
+            }
+            if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+                spec.session_id = Some(crate::model::session::RuntimeSessionId::from_u64(
+                    u64::from_str_radix(sid, 16).unwrap_or(0),
+                ));
+                spec.session_origin = crate::runner::caller_session(spec.session_id);
+            }
+            // The connection's own environment, never a stale daemon env.
+            let env: Vec<(String, String)> = std::env::vars().collect();
+            let view = Client::new().start(&spec, &env)?;
+            Ok(pretty(&serde_json::to_value(view)?))
+        }
+        "cancel_run" => {
+            client::ensure_supervisor()?;
+            let id = run_id_arg(args)?;
+            match Client::new().cancel(id)? {
+                Some(view) => Ok(pretty(&serde_json::to_value(view)?)),
+                None => Ok("null".into()),
+            }
+        }
+        other => Err(std::io::Error::other(format!("unknown run tool {other:?}"))),
+    }
+}
+
+fn run_id_arg(args: &Value) -> std::io::Result<crate::model::run::RunId> {
+    let raw = args
+        .get("run_id")
+        .ok_or_else(|| std::io::Error::other("run_id is required"))?;
+    let id = match raw {
+        Value::String(s) => s.parse::<i64>().ok(),
+        Value::Number(n) => n.as_i64(),
+        _ => None,
+    }
+    .ok_or_else(|| std::io::Error::other("run_id must be a decimal id"))?;
+    Ok(crate::model::run::RunId(id))
+}
+
 fn tool_error(id: &Value, msg: &str) -> String {
     json!({
         "jsonrpc": "2.0",
@@ -171,7 +429,7 @@ mod tests {
 
     fn handle_msg(line: &str) -> Option<String> {
         let v: Value = serde_json::from_str(line).unwrap();
-        handle(&v)
+        handle(&v, false)
     }
 
     #[test]

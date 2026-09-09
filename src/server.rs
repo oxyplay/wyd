@@ -1,25 +1,40 @@
-//! `wyd serve`: a local Unix-socket API over the ownership store
+//! `wyd serve`: the local supervisor and ownership API over a Unix socket
 //! (contract §15–16). Keeps the store fresh by running the collector on a
-//! loop, and serves line-delimited JSON requests (read + vendor registration)
-//! to local clients.
+//! loop, serves line-delimited JSON requests to local clients, and owns every
+//! managed run's process groups.
+//!
+//! The socket is 0600 in the user's state directory and the protocol is
+//! line-delimited JSON: `{"cmd": ...}` in, `{"ok":...}` out. It is not, and
+//! must never become, a TCP shell service.
 
 use crate::collect::{self, OwnershipTracker};
 use crate::model::process::ProcessIdentity;
 use crate::platform::{BootIdentityProvider, SystemBoot};
+use crate::runner::{Supervisor, logs::Stream};
 use crate::scanner::{ProcessScanner, processes::SysinfoProcessScanner};
 use crate::store::RuntimeStore;
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
 const REFRESH: Duration = Duration::from_secs(2);
+/// Longest a client may take to send one request line.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Concurrent connection threads. A stuck client occupies one, never the
+/// acceptor.
+const MAX_CLIENTS: usize = 64;
+/// A supervisor started on demand exits after this long without clients or
+/// runs. An explicit `wyd serve` never does.
+const IDLE_EXIT: Duration = Duration::from_secs(300);
 
 /// The Unix socket lives next to the state database.
-fn socket_path() -> PathBuf {
+pub fn socket_path() -> PathBuf {
     RuntimeStore::default_path().with_file_name("wyd.sock")
 }
 
@@ -36,10 +51,12 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run the daemon: a background collector loop plus a Unix-socket acceptor.
-/// Single-instance: refuses to start if another `wyd serve` is already
-/// listening on the socket, instead of silently replacing it.
-pub fn serve() -> std::io::Result<()> {
+/// Run the daemon: a background collector loop, a Unix-socket acceptor and
+/// the run supervisor. Single-instance: refuses to start if another
+/// `wyd serve` is already listening on the socket, instead of silently
+/// replacing it. `auto` marks a supervisor started on demand by a client; it
+/// exits once idle, while an explicit `wyd serve` stays in the foreground.
+pub fn serve(auto: bool) -> std::io::Result<()> {
     let path = socket_path();
     if serve_alive() {
         eprintln!("wyd serve already running ({})", path.display());
@@ -47,6 +64,9 @@ pub fn serve() -> std::io::Result<()> {
     }
     let _ = std::fs::remove_file(&path); // stale socket from a dead run
     let pid_path = RuntimeStore::default_path().with_file_name("wyd.pid");
+    if let Some(dir) = pid_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
     let listener = UnixListener::bind(&path)?;
@@ -54,17 +74,62 @@ pub fn serve() -> std::io::Result<()> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("wyd serve on {} (local runtime API)", path.display());
 
+    let supervisor = Supervisor::open()?;
     thread::spawn(collect_loop);
 
+    let clients = Arc::new(AtomicUsize::new(0));
+    let last_seen = Arc::new(AtomicU64::new(now()));
+    if auto {
+        spawn_idle_exit(Arc::clone(&supervisor), Arc::clone(&last_seen));
+    }
+
     for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let _ = handle(s);
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept: {e}");
+                continue;
             }
-            Err(e) => eprintln!("accept: {e}"),
+        };
+        if clients.load(Ordering::SeqCst) >= MAX_CLIENTS {
+            // Refuse rather than queue: a stuck client must not stall others.
+            let mut stream = stream;
+            let _ = writeln!(
+                stream,
+                "{}",
+                err_json("too many concurrent clients; try again")
+            );
+            continue;
         }
+        clients.fetch_add(1, Ordering::SeqCst);
+        let supervisor = Arc::clone(&supervisor);
+        let clients = Arc::clone(&clients);
+        let last_seen = Arc::clone(&last_seen);
+        thread::spawn(move || {
+            if let Err(e) = handle(stream, &supervisor) {
+                eprintln!("client: {e}");
+            }
+            last_seen.store(now(), Ordering::SeqCst);
+            clients.fetch_sub(1, Ordering::SeqCst);
+        });
     }
     Ok(())
+}
+
+/// Exit an on-demand supervisor once nothing needs it. Active runs keep it
+/// alive: a client disconnecting must never stop a run.
+fn spawn_idle_exit(supervisor: Arc<Supervisor>, last_seen: Arc<AtomicU64>) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            if supervisor.active_runs() > 0 {
+                continue;
+            }
+            if now().saturating_sub(last_seen.load(Ordering::SeqCst)) >= IDLE_EXIT.as_secs() {
+                std::process::exit(0);
+            }
+        }
+    });
 }
 
 /// Collect + persist on a loop so the API stays fresh even with no TUI open.
@@ -79,35 +144,64 @@ pub fn collect_loop() {
     }
 }
 
-fn handle(stream: UnixStream) -> std::io::Result<()> {
+fn handle(stream: UnixStream, supervisor: &Arc<Supervisor>) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    // Bounded read: a client cannot make the daemon buffer unbounded input.
+    if reader
+        .by_ref()
+        .take(crate::model::run::MAX_REQUEST_BYTES as u64)
+        .read_line(&mut line)?
+        == 0
+    {
         return Ok(()); // client closed
     }
-    let mut store = match RuntimeStore::open(&RuntimeStore::default_path()) {
-        Ok(s) => s,
-        Err(e) => {
-            let mut w = stream;
-            writeln!(w, "{}", err_json(&e.to_string()))?;
-            return Ok(());
-        }
+    let resp = match RuntimeStore::open(&RuntimeStore::default_path()) {
+        Ok(mut store) => dispatch(&mut store, supervisor, &line),
+        Err(e) => err_json(&e.to_string()),
     };
-    let resp = dispatch(&mut store, &line);
     let mut w = stream;
     writeln!(w, "{resp}")?;
     Ok(())
 }
 
-/// Parse one request line and answer from the store. `&mut` because `explain`
-/// resolves (and may persist) the boot id.
-fn dispatch(store: &mut RuntimeStore, line: &str) -> String {
+/// Parse one request line and answer it. `&mut` because `explain` resolves
+/// (and may persist) the boot id. Run commands go to the supervisor, which
+/// owns the process groups; everything else reads the ownership store.
+fn dispatch(store: &mut RuntimeStore, supervisor: &Arc<Supervisor>, line: &str) -> String {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(e) => return err_json(&e.to_string()),
     };
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("");
     match cmd {
+        "ping" => ok_json(json!({
+            "pong": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "supervisor": supervisor.identity(),
+        })),
+        "capabilities" => ok_json(json!({ "capabilities": supervisor.capabilities() })),
+        "start_run" => match start_run(supervisor, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
+        "get_run" => match get_run(supervisor, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
+        "read_run_output" => match read_run_output(supervisor, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
+        "list_runs" => match list_runs(supervisor, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
+        "cancel_run" => match cancel_run(supervisor, &req) {
+            Ok(v) => ok_json(v),
+            Err(e) => err_json(&e.to_string()),
+        },
         "list_sessions" => match store.sessions() {
             Ok(s) => ok_json(json!({
                 "sessions": s.iter().map(session_json).collect::<Vec<_>>()
@@ -142,6 +236,102 @@ fn dispatch(store: &mut RuntimeStore, line: &str) -> String {
         },
         other => err_json(&format!("unknown command {other:?}")),
     }
+}
+
+fn start_run(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Value> {
+    let spec: crate::model::run::RunSpec = serde_json::from_value(
+        req.get("spec")
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("start_run needs a spec"))?,
+    )
+    .map_err(|e| std::io::Error::other(format!("bad spec: {e}")))?;
+    let env: Vec<(String, String)> = match req.get("env") {
+        Some(Value::Array(_)) => serde_json::from_value(req["env"].clone())
+            .map_err(|e| std::io::Error::other(format!("bad env: {e}")))?,
+        _ => Vec::new(),
+    };
+    let started = supervisor.start(spec, env)?;
+    let view = supervisor.get(started.id, None, 0)?;
+    Ok(json!({ "run": view, "created": started.created }))
+}
+
+fn run_id_arg(req: &Value) -> std::io::Result<crate::model::run::RunId> {
+    let raw = req
+        .get("run_id")
+        .ok_or_else(|| std::io::Error::other("run_id is required"))?;
+    let id: i64 = match raw {
+        Value::String(s) => s.parse::<i64>().ok(),
+        Value::Number(n) => n.as_i64(),
+        _ => None,
+    }
+    .ok_or_else(|| std::io::Error::other("run_id must be a decimal id"))?;
+    Ok(crate::model::run::RunId(id))
+}
+
+fn get_run(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Value> {
+    let id = run_id_arg(req)?;
+    let after = req.get("after_revision").and_then(Value::as_i64);
+    let wait_ms = req.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+    Ok(json!({ "run": supervisor.get(id, after, wait_ms)? }))
+}
+
+fn read_run_output(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Value> {
+    let id = run_id_arg(req)?;
+    let stream = req
+        .get("stream")
+        .and_then(Value::as_str)
+        .and_then(Stream::parse)
+        .ok_or_else(|| std::io::Error::other("stream must be stdout or stderr"))?;
+    let cursor = req.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+    // Bounded chunk: a client cannot ask for unbounded memory.
+    let max_bytes = req
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(64 * 1024)
+        .clamp(1, 1024 * 1024) as usize;
+    match supervisor.output(id, stream, cursor, max_bytes)? {
+        Some(chunk) => Ok(json!({
+            "stream": stream.as_str(),
+            "data": chunk.data,
+            "next_cursor": chunk.next_cursor,
+            "truncated": chunk.truncated,
+            "eof": chunk.eof,
+        })),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("run {id} not found"),
+        )),
+    }
+}
+
+fn list_runs(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Value> {
+    let filter = req.get("filter").cloned().unwrap_or(json!({}));
+    let mut f = crate::store::RunFilter {
+        project: filter
+            .get("project")
+            .and_then(Value::as_str)
+            .map(String::from),
+        state: filter
+            .get("state")
+            .and_then(Value::as_str)
+            .and_then(crate::model::run::RunState::parse),
+        limit: filter
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize),
+        session: None,
+    };
+    if let Some(sid) = filter.get("session").and_then(Value::as_str) {
+        f.session = Some(crate::model::session::RuntimeSessionId::from_u64(
+            u64::from_str_radix(sid, 16).unwrap_or(0),
+        ));
+    }
+    Ok(json!({ "runs": supervisor.list(&f)? }))
+}
+
+fn cancel_run(supervisor: &Arc<Supervisor>, req: &Value) -> std::io::Result<Value> {
+    let id = run_id_arg(req)?;
+    Ok(json!({ "run": supervisor.cancel(id)? }))
 }
 
 /// Vendor registers an agent session (contract §17). Resolves the pid to a
@@ -250,6 +440,11 @@ mod tests {
     use super::*;
     use crate::model::boot::BootId;
 
+    fn test_supervisor() -> Arc<Supervisor> {
+        let root = std::env::temp_dir().join(format!("wyd-server-test-{}", std::process::id()));
+        crate::runner::for_tests(&root).unwrap()
+    }
+
     fn proc(
         pid: u32,
         ppid: Option<u32>,
@@ -274,6 +469,7 @@ mod tests {
     #[test]
     fn dispatch_lists_sessions() {
         let mut store = RuntimeStore::open_in_memory().unwrap();
+        let sup = test_supervisor();
         let procs = vec![
             proc(1, None, "launchd", &["launchd"], 1),
             proc(100, Some(1), "omp", &["omp"], 1000),
@@ -287,7 +483,7 @@ mod tests {
         let out = crate::classify::ownership::derive_ownership(&items, &ids, 2000);
         store.apply_ownership(&out, 2000).unwrap();
 
-        let resp = dispatch(&mut store, "{\"cmd\":\"list_sessions\"}");
+        let resp = dispatch(&mut store, &sup, "{\"cmd\":\"list_sessions\"}");
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["data"]["sessions"][0]["agent"], "omp");
@@ -296,7 +492,8 @@ mod tests {
     #[test]
     fn dispatch_rejects_unknown_command() {
         let mut store = RuntimeStore::open_in_memory().unwrap();
-        let resp = dispatch(&mut store, "{\"cmd\":\"rm -rf /\"}");
+        let sup = test_supervisor();
+        let resp = dispatch(&mut store, &sup, "{\"cmd\":\"rm -rf /\"}");
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["ok"], false);
     }

@@ -11,6 +11,10 @@ use crate::classify::ownership::OwnershipResult;
 use crate::classify::ownership::resolver::{AttributionDecision, Evidence, EvidenceKind};
 use crate::model::boot::{BootEpoch, BootId};
 use crate::model::process::ProcessIdentity;
+use crate::model::run::{
+    CleanupState, LogState, REQUEST_ID_WINDOW, RunId, RunOutcome, RunRecord, RunResult, RunSpec,
+    RunState, SessionOrigin,
+};
 use crate::model::session::RuntimeSessionId;
 use crate::trace;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -19,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// One deferred trace line from inside a transaction. `reselect` names the
 /// primary key to re-read after commit for the post-image; when absent,
@@ -65,8 +69,17 @@ impl RuntimeStore {
         let conn = Connection::open(path).map_err(err)?;
         conn.busy_timeout(Duration::from_secs(2)).map_err(err)?;
         // WAL: concurrent readers (TUI/CLI/MCP) don't block the writer, and
-        // the writer (serve/tracker) doesn't block readers.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        // the writer (serve/tracker) doesn't block readers. Ask first: setting
+        // the mode on a database that is already WAL can fail with
+        // SQLITE_BUSY while another connection is writing, which would make
+        // every read path fail for no reason.
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap_or_default();
+        if !mode.eq_ignore_ascii_case("wal") {
+            conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(err)?;
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")
             .map_err(err)?;
         let store = Self { conn };
         store.init()?;
@@ -100,6 +113,30 @@ impl RuntimeStore {
     }
 
     fn init(&self) -> io::Result<()> {
+        // Opening the store is the common path for every read (TUI, CLI, MCP
+        // tool call), so it must not take a write lock once the schema is
+        // current — a concurrent collector would otherwise show up as
+        // "database is locked". The DDL and migrations run only when the
+        // recorded version says they are needed.
+        let version = self
+            .meta("schema_version")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok());
+        match version {
+            Some(v) if v > SCHEMA_VERSION => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "state.db schema version {v} is newer than supported {SCHEMA_VERSION}; \
+                         upgrade wyd or remove the file"
+                    ),
+                ));
+            }
+            Some(v) if v == SCHEMA_VERSION => return Ok(()),
+            _ => {}
+        }
+
         self.conn
             .execute_batch(
                 "BEGIN;
@@ -180,6 +217,59 @@ impl RuntimeStore {
                 vendor_ended_at INTEGER,
                 PRIMARY KEY (vendor, vendor_session_id)
             );
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                argv TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                project_root TEXT,
+                session_id INTEGER,
+                session_origin TEXT NOT NULL,
+                timeout_secs INTEGER NOT NULL,
+                grace_secs INTEGER NOT NULL,
+                log_limit_bytes INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                outcome TEXT,
+                exit_code INTEGER,
+                signal INTEGER,
+                cleanup TEXT NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                duration_ms INTEGER,
+                detail TEXT,
+                revision INTEGER NOT NULL,
+                supervisor TEXT,
+                boot_id BLOB,
+                leader_boot_id BLOB,
+                leader_pid INTEGER,
+                leader_start_time INTEGER,
+                created_at INTEGER NOT NULL,
+                log_stdout_bytes INTEGER NOT NULL DEFAULT 0,
+                log_stderr_bytes INTEGER NOT NULL DEFAULT 0,
+                log_stdout_truncated INTEGER NOT NULL DEFAULT 0,
+                log_stderr_truncated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS runs_request ON runs(request_id, created_at);
+            CREATE INDEX IF NOT EXISTS runs_state ON runs(state);
+            CREATE TABLE IF NOT EXISTS run_processes (
+                run_id INTEGER NOT NULL,
+                boot_id BLOB NOT NULL,
+                pid INTEGER NOT NULL,
+                start_time INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                PRIMARY KEY (run_id, boot_id, pid, start_time)
+            );
+            CREATE TABLE IF NOT EXISTS run_events (
+                run_id INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                detail TEXT,
+                PRIMARY KEY (run_id, revision)
+            );
             COMMIT;",
             )
             .map_err(err)?;
@@ -197,19 +287,11 @@ impl RuntimeStore {
             "vendor_ended_at INTEGER",
         )?;
 
-        match self.meta("schema_version")? {
-            Some(v) if v != SCHEMA_VERSION.to_string() => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "state.db schema version {v} != supported {SCHEMA_VERSION}; \
-                     remove or migrate the file"
-                ),
-            )),
-            _ => {
-                self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
-                Ok(())
-            }
-        }
+        // Older stores are migrated forward: every change so far is additive
+        // (new tables, new nullable columns). A store written by a *newer*
+        // wyd was already rejected above.
+        self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
+        Ok(())
     }
 
     /// Add `column` to `table` if it does not already exist (idempotent
@@ -1371,6 +1453,598 @@ impl RuntimeStore {
     }
 }
 
+/// Result of an idempotent `start_run` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunInsert {
+    /// A new run was created.
+    Created(RunId),
+    /// The same `request_id` and spec already exist; the caller gets that run.
+    Existing(RunId),
+    /// The `request_id` was reused with a different spec — rejected.
+    Conflict(RunId),
+}
+
+/// Filters for `run_list`.
+#[derive(Debug, Clone, Default)]
+pub struct RunFilter {
+    pub project: Option<String>,
+    pub session: Option<RuntimeSessionId>,
+    pub state: Option<RunState>,
+    pub limit: Option<usize>,
+}
+
+/// One state transition: the new state, the cleanup status it implies, the
+/// event name to record and an optional human-readable detail.
+#[derive(Debug, Clone, Copy)]
+pub struct RunStep<'a> {
+    pub state: RunState,
+    pub cleanup: CleanupState,
+    pub kind: &'a str,
+    pub detail: Option<&'a str>,
+}
+
+/// One lifecycle event, ordered by `revision`.
+#[derive(Debug, Clone)]
+pub struct RunEvent {
+    pub revision: i64,
+    pub at: u64,
+    pub kind: String,
+    pub detail: Option<String>,
+}
+
+impl RuntimeStore {
+    /// Create a run, or resolve a repeated `request_id` within
+    /// [`REQUEST_ID_WINDOW`]. The lookup and the insert share one immediate
+    /// transaction, so two clients racing on the same key cannot both create.
+    pub fn run_insert(
+        &mut self,
+        spec: &RunSpec,
+        supervisor: &str,
+        boot_id: &BootId,
+        now: u64,
+    ) -> io::Result<RunInsert> {
+        let fingerprint = spec.fingerprint();
+        let window_start = now.saturating_sub(REQUEST_ID_WINDOW.as_secs()) as i64;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(err)?;
+        let existing: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT run_id, fingerprint FROM runs
+                 WHERE request_id = ?1 AND created_at >= ?2
+                 ORDER BY run_id DESC LIMIT 1",
+                params![spec.request_id, window_start],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        if let Some((id, found)) = existing {
+            tx.commit().map_err(err)?;
+            return Ok(if found == fingerprint {
+                RunInsert::Existing(RunId(id))
+            } else {
+                RunInsert::Conflict(RunId(id))
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO runs (
+                request_id, fingerprint, argv, cwd, project_root, session_id,
+                session_origin, timeout_secs, grace_secs, log_limit_bytes,
+                state, cleanup, revision, supervisor, boot_id, created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                spec.request_id,
+                fingerprint,
+                serde_json::to_string(&spec.argv).map_err(err)?,
+                spec.cwd.to_string_lossy(),
+                spec.project_root
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                spec.session_id.map(|s| s.as_u64() as i64),
+                match spec.session_origin {
+                    SessionOrigin::None => "none",
+                    SessionOrigin::CallerReported => "caller_reported",
+                },
+                spec.timeout.as_secs() as i64,
+                spec.grace.as_secs() as i64,
+                spec.log_limit_bytes as i64,
+                RunState::Queued.as_str(),
+                CleanupState::Pending.as_str(),
+                0i64,
+                supervisor,
+                boot_id.to_le_bytes().as_slice(),
+                now as i64,
+            ],
+        )
+        .map_err(err)?;
+        let id = RunId(tx.last_insert_rowid());
+        tx.commit().map_err(err)?;
+        Ok(RunInsert::Created(id))
+    }
+
+    /// Move a run to a new state, appending an event. A stale `revision`
+    /// (another thread already advanced the run) is ignored, never applied
+    /// twice.
+    pub fn run_transition(
+        &mut self,
+        id: RunId,
+        revision: i64,
+        step: RunStep<'_>,
+        now: u64,
+    ) -> io::Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE runs SET state = ?1, cleanup = ?2, revision = ?3
+                 WHERE run_id = ?4 AND revision < ?3",
+                params![step.state.as_str(), step.cleanup.as_str(), revision, id.0],
+            )
+            .map_err(err)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.run_event(id, revision, step.kind, step.detail, now)?;
+        Ok(true)
+    }
+
+    /// Record the leader identity once the process exists.
+    pub fn run_set_leader(
+        &mut self,
+        id: RunId,
+        leader: &ProcessIdentity,
+        started_at: u64,
+    ) -> io::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET leader_boot_id = ?1, leader_pid = ?2,
+                    leader_start_time = ?3, started_at = ?4
+                 WHERE run_id = ?5",
+                params![
+                    leader.boot_id.to_le_bytes().as_slice(),
+                    leader.pid as i64,
+                    leader.start_time as i64,
+                    started_at as i64,
+                    id.0
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Record a process observed in the run's group. Repeated sightings only
+    /// refresh `last_seen_at`.
+    pub fn run_record_process(
+        &mut self,
+        id: RunId,
+        who: &ProcessIdentity,
+        role: &str,
+        now: u64,
+    ) -> io::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO run_processes
+                    (run_id, boot_id, pid, start_time, role, first_seen_at, last_seen_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?6)
+                 ON CONFLICT(run_id, boot_id, pid, start_time)
+                 DO UPDATE SET last_seen_at = excluded.last_seen_at",
+                params![
+                    id.0,
+                    who.boot_id.to_le_bytes().as_slice(),
+                    who.pid as i64,
+                    who.start_time as i64,
+                    role,
+                    now as i64
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Processes attributed to a run (identity + role).
+    pub fn run_processes(&self, id: RunId) -> io::Result<Vec<(ProcessIdentity, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT boot_id, pid, start_time, role FROM run_processes
+                 WHERE run_id = ?1 ORDER BY first_seen_at",
+            )
+            .map_err(err)?;
+        let rows: rusqlite::Result<Vec<_>> = stmt
+            .query_map(params![id.0], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(err)?
+            .collect();
+        drop(stmt);
+        rows.map(|v| {
+            v.into_iter()
+                .map(|(boot, pid, start, role)| {
+                    (
+                        ProcessIdentity {
+                            boot_id: bytes_to_boot(&boot),
+                            pid: pid as u32,
+                            start_time: start as u64,
+                        },
+                        role,
+                    )
+                })
+                .collect()
+        })
+        .map_err(err)
+    }
+
+    /// Append one event. `revision` is the run revision the event belongs to.
+    pub fn run_event(
+        &mut self,
+        id: RunId,
+        revision: i64,
+        kind: &str,
+        detail: Option<&str>,
+        now: u64,
+    ) -> io::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO run_events (run_id, revision, at, kind, detail)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![id.0, revision, now as i64, kind, detail],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Events after `after_revision`, oldest first (cursor read).
+    pub fn run_events(&self, id: RunId, after_revision: i64) -> io::Result<Vec<RunEvent>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT revision, at, kind, detail FROM run_events
+                 WHERE run_id = ?1 AND revision > ?2 ORDER BY revision",
+            )
+            .map_err(err)?;
+        let rows: rusqlite::Result<Vec<_>> = stmt
+            .query_map(params![id.0, after_revision], |r| {
+                Ok(RunEvent {
+                    revision: r.get(0)?,
+                    at: r.get::<_, i64>(1)? as u64,
+                    kind: r.get(2)?,
+                    detail: r.get(3)?,
+                })
+            })
+            .map_err(err)?
+            .collect();
+        drop(stmt);
+        rows.map_err(err)
+    }
+
+    /// Finish a run. Only the first caller wins; a run that is already
+    /// finished is left untouched, so cancel racing with exit cannot
+    /// overwrite a real result with a synthetic one.
+    pub fn run_finish(
+        &mut self,
+        id: RunId,
+        revision: i64,
+        result: &RunResult,
+        logs: LogState,
+    ) -> io::Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE runs SET
+                    state = 'finished', outcome = ?1, exit_code = ?2, signal = ?3,
+                    started_at = COALESCE(?4, started_at), finished_at = ?5,
+                    duration_ms = ?6, cleanup = ?7, detail = ?8, revision = ?9,
+                    log_stdout_bytes = ?10, log_stderr_bytes = ?11,
+                    log_stdout_truncated = ?12, log_stderr_truncated = ?13
+                 WHERE run_id = ?14 AND state != 'finished'",
+                params![
+                    result.outcome.as_str(),
+                    result.exit_code,
+                    result.signal,
+                    result.started_at.map(|v| v as i64),
+                    result.finished_at as i64,
+                    result.duration_ms as i64,
+                    result.cleanup.as_str(),
+                    result.detail,
+                    revision,
+                    logs.stdout_bytes as i64,
+                    logs.stderr_bytes as i64,
+                    logs.stdout_truncated as i64,
+                    logs.stderr_truncated as i64,
+                    id.0,
+                ],
+            )
+            .map_err(err)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        self.run_event(
+            id,
+            revision,
+            "finished",
+            Some(result.outcome.as_str()),
+            result.finished_at,
+        )?;
+        Ok(true)
+    }
+
+    /// One run by id.
+    pub fn run_get(&self, id: RunId) -> io::Result<Option<RunRecord>> {
+        let row: Option<RunRow> = self
+            .conn
+            .query_row(
+                &format!("{RUN_SELECT} WHERE run_id = ?1"),
+                params![id.0],
+                run_row,
+            )
+            .optional()
+            .map_err(err)?;
+        row.map(record_from_row).transpose()
+    }
+
+    /// Runs matching `filter`, newest first.
+    pub fn run_list(&self, filter: &RunFilter) -> io::Result<Vec<RunRecord>> {
+        let mut sql = String::from(RUN_SELECT);
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(project) = &filter.project {
+            clauses.push(format!("project_root = ?{}", args.len() + 1));
+            args.push(Box::new(project.clone()));
+        }
+        if let Some(session) = filter.session {
+            clauses.push(format!("session_id = ?{}", args.len() + 1));
+            args.push(Box::new(session.as_u64() as i64));
+        }
+        if let Some(state) = filter.state {
+            clauses.push(format!("state = ?{}", args.len() + 1));
+            args.push(Box::new(state.as_str().to_string()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(&format!(
+            " ORDER BY run_id DESC LIMIT {}",
+            filter.limit.unwrap_or(200).clamp(1, 1000)
+        ));
+
+        let mut stmt = self.conn.prepare(&sql).map_err(err)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows: rusqlite::Result<Vec<RunRow>> = stmt
+            .query_map(refs.as_slice(), run_row)
+            .map_err(err)?
+            .collect();
+        drop(stmt);
+        rows.map_err(err)?
+            .into_iter()
+            .map(record_from_row)
+            .collect()
+    }
+
+    /// Runs that never reached a terminal state — the recovery set on
+    /// supervisor startup.
+    pub fn run_unfinished(&self) -> io::Result<Vec<RunRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "{RUN_SELECT} WHERE state != 'finished' ORDER BY run_id"
+            ))
+            .map_err(err)?;
+        let rows: rusqlite::Result<Vec<RunRow>> =
+            stmt.query_map([], run_row).map_err(err)?.collect();
+        drop(stmt);
+        rows.map_err(err)?
+            .into_iter()
+            .map(record_from_row)
+            .collect()
+    }
+
+    /// Delete finished runs created before `before`, returning their ids so
+    /// the caller can drop the matching log directories.
+    pub fn run_prune(&mut self, before: u64) -> io::Result<Vec<RunId>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(err)?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT run_id FROM runs
+                     WHERE state = 'finished' AND created_at < ?1",
+                )
+                .map_err(err)?;
+            let rows: rusqlite::Result<Vec<i64>> = stmt
+                .query_map(params![before as i64], |r| r.get(0))
+                .map_err(err)?
+                .collect();
+            drop(stmt);
+            rows.map_err(err)?
+        };
+        for id in &ids {
+            tx.execute("DELETE FROM run_processes WHERE run_id = ?1", params![id])
+                .map_err(err)?;
+            tx.execute("DELETE FROM run_events WHERE run_id = ?1", params![id])
+                .map_err(err)?;
+            tx.execute("DELETE FROM runs WHERE run_id = ?1", params![id])
+                .map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+        Ok(ids.into_iter().map(RunId).collect())
+    }
+}
+
+const RUN_SELECT: &str = "SELECT
+    run_id, request_id, argv, cwd, project_root, session_id, session_origin,
+    timeout_secs, grace_secs, log_limit_bytes, state, outcome, exit_code, signal,
+    cleanup, started_at, finished_at, duration_ms, detail, revision, supervisor,
+    leader_boot_id, leader_pid, leader_start_time, created_at,
+    log_stdout_bytes, log_stderr_bytes, log_stdout_truncated, log_stderr_truncated
+    FROM runs";
+
+type RunRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+fn run_row(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+        r.get(12)?,
+        r.get(13)?,
+        r.get(14)?,
+        r.get(15)?,
+        r.get(16)?,
+        r.get(17)?,
+        r.get(18)?,
+        r.get(19)?,
+        r.get(20)?,
+        r.get(21)?,
+        r.get(22)?,
+        r.get(23)?,
+        r.get(24)?,
+        r.get(25)?,
+        r.get(26)?,
+        r.get(27)?,
+        r.get(28)?,
+    ))
+}
+
+fn record_from_row(row: RunRow) -> io::Result<RunRecord> {
+    let (
+        id,
+        request_id,
+        argv,
+        cwd,
+        project_root,
+        session_id,
+        session_origin,
+        timeout_secs,
+        grace_secs,
+        log_limit_bytes,
+        state,
+        outcome,
+        exit_code,
+        signal,
+        cleanup,
+        started_at,
+        finished_at,
+        duration_ms,
+        detail,
+        revision,
+        supervisor,
+        leader_boot,
+        leader_pid,
+        leader_start_time,
+        created_at,
+        stdout_bytes,
+        stderr_bytes,
+        stdout_truncated,
+        stderr_truncated,
+    ) = row;
+
+    let argv: Vec<String> = serde_json::from_str(&argv).map_err(err)?;
+    let cwd = PathBuf::from(cwd);
+    let spec = RunSpec {
+        request_id,
+        argv,
+        cwd,
+        project_root: project_root.map(PathBuf::from),
+        session_id: session_id.map(|s| RuntimeSessionId::from_u64(s as u64)),
+        session_origin: match session_origin.as_str() {
+            "caller_reported" => SessionOrigin::CallerReported,
+            _ => SessionOrigin::None,
+        },
+        timeout: Duration::from_secs(timeout_secs as u64),
+        grace: Duration::from_secs(grace_secs as u64),
+        log_limit_bytes: log_limit_bytes as u64,
+    };
+    let state = RunState::parse(&state)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad run state"))?;
+    let cleanup = CleanupState::parse(&cleanup)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad cleanup state"))?;
+    let result = match (outcome.as_deref().and_then(RunOutcome::parse), finished_at) {
+        (Some(outcome), Some(finished_at)) => Some(RunResult {
+            outcome,
+            exit_code: exit_code.map(|v| v as i32),
+            signal: signal.map(|v| v as i32),
+            started_at: started_at.map(|v| v as u64),
+            finished_at: finished_at as u64,
+            duration_ms: duration_ms.unwrap_or(0).max(0) as u64,
+            cleanup,
+            detail,
+        }),
+        _ => None,
+    };
+    let leader = match (leader_boot, leader_pid, leader_start_time) {
+        (Some(boot), Some(pid), Some(start)) => Some(ProcessIdentity {
+            boot_id: bytes_to_boot(&boot),
+            pid: pid as u32,
+            start_time: start as u64,
+        }),
+        _ => None,
+    };
+    Ok(RunRecord {
+        id: RunId(id),
+        spec,
+        state,
+        result,
+        logs: LogState {
+            stdout_bytes: stdout_bytes.max(0) as u64,
+            stderr_bytes: stderr_bytes.max(0) as u64,
+            stdout_truncated: stdout_truncated != 0,
+            stderr_truncated: stderr_truncated != 0,
+        },
+        revision,
+        created_at: created_at as u64,
+        leader,
+        supervisor,
+    })
+}
+
 /// One session's durable record.
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
@@ -1847,5 +2521,240 @@ mod tests {
             .ensure_session(&boot, "junie", 100, 500, 2000)
             .unwrap();
         assert_eq!(again, sid);
+    }
+
+    fn run_spec(name: &str, script: &str) -> RunSpec {
+        let mut spec = RunSpec::new(
+            format!("req-{name}"),
+            vec!["/bin/sh".into(), "-c".into(), script.into()],
+            std::path::PathBuf::from("/tmp"),
+        );
+        spec.timeout = Duration::from_secs(5);
+        spec
+    }
+
+    #[test]
+    fn run_insert_is_idempotent_and_rejects_a_changed_spec() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let boot = BootId::from_u128(7);
+        let spec = run_spec("k", "echo hi");
+        let first = store.run_insert(&spec, "sup", &boot, 1000).unwrap();
+        assert!(matches!(first, RunInsert::Created(_)));
+
+        // Same key, same command → the existing run, not a second one.
+        let mut retimed = spec.clone();
+        retimed.timeout = Duration::from_secs(99);
+        let again = store.run_insert(&retimed, "sup", &boot, 1001).unwrap();
+        assert_eq!(again, RunInsert::Existing(RunId(1)));
+        assert_eq!(store.run_list(&RunFilter::default()).unwrap().len(), 1);
+
+        // Same key, different command → conflict.
+        let other = run_spec("k", "echo different");
+        assert!(matches!(
+            store.run_insert(&other, "sup", &boot, 1002).unwrap(),
+            RunInsert::Conflict(_)
+        ));
+
+        // Outside the dedupe window the key is reusable.
+        let late = 1000 + REQUEST_ID_WINDOW.as_secs() + 1;
+        assert!(matches!(
+            store.run_insert(&other, "sup", &boot, late).unwrap(),
+            RunInsert::Created(_)
+        ));
+    }
+
+    #[test]
+    fn run_finish_wins_once_and_a_stale_transition_is_ignored() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let boot = BootId::from_u128(7);
+        let RunInsert::Created(id) = store
+            .run_insert(&run_spec("f", "true"), "sup", &boot, 10)
+            .unwrap()
+        else {
+            panic!("expected a new run");
+        };
+        assert!(
+            store
+                .run_transition(
+                    id,
+                    1,
+                    RunStep {
+                        state: RunState::Running,
+                        cleanup: CleanupState::Pending,
+                        kind: "running",
+                        detail: None
+                    },
+                    11
+                )
+                .unwrap()
+        );
+        // A stale revision cannot move the run backwards.
+        assert!(
+            !store
+                .run_transition(
+                    id,
+                    1,
+                    RunStep {
+                        state: RunState::Stopping,
+                        cleanup: CleanupState::Pending,
+                        kind: "stopping",
+                        detail: None
+                    },
+                    12
+                )
+                .unwrap()
+        );
+
+        let result = RunResult {
+            outcome: RunOutcome::Exited,
+            exit_code: Some(0),
+            signal: None,
+            started_at: Some(11),
+            finished_at: 12,
+            duration_ms: 1000,
+            cleanup: CleanupState::Complete,
+            detail: None,
+        };
+        assert!(
+            store
+                .run_finish(id, 2, &result, LogState::default())
+                .unwrap()
+        );
+        // A second finish (cancel racing with exit) must not overwrite it.
+        let cancelled = RunResult {
+            outcome: RunOutcome::Cancelled,
+            exit_code: None,
+            ..result.clone()
+        };
+        assert!(
+            !store
+                .run_finish(id, 3, &cancelled, LogState::default())
+                .unwrap()
+        );
+        let record = store.run_get(id).unwrap().unwrap();
+        assert_eq!(record.result.unwrap().outcome, RunOutcome::Exited);
+    }
+
+    #[test]
+    fn run_events_are_read_by_cursor() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let boot = BootId::from_u128(7);
+        let RunInsert::Created(id) = store
+            .run_insert(&run_spec("e", "true"), "sup", &boot, 10)
+            .unwrap()
+        else {
+            panic!("expected a new run");
+        };
+        store
+            .run_transition(
+                id,
+                1,
+                RunStep {
+                    state: RunState::Running,
+                    cleanup: CleanupState::Pending,
+                    kind: "running",
+                    detail: None,
+                },
+                11,
+            )
+            .unwrap();
+        store
+            .run_transition(
+                id,
+                2,
+                RunStep {
+                    state: RunState::Stopping,
+                    cleanup: CleanupState::Pending,
+                    kind: "stop",
+                    detail: None,
+                },
+                12,
+            )
+            .unwrap();
+        let all = store.run_events(id, 0).unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            ["running", "stop"]
+        );
+        let tail = store.run_events(id, 1).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].kind, "stop");
+    }
+
+    #[test]
+    fn unfinished_runs_are_the_recovery_set_and_prune_only_takes_finished() {
+        let mut store = RuntimeStore::open_in_memory().unwrap();
+        let boot = BootId::from_u128(7);
+        let RunInsert::Created(live) = store
+            .run_insert(&run_spec("live", "sleep 1"), "sup", &boot, 10)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let RunInsert::Created(done) = store
+            .run_insert(&run_spec("done", "true"), "sup", &boot, 10)
+            .unwrap()
+        else {
+            panic!()
+        };
+        store
+            .run_finish(
+                done,
+                1,
+                &RunResult {
+                    outcome: RunOutcome::Exited,
+                    exit_code: Some(0),
+                    signal: None,
+                    started_at: Some(10),
+                    finished_at: 11,
+                    duration_ms: 1000,
+                    cleanup: CleanupState::Complete,
+                    detail: None,
+                },
+                LogState::default(),
+            )
+            .unwrap();
+
+        let unfinished = store.run_unfinished().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].id, live);
+
+        let pruned = store.run_prune(i64::MAX as u64).unwrap();
+        assert_eq!(pruned, vec![done], "only finished runs are pruned");
+        assert!(store.run_get(live).unwrap().is_some());
+        assert!(store.run_get(done).unwrap().is_none());
+    }
+
+    #[test]
+    fn opens_and_migrates_a_v1_store_forward() {
+        let dir = std::env::temp_dir().join(format!("wyd-store-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            // A v1 store: only the old tables, no runs tables, version 1.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+            )
+            .unwrap();
+        }
+        let store = RuntimeStore::open(&path).unwrap();
+        assert_eq!(store.meta("schema_version").unwrap().as_deref(), Some("2"));
+        // The runs tables exist and are usable after the migration.
+        assert!(store.run_list(&RunFilter::default()).unwrap().is_empty());
+
+        // A store from a newer wyd is refused, not half-read.
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(RuntimeStore::open(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

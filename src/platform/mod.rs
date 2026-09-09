@@ -11,6 +11,8 @@ pub use linux::tty_of;
 mod boot;
 pub use boot::{BootIdentityProvider, SystemBoot};
 
+pub mod pgroup;
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn tty_of(_pid: u32) -> Option<String> {
     None

@@ -3,6 +3,7 @@ pub mod docker;
 pub mod port;
 pub mod process;
 pub mod project;
+pub mod run;
 pub mod runtime;
 pub mod session;
 pub mod snapshot;

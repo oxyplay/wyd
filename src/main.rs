@@ -7,6 +7,7 @@ mod mcp;
 mod model;
 mod output;
 mod platform;
+mod runner;
 mod scanner;
 mod server;
 mod store;
@@ -14,7 +15,7 @@ mod trace;
 mod tui;
 mod web;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -27,6 +28,7 @@ use model::process::ProcessIdentity;
 use parking_lot::RwLock;
 use platform::BootIdentityProvider;
 use scanner::{ProcessScanner, processes::SysinfoProcessScanner};
+use serde_json::Value;
 
 /// See what your dev sessions left running.
 #[derive(Parser)]
@@ -64,10 +66,66 @@ enum Subcmd {
     },
     /// Explain which session owns a process (from recorded provenance)
     Why { pid: u32 },
-    /// Serve the local runtime API (read + vendor registration)
-    Serve,
+    /// Serve the local runtime API and run supervisor (read + runs)
+    Serve {
+        /// Internal: started on demand by a client; exits when idle
+        #[arg(long, hide = true)]
+        auto: bool,
+    },
+    /// Run a command under wyd's supervisor and print its result
+    Run {
+        /// Execution timeout, e.g. 120s, 10m
+        #[arg(long, default_value = "10m", value_parser = parse_duration)]
+        timeout: Duration,
+        /// Grace period between soft and forced stop
+        #[arg(long, default_value = "3s", value_parser = parse_duration)]
+        grace: Duration,
+        /// Absolute working directory (default: current directory)
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Reuse an existing run instead of starting a new one
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Print the structured result instead of the captured output
+        #[arg(long)]
+        json: bool,
+        /// Command and arguments. Shell syntax needs an explicit `sh -c`.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// List managed runs
+    Runs {
+        /// Only runs in this state: queued|starting|running|stopping|finished
+        #[arg(long)]
+        state: Option<String>,
+        /// Only runs in this project root
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a run's captured output
+    Logs {
+        run_id: i64,
+        /// stdout | stderr
+        #[arg(long, default_value = "stdout")]
+        stream: String,
+        /// Keep printing new output as it arrives
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Ask a run to stop (idempotent)
+    Cancel { run_id: i64 },
     /// Run an MCP server over stdio (for coding agents)
-    Mcp,
+    Mcp {
+        /// Enable the execution tools (start_run, cancel_run) for this
+        /// connection. Off by default: MCP stays read-only.
+        #[arg(long)]
+        allow_run: bool,
+    },
     /// Serve a loopback web dashboard with WebMCP tools
     Web {
         /// Bind address (default: 127.0.0.1)
@@ -143,8 +201,28 @@ fn main() -> io::Result<()> {
         Some(Subcmd::Upgrade) => run_upgrade(),
         Some(Subcmd::Prune { dry_run, yes }) => run_prune(dry_run, yes),
         Some(Subcmd::Why { pid }) => run_why(pid),
-        Some(Subcmd::Serve) => server::serve(),
-        Some(Subcmd::Mcp) => mcp::serve_stdio(),
+        Some(Subcmd::Serve { auto }) => server::serve(auto),
+        Some(Subcmd::Run {
+            timeout,
+            grace,
+            cwd,
+            request_id,
+            json,
+            argv,
+        }) => run_command(timeout, grace, cwd, request_id, json, argv),
+        Some(Subcmd::Runs {
+            state,
+            project,
+            limit,
+            json,
+        }) => run_runs(state, project, limit, json),
+        Some(Subcmd::Logs {
+            run_id,
+            stream,
+            follow,
+        }) => run_logs(run_id, stream, follow),
+        Some(Subcmd::Cancel { run_id }) => run_cancel(run_id),
+        Some(Subcmd::Mcp { allow_run }) => mcp::serve_stdio(allow_run),
         Some(Subcmd::Web {
             host,
             port,
@@ -177,6 +255,262 @@ fn main() -> io::Result<()> {
         }
     }
 }
+/// Parse `120s` / `10m` / `1h` / plain seconds.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let (num, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c.to_ascii_lowercase()),
+        _ => (s, 's'),
+    };
+    let value: u64 = num
+        .parse()
+        .map_err(|_| format!("{s:?} is not a duration like 120s, 10m, 1h"))?;
+    let secs = match unit {
+        's' => value,
+        'm' => value * 60,
+        'h' => value * 3600,
+        _ => return Err(format!("unknown duration unit {unit:?}")),
+    };
+    Ok(Duration::from_secs(secs.max(1)))
+}
+
+/// `wyd run`: start under the supervisor, wait, print the result.
+fn run_command(
+    timeout: Duration,
+    grace: Duration,
+    cwd: Option<String>,
+    request_id: Option<String>,
+    json: bool,
+    argv: Vec<String>,
+) -> io::Result<()> {
+    use model::run::{RunSpec, exit};
+    runner::client::ensure_supervisor()?;
+    let client = runner::client::Client::new();
+
+    let cwd = match cwd {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir()?,
+    };
+    if !cwd.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--cwd must be an absolute path",
+        ));
+    }
+    // A CLI invocation is a fresh request; the id only exists so a retried
+    // call can be deduplicated by a caller that supplies its own.
+    let request_id = request_id.unwrap_or_else(|| {
+        format!(
+            "cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    });
+    let mut spec = RunSpec::new(request_id, argv, cwd);
+    spec.timeout = timeout;
+    spec.grace = grace;
+
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let started = client.start(&spec, &env)?;
+    let id: i64 = started
+        .run_id
+        .parse()
+        .map_err(|_| io::Error::other("bad run id from supervisor"))?;
+    let view = runner::client::wait_for_finish(&client, model::run::RunId(id))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        print_run_output(&client, model::run::RunId(id), false)?;
+        if let Some(detail) = &view.detail {
+            eprintln!("wyd: {detail}");
+        }
+        eprintln!(
+            "wyd: run {id} {:?} cleanup={} in {}ms",
+            view.outcome.unwrap_or(model::run::RunOutcome::Exited),
+            view.cleanup.as_str(),
+            view.duration_ms.unwrap_or(0)
+        );
+    }
+
+    let code = match view.outcome {
+        Some(model::run::RunOutcome::Exited) => view.exit_code.unwrap_or(0),
+        Some(model::run::RunOutcome::Signaled) => 128 + view.signal.unwrap_or(0),
+        Some(model::run::RunOutcome::TimedOut) => exit::TIMED_OUT,
+        Some(model::run::RunOutcome::Cancelled) => exit::CANCELLED,
+        _ => exit::SPAWN_FAILED,
+    };
+    std::process::exit(code);
+}
+
+/// Copy a run's retained output to our own stdout/stderr.
+fn print_run_output(
+    client: &runner::client::Client,
+    id: model::run::RunId,
+    follow: bool,
+) -> io::Result<()> {
+    use runner::logs::Stream;
+    let mut cursors = [(Stream::Stdout, 0u64), (Stream::Stderr, 0u64)];
+    let mut open = [true, true];
+    while open[0] || open[1] {
+        for (idx, (stream, cursor)) in cursors.iter_mut().enumerate() {
+            if !open[idx] {
+                continue;
+            }
+            let chunk = client.output(id, *stream, *cursor, 64 * 1024)?;
+            let data = chunk.get("data").and_then(Value::as_str).unwrap_or("");
+            if !data.is_empty() {
+                match stream {
+                    Stream::Stdout => print!("{data}"),
+                    Stream::Stderr => eprint!("{data}"),
+                }
+                io::Write::flush(&mut io::stdout())?;
+            }
+            *cursor = chunk
+                .get("next_cursor")
+                .and_then(Value::as_u64)
+                .unwrap_or(*cursor);
+            let eof = chunk.get("eof").and_then(Value::as_bool).unwrap_or(true);
+            if eof {
+                open[idx] = false;
+                if chunk.get("truncated").and_then(Value::as_bool) == Some(true) {
+                    eprintln!(
+                        "wyd: {} output truncated at the configured log limit",
+                        stream.as_str()
+                    );
+                }
+            }
+        }
+        if open[0] || open[1] {
+            if !follow {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    Ok(())
+}
+
+fn run_runs(
+    state: Option<String>,
+    project: Option<String>,
+    limit: usize,
+    json: bool,
+) -> io::Result<()> {
+    // Reads come from the durable store, so `wyd runs` works whether or not a
+    // supervisor is alive.
+    let store = store::RuntimeStore::open(&store::RuntimeStore::default_path())?;
+    let filter = store::RunFilter {
+        project,
+        session: None,
+        state: state.as_deref().and_then(model::run::RunState::parse),
+        limit: Some(limit),
+    };
+    let runs: Vec<runner::RunView> = store
+        .run_list(&filter)?
+        .iter()
+        .map(runner::RunView::from_record)
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+    if runs.is_empty() {
+        println!("no runs");
+        return Ok(());
+    }
+    for run in runs {
+        let cmd = run.argv.join(" ");
+        println!(
+            "{:>4}  {:<9} {:<13} {:>8}  {}",
+            run.run_id,
+            run.state.as_str(),
+            run.outcome.map(|o| o.as_str()).unwrap_or("-"),
+            format!("{}ms", run.duration_ms.unwrap_or(0)),
+            truncate(&cmd, 70),
+        );
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn run_logs(run_id: i64, stream: String, follow: bool) -> io::Result<()> {
+    use runner::logs::Stream;
+    let stream = Stream::parse(&stream)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stream: stdout | stderr"))?;
+    let id = model::run::RunId(run_id);
+    let store = store::RuntimeStore::open(&store::RuntimeStore::default_path())?;
+    let Some(_record) = store.run_get(id)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("run {run_id} not found"),
+        ));
+    };
+    // Retained output lives on disk; the supervisor is only needed to start
+    // or stop a run, never to read one back.
+    let paths =
+        runner::logs::RunPaths::new(store::RuntimeStore::default_path().with_file_name("runs"));
+    let path = paths.stream_file(run_id, stream);
+    let mut cursor = 0u64;
+    loop {
+        let chunk = runner::logs::read_chunk(&path, cursor, 64 * 1024)?;
+        match stream {
+            Stream::Stdout => print!("{}", chunk.data),
+            Stream::Stderr => eprint!("{}", chunk.data),
+        }
+        io::Write::flush(&mut io::stdout())?;
+        cursor = chunk.next_cursor;
+        let finished = store
+            .run_get(id)?
+            .map(|r| r.state.is_terminal())
+            .unwrap_or(true);
+        if chunk.eof && finished {
+            let logs = store.run_get(id)?.map(|r| r.logs).unwrap_or_default();
+            let truncated = match stream {
+                Stream::Stdout => logs.stdout_truncated,
+                Stream::Stderr => logs.stderr_truncated,
+            };
+            if truncated {
+                eprintln!(
+                    "wyd: {} output truncated at the configured log limit",
+                    stream.as_str()
+                );
+            }
+            return Ok(());
+        }
+        if chunk.eof && !follow {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn run_cancel(run_id: i64) -> io::Result<()> {
+    let client = runner::client::Client::new();
+    let view = client.cancel(model::run::RunId(run_id))?;
+    match view {
+        Some(view) => {
+            println!("run {} {}", view.run_id, view.state.as_str());
+            Ok(())
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("run {run_id} not found"),
+        )),
+    }
+}
+
 fn run_upgrade() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);

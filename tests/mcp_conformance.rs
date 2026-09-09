@@ -97,7 +97,79 @@ CREATE TABLE IF NOT EXISTS session_aliases (
     vendor_ended_at INTEGER,
     PRIMARY KEY (vendor, vendor_session_id)
 );
+CREATE TABLE IF NOT EXISTS runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    argv TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    project_root TEXT,
+    session_id INTEGER,
+    session_origin TEXT NOT NULL,
+    timeout_secs INTEGER NOT NULL,
+    grace_secs INTEGER NOT NULL,
+    log_limit_bytes INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    outcome TEXT,
+    exit_code INTEGER,
+    signal INTEGER,
+    cleanup TEXT NOT NULL,
+    started_at INTEGER,
+    finished_at INTEGER,
+    duration_ms INTEGER,
+    detail TEXT,
+    revision INTEGER NOT NULL,
+    supervisor TEXT,
+    boot_id BLOB,
+    leader_boot_id BLOB,
+    leader_pid INTEGER,
+    leader_start_time INTEGER,
+    created_at INTEGER NOT NULL,
+    log_stdout_bytes INTEGER NOT NULL DEFAULT 0,
+    log_stderr_bytes INTEGER NOT NULL DEFAULT 0,
+    log_stdout_truncated INTEGER NOT NULL DEFAULT 0,
+    log_stderr_truncated INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS run_processes (
+    run_id INTEGER NOT NULL,
+    boot_id BLOB NOT NULL,
+    pid INTEGER NOT NULL,
+    start_time INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    PRIMARY KEY (run_id, boot_id, pid, start_time)
+);
+CREATE TABLE IF NOT EXISTS run_events (
+    run_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT,
+    PRIMARY KEY (run_id, revision)
+);
 ";
+
+/// Table names declared by a DDL string, in declaration order.
+fn table_names(ddl: &str) -> std::collections::BTreeSet<String> {
+    ddl.split("CREATE TABLE IF NOT EXISTS ")
+        .skip(1)
+        .filter_map(|rest| rest.split(|c: char| c.is_whitespace() || c == '(').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The fixture schema is a copy of production DDL; a copy drifts. This reads
+/// the real source and fails the moment the two disagree.
+#[test]
+fn fixture_schema_matches_production() {
+    let production = table_names(include_str!("../src/store.rs"));
+    let fixture = table_names(SCHEMA);
+    assert_eq!(
+        fixture, production,
+        "tests/mcp_conformance.rs SCHEMA drifted from RuntimeStore::init"
+    );
+}
 
 /// Replicates `RuntimeStore::default_path` so the test seeds the same store
 /// the spawned server will open.
@@ -117,6 +189,15 @@ fn seed_store(home: &Path) {
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
     conn.execute_batch(SCHEMA).unwrap();
+    // An initialized store always carries the schema version; without it the
+    // first open runs the migration DDL and takes a write lock, which races
+    // the in-process collector.
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', '2')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO sessions
             (session_id, boot_id, agent, root_pid, root_start_time, project,
@@ -136,6 +217,10 @@ struct McpClient {
 
 impl McpClient {
     fn spawn() -> Self {
+        Self::spawn_with(&[])
+    }
+
+    fn spawn_with(extra: &[&str]) -> Self {
         // Hermetic: point HOME/XDG at a throwaway dir so the spawned server's
         // collect loop and store never touch the real user's state.
         let home = std::env::temp_dir().join(format!(
@@ -150,6 +235,7 @@ impl McpClient {
         seed_store(&home);
         let mut child = Command::new(env!("CARGO_BIN_EXE_wyd"))
             .arg("mcp")
+            .args(extra)
             .env("HOME", &home)
             .env("XDG_DATA_HOME", home.join("xdg"))
             .stdin(Stdio::piped())
@@ -198,6 +284,39 @@ impl McpClient {
 }
 
 #[test]
+fn allow_run_exposes_execution_tools() {
+    let mut c = McpClient::spawn_with(&["--allow-run"]);
+    c.request(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": PROTOCOL_VERSION }
+    }));
+    let list = c.request(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"start_run"));
+    assert!(names.contains(&"cancel_run"));
+    // The description must not hide that this executes on the host.
+    let start = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "start_run")
+        .unwrap();
+    let description = start["description"].as_str().unwrap_or("");
+    assert!(
+        description.contains("HOST"),
+        "start_run must say it executes on the host: {description}"
+    );
+    c.shutdown();
+}
+
+#[test]
 fn full_handshake_as_a_client() {
     let mut c = McpClient::spawn();
 
@@ -235,14 +354,27 @@ fn full_handshake_as_a_client() {
     );
     assert_eq!(ping["result"], json!({}));
 
-    // 3. tools/list → exactly the two tools, each with a JSON Schema object.
+    // 3. tools/list → the read-only tool set, each with a JSON Schema object.
     let list = c.request(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }));
     let tools = list["result"]["tools"]
         .as_array()
         .expect("tools/list returns a tools array");
     let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     names.sort();
-    assert_eq!(names, ["explain", "list_sessions"]);
+    assert_eq!(
+        names,
+        [
+            "explain",
+            "get_run",
+            "list_runs",
+            "list_sessions",
+            "read_run_output"
+        ]
+    );
+    assert!(
+        !names.contains(&"start_run") && !names.contains(&"cancel_run"),
+        "MCP without --allow-run must stay read-only"
+    );
     for t in tools {
         assert_eq!(
             t["inputSchema"]["type"], "object",
