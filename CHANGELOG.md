@@ -2,6 +2,24 @@
 
 All notable changes to wyd.
 
+## [Unreleased]
+
+### Added
+- `wyd why <pid>` now names the system source when no agent session owns a
+  process: it walks the live ancestry and reports systemd (with the unit from
+  `/proc/<pid>/cgroup` on Linux), launchd, cron, tmux, screen, ssh, snap,
+  flatpak, or an interactive shell, alongside the ancestry chain.
+- `wyd why <pid>` exit codes for scripts/CI: `0` cleanly owned (session
+  active), `1` leftover or unattributed (owner ended or no recorded owner),
+  `2` pid not running or not identifiable, `5` internal error.
+- `wyd ports` (and `wyd ports --json`): lists every listening socket with the
+  process on it and what started it — the owning agent session from durable
+  provenance, or the system source (systemd/launchd/cron/tmux/ssh/…) when no
+  session owns it.
+- `wyd why <pid> --tree`: renders the full ancestry tree (the path from pid 1
+  down to the target, marked `◀`, plus its children, capped at 10) as a
+  structure view with no provenance required.
+
 ## [0.9.0] - 2026-09-01
 
 ### Added

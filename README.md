@@ -66,7 +66,11 @@ resolver attributes resources to a session with an explainable score when
 exact ancestry is gone.
 
 - **Sessions** view in the TUI (top-level): agent · project · state · age · id, with a details panel.
-- **`wyd why <pid>`** — which session owns a process, and the evidence.
+- **`wyd why <pid>`** — which session owns a process, and the evidence. When no
+  agent session owns it, it names the system source instead (systemd unit,
+  launchd, cron, tmux, ssh, snap, flatpak, or an interactive shell), with the
+  ancestry chain. Exit codes: `0` cleanly owned, `1` leftover/unattributed,
+  `2` not running, `5` internal error.
 - **`wyd --json sessions`** — recorded sessions as JSON.
 - **`wyd serve`** — a local daemon over a Unix socket (`wyd.sock`, mode 0600, single-instance). Keeps provenance fresh and answers read-only queries; vendors can register sessions with `session_start` / `session_end` (their id maps to a Wyd session as an alias).
 - **`wyd mcp`** — a Model Context Protocol server over stdio, so a coding agent can ask wyd for its sessions, who owns a PID, and its managed runs (`--allow-run` adds host execution).
@@ -314,6 +318,9 @@ wyd --plain mcp
 wyd --json project myapp
 wyd --json sessions      # recorded agent sessions
 wyd why <pid>            # which session owns a process, and the evidence
+wyd why <pid> --tree     # full ancestry tree: path + children, target marked
+wyd ports                # listening ports: process on each + what started it
+wyd ports --json         # same, machine-readable
 wyd serve                # local daemon: Unix-socket API + keeps provenance fresh
 wyd mcp                  # MCP server over stdio (for coding agents)
 wyd prune --dry-run      # list anonymous volumes that would be deleted
@@ -321,6 +328,24 @@ wyd prune                # confirm, then delete them
 ```
 
 Filters: `leftovers`, `mcp`, `agents`, `docker`, `project`, `sessions` (JSON only).
+
+`wyd why <pid>` exits `0` when the process is cleanly owned by an active
+session, `1` when it is a leftover or has no recorded owner (a system source
+is printed instead), `2` when the pid is not running, and `5` on an internal
+error — so `wyd why <pid> && …` or a `case $?` works in scripts and CI.
+
+`wyd why <pid> --tree` prints the full ancestry tree instead of the narrative:
+the path from pid 1 (or the highest visible ancestor) down to the target
+(marked `◀`), plus the target's children (capped at 10, with a
+`… (+N more)` line beyond that). It is a pure structure view — no provenance
+needed.
+
+`wyd ports` lists every listening socket as `address:port`, the process on it,
+and what started it — the owning agent session when provenance knows it
+(`session opencode (active)`), otherwise the system source (`systemd
+(postgresql.service)`, `launchd`, `cron`, …). `--json` returns
+`{address, port, pid, process, owner_agent, owner_session, owner_state,
+source}` per entry, omitting the fields that do not apply.
 
 ```json
 {

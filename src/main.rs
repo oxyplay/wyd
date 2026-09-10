@@ -7,9 +7,11 @@ mod mcp;
 mod model;
 mod output;
 mod platform;
+mod ports;
 mod runner;
 mod scanner;
 mod server;
+mod source;
 mod store;
 mod trace;
 mod tui;
@@ -65,7 +67,18 @@ enum Subcmd {
         yes: bool,
     },
     /// Explain which session owns a process (from recorded provenance)
-    Why { pid: u32 },
+    Why {
+        pid: u32,
+        /// Show the full ancestry tree (path + children) instead of the narrative
+        #[arg(long)]
+        tree: bool,
+    },
+    /// List listening ports with the process on each and what started it
+    Ports {
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Serve the local runtime API and run supervisor (read + runs)
     Serve {
         /// Internal: started on demand by a client; exits when idle
@@ -226,7 +239,8 @@ fn main() -> io::Result<()> {
     match cli.command {
         Some(Subcmd::Upgrade) => run_upgrade(),
         Some(Subcmd::Prune { dry_run, yes }) => run_prune(dry_run, yes),
-        Some(Subcmd::Why { pid }) => run_why(pid),
+        Some(Subcmd::Why { pid, tree }) => run_why(pid, tree),
+        Some(Subcmd::Ports { json }) => run_ports(json),
         Some(Subcmd::Serve { auto }) => server::serve(auto),
         Some(Subcmd::Run {
             timeout,
@@ -841,50 +855,127 @@ fn run_sessions_json() -> io::Result<()> {
 }
 
 /// `wyd why <pid>`: reconstruct a process's origin session and attribution
-/// from durable provenance (contract §15).
-fn run_why(pid: u32) -> io::Result<()> {
-    let mut store = store::RuntimeStore::open(&store::RuntimeStore::default_path())?;
-    let now = now();
-    let boot = store.boot_id_for_epoch(platform::SystemBoot.current_boot_epoch()?, now)?;
+/// from durable provenance (contract §15), falling back to system-source
+/// detection (systemd/launchd/cron/tmux/ssh/…) when no agent session owns it.
+///
+/// Exit codes: 0 = cleanly owned (session active), 1 = warning (owner ended
+/// or no recorded owner), 2 = pid not running or not identifiable,
+/// 5 = internal error. `--tree` prints the ancestry tree and exits 0/2.
+fn run_why(pid: u32, tree: bool) -> io::Result<()> {
+    let code = match why_inner(pid, tree) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("wyd why: {e}");
+            std::process::exit(5);
+        }
+    };
+    std::process::exit(code);
+}
 
-    // Resolve start_time from the live process.
+fn why_inner(pid: u32, tree: bool) -> io::Result<i32> {
     let mut scanner = SysinfoProcessScanner::new();
     let processes = scanner
         .scan()
         .map_err(|e| io::Error::other(e.to_string()))?;
     let Some(proc) = processes.iter().find(|p| p.pid == pid) else {
-        return Err(io::Error::other(format!("pid {pid} is not running")));
+        eprintln!("pid {pid} is not running");
+        return Ok(2);
     };
+
+    // `--tree` is a pure structure view: no provenance needed.
+    if tree {
+        print!("{}", source::render_tree(pid, &processes));
+        return Ok(0);
+    }
+
+    let mut store = store::RuntimeStore::open(&store::RuntimeStore::default_path())?;
+    let now = now();
+    let boot = store.boot_id_for_epoch(platform::SystemBoot.current_boot_epoch()?, now)?;
+
+    // Resolve start_time from the live process.
     let Some(identity) = ProcessIdentity::from_process(&boot, proc) else {
-        return Err(io::Error::other(format!(
-            "pid {pid} has no stable identity (start_time unavailable)"
-        )));
+        eprintln!("pid {pid} has no stable identity (start_time unavailable)");
+        return Ok(2);
     };
 
     println!("{} pid {pid}", proc.label());
     match store.explain_process(&boot, pid, identity.start_time)? {
         Some(exp) => {
             print_session_owner(&store, &exp);
+            Ok(if exp.session.ended_at.is_some() { 1 } else { 0 })
         }
         None => {
             // Maybe the pid IS a session root.
             match store.session_for_root(&boot, pid, identity.start_time)? {
-                Some(s) => println!(
-                    "session root of: {} {} ({} since {})",
-                    s.agent,
-                    s.id,
-                    if s.ended_at.is_some() {
-                        "ended"
-                    } else {
-                        "active"
-                    },
-                    s.started_at
-                ),
-                None => println!("pid {pid}: no recorded owner"),
+                Some(s) => {
+                    println!(
+                        "session root of: {} {} ({} since {})",
+                        s.agent,
+                        s.id,
+                        if s.ended_at.is_some() {
+                            "ended"
+                        } else {
+                            "active"
+                        },
+                        s.started_at
+                    );
+                    Ok(if s.ended_at.is_some() { 1 } else { 0 })
+                }
+                None => {
+                    print_source(&processes, proc);
+                    Ok(1)
+                }
             }
         }
     }
+}
+
+/// Fallback for a pid with no recorded owner: name the system source it
+/// still descends from, with the ancestry chain as evidence.
+fn print_source(processes: &[model::ProcessInfo], target: &model::ProcessInfo) {
+    let report = source::detect(target.pid, processes);
+    println!("no recorded owner");
+    println!("source:   {}", report.source.label());
+    let mut parts: Vec<String> = report
+        .chain
+        .iter()
+        .map(|p| format!("{} ({})", p.name, p.pid))
+        .collect();
+    parts.push(format!("{} ({})", target.name, target.pid));
+    println!("ancestry: {}", parts.join(" → "));
+}
+
+/// `wyd ports`: list every listening port with the process on it and what
+/// started it — the owning agent session, or the system source when no
+/// session owns it.
+fn run_ports(json: bool) -> io::Result<()> {
+    let mut scanner = SysinfoProcessScanner::new();
+    let processes = scanner
+        .scan()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let listening = scanner::ports::scan().map_err(|e| io::Error::other(e.to_string()))?;
+
+    let prov = ports_provenance();
+    let entries = ports::collect(&listening, &processes, prov.as_ref());
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into())
+        );
+    } else {
+        println!("{}", ports::render_plain(&entries));
+    }
     Ok(())
+}
+
+/// Best-effort provenance for port owner attribution: `None` when the store
+/// or boot identity is unavailable, so `wyd ports` still lists system sources.
+fn ports_provenance() -> Option<ports::Provenance> {
+    let mut store = store::RuntimeStore::open(&store::RuntimeStore::default_path()).ok()?;
+    let epoch = platform::SystemBoot.current_boot_epoch().ok()?;
+    let boot = store.boot_id_for_epoch(epoch, now()).ok()?;
+    Some(ports::Provenance { store, boot })
 }
 
 fn print_session_owner(store: &store::RuntimeStore, exp: &store::Explanation) {
