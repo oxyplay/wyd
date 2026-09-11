@@ -243,11 +243,24 @@ pub struct SnapshotDoc {
     pub schema_version: u32,
     pub wyd_version: String,
     pub generated_at: String,
+    pub system: SystemDoc,
     pub projects: Vec<ProjectDoc>,
     pub sessions: Vec<SessionDoc>,
     pub resources: Vec<ResourceDoc>,
     pub containers: Vec<ContainerDoc>,
     pub leftovers: LeftoversDoc,
+}
+
+/// Host resource gauges for the menu's one-line status. CPU is sampled over a
+/// short window (one-shot calls yield 0 otherwise); memory/disk are instant.
+#[derive(Debug, Serialize)]
+pub struct SystemDoc {
+    /// Busy CPU across all cores, percent.
+    pub cpu_percent: f32,
+    pub used_memory_bytes: u64,
+    pub total_memory_bytes: u64,
+    /// Free bytes on the root volume.
+    pub free_disk_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -573,33 +586,26 @@ pub fn build_snapshot(snap: &RuntimeSnapshot) -> SnapshotDoc {
     let mut sessions: Vec<SessionDoc> = snap.sessions.iter().map(|s| session_doc(s, now)).collect();
     sessions.sort_by(|a, b| a.id.cmp(&b.id));
 
-    let mut leftover_ids: Vec<String> = resources
+    // Leftovers = abandoned running processes + Docker reclaimables
+    // (dangling images, anonymous volumes, build cache). Stopped containers
+    // are NOT leftovers — they consume nothing; manage them in the Docker
+    // section (start/stop).
+    let leftover_ids: Vec<String> = resources
         .iter()
         .filter(|r| r.classification == "leftover")
         .map(|r| r.id.clone())
         .collect();
-    // Stopped containers are leftover candidates too.
-    for c in &containers {
-        if c.status == "stopped" && !leftover_ids.contains(&c.id) {
-            leftover_ids.push(c.id.clone());
-        }
-    }
-    leftover_ids.sort();
     let reclaim: u64 = resources
         .iter()
         .filter(|r| r.classification == "leftover")
         .map(|r| r.estimated_reclaim_bytes)
-        .sum::<u64>()
-        + containers
-            .iter()
-            .filter(|c| c.status == "stopped")
-            .map(|c| c.estimated_reclaim_bytes)
-            .sum::<u64>();
+        .sum::<u64>();
 
     SnapshotDoc {
         schema_version: SCHEMA_VERSION,
         wyd_version: env!("CARGO_PKG_VERSION").into(),
         generated_at: rfc3339(now),
+        system: system_doc(snap),
         projects,
         sessions,
         resources,
@@ -609,6 +615,45 @@ pub fn build_snapshot(snap: &RuntimeSnapshot) -> SnapshotDoc {
             estimated_reclaim_bytes: reclaim,
             resource_ids: leftover_ids,
         },
+    }
+}
+
+/// Host gauges for the one-line menu status. CPU needs a two-sample window
+/// (a cold one-shot refresh reads 0); memory comes from the scanners, disk
+/// from the root volume. All measured here, never in the client.
+fn system_doc(snap: &RuntimeSnapshot) -> SystemDoc {
+    let cpu_percent = sample_cpu_percent();
+    SystemDoc {
+        cpu_percent,
+        used_memory_bytes: snap.used_memory_bytes,
+        total_memory_bytes: snap.total_memory_bytes,
+        free_disk_bytes: free_disk_bytes(),
+    }
+}
+
+/// Two refresh_cpu_usage reads ~200ms apart yield the real CPU delta.
+fn sample_cpu_percent() -> f32 {
+    use std::thread::sleep;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_usage();
+    sleep(std::time::Duration::from_millis(200));
+    sys.refresh_cpu_usage();
+    (sys.global_cpu_usage() * 10.0).round() / 10.0
+}
+
+/// Free bytes on the root volume (statvfs).
+fn free_disk_bytes() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        let path = std::ffi::CString::new("/").unwrap_or_default();
+        unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
+        // f_bavail is a signed type; clamp negatives to 0.
+        (stats.f_bavail as i64).max(0) as u64 * stats.f_frsize
+    }
+    #[cfg(not(unix))]
+    {
+        0
     }
 }
 

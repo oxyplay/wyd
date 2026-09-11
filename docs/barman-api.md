@@ -102,11 +102,10 @@ Unknown/stale id: `{"ok":false,…,"error":"stale target:
 re-refresh","stale":true}`, exit 2.
 
 ## `cleanup-plan` / `execute`
-
 `cleanup-plan` derives strictly from `classification == "leftover"` rows
-(plus stopped containers) and Docker dangling/anonymous-volume candidates.
-Persistent databases/services surface under `protected` and are never
-selected:
+(abandoned running processes) and Docker dangling/anonymous-volume
+candidates. Stopped containers are not leftovers — they consume nothing;
+manage them via the `containers` table (start/stop):
 
 ```json
 {"plan_id": "cleanup_abc123", "items": [{"resource_id": "…",
