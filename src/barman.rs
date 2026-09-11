@@ -102,7 +102,7 @@ pub fn run(cmd: BarmanCmd) -> io::Result<()> {
     match cmd {
         BarmanCmd::Snapshot { demo, .. } => {
             let snap = live_snapshot(demo);
-            let doc = build_snapshot(&snap);
+            let doc = build_snapshot(&snap, demo);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into())
@@ -147,7 +147,7 @@ pub fn run(cmd: BarmanCmd) -> io::Result<()> {
         }
         BarmanCmd::CleanupPlan { demo, .. } => {
             let snap = live_snapshot(demo);
-            let doc = build_snapshot(&snap);
+            let doc = build_snapshot(&snap, demo);
             let plan = cleanup_plan(&doc);
             remember_plan(&plan);
             println!(
@@ -548,7 +548,7 @@ fn session_project_id(path: &str) -> Option<String> {
 
 /// Build the v1 document from a snapshot. Pure: same input → same output
 /// except `generated_at`/`age_seconds` wall-clock fields.
-pub fn build_snapshot(snap: &RuntimeSnapshot) -> SnapshotDoc {
+pub fn build_snapshot(snap: &RuntimeSnapshot, demo: bool) -> SnapshotDoc {
     let now = unix_now();
     let by_pid: HashMap<u32, u64> = snap
         .processes
@@ -572,7 +572,7 @@ pub fn build_snapshot(snap: &RuntimeSnapshot) -> SnapshotDoc {
     let mut containers: Vec<ContainerDoc> = Vec::new();
     for res in &snap.docker.resources {
         if res.kind == DockerKind::Container {
-            containers.push(container_doc(res));
+            containers.push(container_doc(res, demo));
         } else {
             resources.push(docker_artifact_resource(res));
         }
@@ -611,6 +611,7 @@ pub fn build_snapshot(snap: &RuntimeSnapshot) -> SnapshotDoc {
         wyd_version: env!("CARGO_PKG_VERSION").into(),
         generated_at: rfc3339(now),
         system: system_doc(snap),
+
         projects,
         sessions,
         resources,
@@ -803,17 +804,14 @@ fn docker_artifact_resource(res: &DockerResource) -> ResourceDoc {
     }
 }
 
-fn container_doc(res: &DockerResource) -> ContainerDoc {
+fn container_doc(res: &DockerResource, demo: bool) -> ContainerDoc {
     let running = res.running();
     let ports = res.ports.clone();
     // Published host port on a running container → openable loopback URL,
     // but only if something HTTP actually answers (a DB on a published port
     // is not a frontend). Verified, not guessed by name.
-    let url = if running {
-        ports
-            .first()
-            .filter(|p| speaks_http(**p))
-            .map(|p| format!("http://127.0.0.1:{p}"))
+    let url = if running && ports.first().is_some_and(|p| demo || speaks_http(*p)) {
+        ports.first().map(|p| format!("http://127.0.0.1:{p}"))
     } else {
         None
     };
@@ -848,9 +846,10 @@ fn speaks_http(port: u16) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
-    let Ok(mut stream) =
-        TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().unwrap(), Duration::from_millis(250))
-    else {
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_millis(250),
+    ) else {
         return false;
     };
     stream
@@ -859,7 +858,10 @@ fn speaks_http(port: u16) -> bool {
     stream
         .set_write_timeout(Some(Duration::from_millis(250)))
         .ok();
-    if stream.write_all(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n").is_err() {
+    if stream
+        .write_all(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .is_err()
+    {
         return false;
     }
     let mut buf = [0u8; 16];
@@ -1279,7 +1281,7 @@ fn act_group(
             "restart not supported for this resource".into(),
         );
     }
-    let doc = build_snapshot(snap);
+    let doc = build_snapshot(snap, false);
     let member_ids: Vec<String> = doc
         .projects
         .iter()
@@ -1378,7 +1380,7 @@ pub fn execute(plan_id: &str, only: Option<&[String]>, demo_mode: bool) -> Execu
         None => selected,
     };
     let snap = live_snapshot(demo_mode);
-    let doc = build_snapshot(&snap);
+    let doc = build_snapshot(&snap, demo_mode);
     let reclaim_of: HashMap<&str, u64> = doc
         .resources
         .iter()
@@ -1484,7 +1486,7 @@ mod tests {
     use super::*;
 
     fn demo_doc() -> SnapshotDoc {
-        build_snapshot(&demo::snapshot())
+        build_snapshot(&demo::snapshot(), true)
     }
 
     #[test]
@@ -1516,8 +1518,8 @@ mod tests {
     #[test]
     fn stable_ids_same_input() {
         let snap = demo::snapshot();
-        let a = build_snapshot(&snap);
-        let b = build_snapshot(&snap);
+        let a = build_snapshot(&snap, true);
+        let b = build_snapshot(&snap, true);
         let ids = |d: &SnapshotDoc| d.resources.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&a), ids(&b));
         assert!(
@@ -1618,7 +1620,7 @@ mod tests {
     #[test]
     fn demo_action_never_signals() {
         let snap = demo::snapshot();
-        let doc = build_snapshot(&snap);
+        let doc = build_snapshot(&snap, true);
         let target = doc
             .resources
             .iter()
@@ -1633,7 +1635,7 @@ mod tests {
     #[test]
     fn process_restart_unsupported_shape() {
         let snap = demo::snapshot();
-        let doc = build_snapshot(&snap);
+        let doc = build_snapshot(&snap, true);
         let target = doc
             .resources
             .iter()
@@ -1657,7 +1659,7 @@ mod tests {
         stabilize_demo_times(&mut a);
         stabilize_demo_times(&mut b);
         let ids = |s: &RuntimeSnapshot| {
-            build_snapshot(s)
+            build_snapshot(s, true)
                 .resources
                 .iter()
                 .map(|r| r.id.clone())

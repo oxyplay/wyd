@@ -140,13 +140,19 @@ fn suspicious(score: u8, reasons: Vec<SuspicionReason>) -> Option<Suspicion> {
 /// web/TUI Docker sections without a live daemon.
 fn demo_docker() -> DockerSnapshot {
     let n = now();
-    let c = |id: &str, name: &str, detail: &str, size: u64, compose: Option<&str>, created: u64| {
+    let c = |id: &str,
+             name: &str,
+             detail: &str,
+             size: u64,
+             compose: Option<&str>,
+             created: u64,
+             ports: Vec<u16>| {
         DockerResource {
             kind: DockerKind::Container,
             id: id.into(),
             name: name.into(),
             detail: detail.into(),
-            ports: vec![],
+            ports,
             size_bytes: size,
             compose: compose.map(str::to_string),
             persistent: false,
@@ -167,8 +173,26 @@ fn demo_docker() -> DockerSnapshot {
                 42 << 20,
                 Some("testapp"),
                 n - 3600,
+                vec![8080],
             ),
-            c("d4e5f6", "old_worker", "exited", 12 << 20, None, n - 86400),
+            c(
+                "b2c3d4",
+                "demo-adminer",
+                "running",
+                18 << 20,
+                Some("testapp"),
+                n - 3600,
+                vec![8081],
+            ),
+            c(
+                "d4e5f6",
+                "old_worker",
+                "exited",
+                12 << 20,
+                None,
+                n - 86400,
+                vec![],
+            ),
             DockerResource {
                 kind: DockerKind::Volume,
                 id: "v-abc".into(),
@@ -339,7 +363,7 @@ pub fn snapshot() -> RuntimeSnapshot {
     };
     let cursor_vite = RuntimeItem {
         category: Category::DevServer,
-        display_name: "vite :5173".into(),
+        display_name: "vite :5174".into(),
         root_pid: Some(4302),
         process_ids: vec![4302],
         memory_bytes: 118 << 20,
@@ -352,7 +376,7 @@ pub fn snapshot() -> RuntimeSnapshot {
                 SuspicionReason::LongRunningDevServer,
             ],
         ),
-        ports: vec![port(5173)],
+        ports: vec![port(5174)],
         project: p_site.clone(),
         children: vec![],
     };
@@ -505,7 +529,7 @@ pub fn snapshot() -> RuntimeSnapshot {
         proc(
             4103,
             "vite",
-            &["vite", "--port", "5173"],
+            &["vite", "--port", "5174"],
             118 << 20,
             25 * 60,
         ),
