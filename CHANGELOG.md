@@ -4,7 +4,37 @@ All notable changes to wyd.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-11
+
 ### Added
+- **Managed runs** (`wyd run` / `runs` / `logs` / `cancel`): one local
+  supervisor owns a run's process group, deadline, bounded logs (`10 MiB` per
+  stream / `250 MiB` retained) and cleanup; the run survives a dropped CLI or
+  MCP connection. Idempotent `--request-id` (24 h, spec-verified), `--timeout`,
+  `--grace`, `--cwd`; exit codes `128+signal` / `124` / `130` / `125` / `137`,
+  with the precise reason always in the JSON.
+- **Shared admission queue:** deterministic scheduler with slots
+  (`max_parallel`, per-project caps), a bounded queue with starvation bypass,
+  memory reservations as a budget, and `wyd capacity [--set key=value]` /
+  `get_capacity` / `set_limits` on the socket API. Changing a limit governs
+  admission from then on — active runs are never killed; a lower cap is
+  reported as `over_parallel_limit`, not hidden.
+- **Linux hard limits** from a delegated cgroup v2 subtree: aggregate
+  `wyd.slice` caps the total run budget, each run gets
+  `memory.max`/`memory.swap.max`/`cpu.max`/`pids.max`; a `setsid` escapee
+  stays inside the run's cgroup and is killed with it (`cgroup.kill`). OOM is
+  attributed only by `memory.events`. macOS stays **monitored** (sum of RSS,
+  200 ms sampling) — a `hard` request is refused before spawn, never silently
+  downgraded.
+- **Runs visible in the TUI, web dashboard and MCP:** a read-only Runs view
+  (state, outcome, cleanup, queue position), web routes `/api/runs*` with a
+  capacity panel and a confirmed cancel proposal, and MCP tools `list_runs`,
+  `get_run`, `read_run_output`, `get_capacity` — `start_run`/`cancel_run`
+  behind `wyd mcp --allow-run`.
+- **`[runs]` admission limits** in `~/.config/wyd/config.toml`
+  (`max_parallel`, `max_parallel_per_project`, `max_queued`,
+  `queue_timeout_secs`, `memory_budget_mb`, `default_run_memory_mb`,
+  `cpu_budget_millicores`, `pids_budget`, `starvation_after_secs`).
 - `wyd why <pid>` now names the system source when no agent session owns a
   process: it walks the live ancestry and reports systemd (with the unit from
   `/proc/<pid>/cgroup` on Linux), launchd, cron, tmux, screen, ssh, snap,
@@ -16,11 +46,31 @@ All notable changes to wyd.
   process on it and what started it — the owning agent session from durable
   provenance, or the system source (systemd/launchd/cron/tmux/ssh/…) when no
   session owns it.
+- `wyd why <pid> --tree`: renders the full ancestry tree (the path from pid 1
+  to the target, marked) instead of the narrative, with the target's children
+  (capped at 10) — a pure structure view needing no provenance.
 - `wyd barman` (contract v1, `docs/barman-api.md`): machine-readable JSON API
   for the `wyd-barman` menu-bar client — `snapshot`, `action`, `cleanup-plan`,
   `execute`, `version`. Stable IDs (never PID identity), engine-computed
   `actions`, PID-reuse-guarded control path, single-use cleanup plans.
-- `wyd why <pid> --tree`: renders the full ancestry tree (the path from pid 1
+- Provenance store gains staged runs, decisions, and an optional
+  `HISTORYSTORE_TRACE` row-mutation hook (JSONL) for debugging.
+
+### Changed
+- The queue runs on logical time (`max(monotonic, wall-clock)`), so a
+  machine suspend can no longer pause `queue_timeout`, `starvation_after`
+  and deadlines mid-run.
+- Graceful supervisor shutdown: SIGTERM/SIGINT stops active runs (10 s grace)
+  before removing the socket; supervisor exits after 5 idle minutes.
+- The process scanner is owned by one thread with a single reused `System`;
+  collectors no longer spawn a scanner per process.
+
+### Fixed
+- Stopped containers are no longer leftovers (they consume nothing);
+  barman `containers` shows `size_bytes`, published ports and HTTP-verified
+  frontend URLs, and synthetic demo data got a richer realistic set.
+- macOS capability reason is honest about what monitoring can and cannot
+  promise; the suspend backstop is regression-tested.
 
 ## [0.9.0] - 2026-09-01
 

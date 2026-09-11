@@ -35,7 +35,7 @@ never emitted.
 ```json
 {
   "schema_version": 1,
-  "wyd_version": "0.9.0",
+  "wyd_version": "0.10.0",
   "generated_at": "2026-09-11T12:00:00Z",
   "projects": [{"id": "project_wyd", "name": "wyd", "agent": "opencode",
     "resource_count": 3, "memory_bytes": 1234, "resource_ids": []}],
@@ -130,5 +130,5 @@ migration) — durable across CLI invocations, since the client spawns one
 ## `version`
 
 ```json
-{"schema_version": 1, "wyd_version": "0.9.0"}
+{"schema_version": 1, "wyd_version": "0.10.0"}
 ```
