@@ -16,9 +16,11 @@ All notable changes to wyd.
   process on it and what started it — the owning agent session from durable
   provenance, or the system source (systemd/launchd/cron/tmux/ssh/…) when no
   session owns it.
+- `wyd barman` (contract v1, `docs/barman-api.md`): machine-readable JSON API
+  for the `wyd-barman` menu-bar client — `snapshot`, `action`, `cleanup-plan`,
+  `execute`, `version`. Stable IDs (never PID identity), engine-computed
+  `actions`, PID-reuse-guarded control path, single-use cleanup plans.
 - `wyd why <pid> --tree`: renders the full ancestry tree (the path from pid 1
-  down to the target, marked `◀`, plus its children, capped at 10) as a
-  structure view with no provenance required.
 
 ## [0.9.0] - 2026-09-01
 

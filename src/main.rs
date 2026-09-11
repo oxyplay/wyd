@@ -1,4 +1,5 @@
 mod actions;
+mod barman;
 mod classify;
 mod collect;
 mod config;
@@ -180,6 +181,11 @@ enum Subcmd {
         #[arg(long)]
         allow_lan: bool,
     },
+    /// Machine-readable JSON API for the wyd-barman menu-bar client (v1)
+    Barman {
+        #[command(subcommand)]
+        cmd: barman::BarmanCmd,
+    },
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -292,6 +298,7 @@ fn main() -> io::Result<()> {
             demo,
             allow_lan,
         }),
+        Some(Subcmd::Barman { cmd }) => barman::run(cmd),
         None => {
             if cli.json || cli.plain {
                 run_cli(cli)

@@ -23,6 +23,27 @@ pub fn stop_blocking(res: &DockerResource) -> Result<(), String> {
             .map_err(|e| e.to_string())
     })
 }
+/// Start a stopped container by engine id.
+pub fn start_blocking(id: &str) -> Result<(), String> {
+    runtime()?.block_on(async {
+        let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| e.to_string())?;
+        docker
+            .start_container(id, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Restart a container by engine id (works on running and stopped containers).
+pub fn restart_blocking(id: &str) -> Result<(), String> {
+    runtime()?.block_on(async {
+        let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| e.to_string())?;
+        docker
+            .restart_container(id, None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
 
 /// Delete exactly the anonymous volumes the UI showed the user, by id.
 /// This is safer than an engine-wide prune: what wyd listed is what gets
