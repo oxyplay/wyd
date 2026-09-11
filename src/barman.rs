@@ -320,6 +320,9 @@ pub struct ContainerDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_project: Option<String>,
     pub ports: Vec<u16>,
+    /// Loopback URL of the first published port on a running container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub status: String,
     /// On-disk size of the container (running or stopped); 0 when unknown.
     pub size_bytes: u64,
@@ -694,7 +697,14 @@ fn process_resource(item: &RuntimeItem, by_pid: &HashMap<u32, u64>) -> ResourceD
 
     let ports: Vec<u16> = item.ports.iter().map(|p| p.port).collect();
     let port = ports.first().copied();
-    let url = item.ports.first().map(|p| p.url());
+    // A URL is only meaningful for HTTP-ish things: dev servers and
+    // unclassified listeners. Redis on :6379 is not a "frontend".
+    let http_ish = matches!(item.category, Category::DevServer | Category::UnknownDev);
+    let url = if http_ish {
+        item.ports.first().map(|p| p.url())
+    } else {
+        None
+    };
 
     let classification = match item.state {
         RuntimeState::Suspicious => "leftover",
@@ -795,23 +805,67 @@ fn docker_artifact_resource(res: &DockerResource) -> ResourceDoc {
 
 fn container_doc(res: &DockerResource) -> ContainerDoc {
     let running = res.running();
+    let ports = res.ports.clone();
+    // Published host port on a running container → openable loopback URL,
+    // but only if something HTTP actually answers (a DB on a published port
+    // is not a frontend). Verified, not guessed by name.
+    let url = if running {
+        ports
+            .first()
+            .filter(|p| speaks_http(**p))
+            .map(|p| format!("http://127.0.0.1:{p}"))
+    } else {
+        None
+    };
+    let mut actions = if running {
+        vec!["stop".to_string(), "restart".to_string()]
+    } else {
+        vec!["start".to_string()]
+    };
+    if url.is_some() {
+        actions.insert(0, "open".to_string());
+    }
     ContainerDoc {
         id: container_id(&res.id),
         name: res.name.clone(),
         compose_project: res.compose.clone(),
-        ports: Vec::new(),
+        ports,
+        url,
         status: if running {
             "running".into()
         } else {
             "stopped".into()
         },
         size_bytes: res.size_bytes,
-        actions: if running {
-            vec!["stop".into(), "restart".into()]
-        } else {
-            vec!["start".into()]
-        },
+        actions,
         estimated_reclaim_bytes: if running { 0 } else { res.size_bytes },
+    }
+}
+
+/// `true` when 127.0.0.1:`port` answers with an HTTP status line. Tight
+/// timeouts: a refused/refused-slow port just means "not a frontend".
+fn speaks_http(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().unwrap(), Duration::from_millis(250))
+    else {
+        return false;
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    if stream.write_all(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        Ok(n) => n >= 4 && buf.starts_with(b"HTTP"),
+        Err(_) => false,
     }
 }
 
@@ -1189,11 +1243,14 @@ fn act_docker(
         (BarmanAction::Restart, DockerKind::Container) => {
             docker_actions::restart_blocking(&id).map(|_| "restarted".to_string())
         }
-        (BarmanAction::OpenUrl, _) => {
+        (BarmanAction::OpenUrl, DockerKind::Container) => {
+            if let Some(port) = res.ports.first() {
+                return ActionOutcome::ok_url(target, format!("http://127.0.0.1:{port}"));
+            }
             return ActionOutcome::failed(
                 target.into(),
                 action.as_str().into(),
-                "no url for this resource".into(),
+                "no published ports on this container".into(),
             );
         }
         _ => Err("restart not supported for this resource".to_string()),

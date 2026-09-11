@@ -88,6 +88,7 @@ pub fn assemble(
                 id: "*build-cache".into(),
                 name: "build cache".into(),
                 detail: "reclaimable".into(),
+                ports: vec![],
                 size_bytes: size,
                 compose: None,
                 persistent: false,
@@ -151,6 +152,7 @@ fn container_row(c: &ContainerSummary) -> DockerResource {
         id: c.id.clone().unwrap_or_default(),
         name,
         detail: if running { "running" } else { "stopped" }.into(),
+        ports: published_ports(c),
         size_bytes: c.size_rw.unwrap_or(0).max(0) as u64,
         compose,
         persistent: false,
@@ -159,12 +161,28 @@ fn container_row(c: &ContainerSummary) -> DockerResource {
     }
 }
 
+/// Host ports published by the container (top-level `Ports` of
+/// /containers/json): PublicPort of each mapping. Sorted, deduped.
+fn published_ports(c: &ContainerSummary) -> Vec<u16> {
+    let mut ports: Vec<u16> = c
+        .ports
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.public_port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 fn dangling_row(img: &ImageSummary) -> DockerResource {
     DockerResource {
         kind: DockerKind::DanglingImage,
         id: img.id.clone(),
         name: short_id(&img.id),
         detail: "dangling".into(),
+        ports: vec![],
         size_bytes: img.size.max(0) as u64,
         compose: None,
         persistent: false,
@@ -184,6 +202,7 @@ fn volume_row(vol: &Volume, attached: bool) -> DockerResource {
         id: vol.name.clone(),
         name: vol.name.clone(),
         detail: if attached { "attached" } else { "unused" }.into(),
+        ports: vec![],
         size_bytes: size,
         compose: vol.labels.get(COMPOSE_PROJECT).cloned(),
         persistent: true,

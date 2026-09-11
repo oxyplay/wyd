@@ -5,6 +5,8 @@ pub struct DockerResource {
     pub id: String,
     pub name: String,
     pub detail: String,
+    /// Host ports published by a running container; empty otherwise.
+    pub ports: Vec<u16>,
     pub size_bytes: u64,
     pub compose: Option<String>,
     /// Volumes always; UI requires `D` to delete.
@@ -107,7 +109,7 @@ mod tests {
             kind: DockerKind::Volume,
             id: name.into(),
             name: name.into(),
-            detail: if attached { "attached" } else { "unused" }.into(),
+            detail: if attached { "attached" } else { "unused" }.into(),            ports: vec![],
             size_bytes: 100,
             compose: None,
             persistent: true,
@@ -131,7 +133,7 @@ mod tests {
                     kind: DockerKind::Container,
                     id: "c".into(),
                     name: "c".into(),
-                    detail: "running".into(),
+                    detail: "running".into(),                    ports: vec![],
                     size_bytes: 5,
                     compose: None,
                     persistent: false,
