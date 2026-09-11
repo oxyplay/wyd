@@ -321,8 +321,10 @@ pub struct ContainerDoc {
     pub compose_project: Option<String>,
     pub ports: Vec<u16>,
     pub status: String,
+    /// On-disk size of the container (running or stopped); 0 when unknown.
+    pub size_bytes: u64,
     pub actions: Vec<String>,
-    /// Reclaim estimate (image/container size); 0 when unknown.
+    /// Reclaim estimate for stopped containers; 0 when running or unknown.
     pub estimated_reclaim_bytes: u64,
 }
 
@@ -803,6 +805,7 @@ fn container_doc(res: &DockerResource) -> ContainerDoc {
         } else {
             "stopped".into()
         },
+        size_bytes: res.size_bytes,
         actions: if running {
             vec!["stop".into(), "restart".into()]
         } else {

@@ -51,7 +51,8 @@ never emitted.
     "estimated_reclaim_bytes": 0, "actions": ["open|start|stop|restart|kill"]}],
   "containers": [{"id": "container_a1b2c3", "name": "postgres-dev",
     "compose_project": null, "ports": [], "status": "running|stopped",
-    "actions": ["stop|restart"], "estimated_reclaim_bytes": 0}],
+    "size_bytes": 42000000, "actions": ["stop|restart"],
+    "estimated_reclaim_bytes": 0}],
   "leftovers": {"count": 0, "estimated_reclaim_bytes": 0, "resource_ids": []}
 }
 ```
